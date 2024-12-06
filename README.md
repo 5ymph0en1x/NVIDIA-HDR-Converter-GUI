@@ -7,7 +7,7 @@ A simple GUI tool to convert NVIDIA JXR images to JPG with customizable tone map
 
 If you don't trust the exe, go download them here :
 * hdrfix.exe : https://github.com/bvibber/hdrfix
-* XRDecApp.exe : https://github.com/Knewest/precompiled-jxrlib-binaries
+* JXRDecApp.exe : https://github.com/Knewest/precompiled-jxrlib-binaries
 
 Run `pip install pillow` to install the required library
 
