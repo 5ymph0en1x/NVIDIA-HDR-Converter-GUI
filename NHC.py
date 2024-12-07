@@ -208,7 +208,7 @@ class HDRFixGUI:
         Initialize the GUI, creating all frames, labels, entries, and buttons.
         """
         self.master = master
-        master.title("HDRFix Converter")
+        master.title("NVIDIA HDR Converter")
         master.resizable(False, False)
 
         # Main container frame
