@@ -9,6 +9,6 @@ If you don't trust the exe, go download them here :
 * hdrfix.exe : https://github.com/bvibber/hdrfix
 * JXRDecApp.exe : https://github.com/Knewest/precompiled-jxrlib-binaries
 
-Run `pip install pillow` to install the required library
+Run `pip install pillow TKinterModernThemes` to install the required libraries
 
 Run `python NHC.py` to launch the GUI
