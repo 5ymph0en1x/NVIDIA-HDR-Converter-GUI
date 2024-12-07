@@ -2,7 +2,7 @@ import os
 import subprocess
 import tempfile
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 # ============================================================
@@ -257,9 +257,14 @@ class HDRFixGUI:
         params_frame = tk.LabelFrame(parent_frame, text="Parameters", padx=10, pady=10)
         params_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
 
+        # Tone Map dropdown menu
         tk.Label(params_frame, text="Tone Map:").grid(row=0, column=0, sticky="e")
         self.tonemap_var = tk.StringVar(value=DEFAULT_TONE_MAP)
-        tk.Entry(params_frame, textvariable=self.tonemap_var, width=15).grid(row=0, column=1, padx=5)
+        tone_map_values = sorted(list(SUPPORTED_TONE_MAPS))  # Convert set to sorted list
+        tone_map_dropdown = ttk.Combobox(params_frame, textvariable=self.tonemap_var, values=tone_map_values,
+                                         state='readonly')
+        tone_map_dropdown.grid(row=0, column=1, padx=5)
+        tone_map_dropdown.set(DEFAULT_TONE_MAP)  # Set default
 
         tk.Label(params_frame, text="Pre-gamma:").grid(row=1, column=0, sticky="e")
         self.pregamma_var = tk.StringVar(value=DEFAULT_PREGAMMA)
