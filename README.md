@@ -104,5 +104,10 @@ pip install -r requirements.txt
 - Cached model storage
 
 ## Acknowledgments
-- Uses PyTorch pretrained models
-- GUI theme based on TKinterModernThemes
+If you don't trust the exe, go download them here :
+* hdrfix.exe : https://github.com/bvibber/hdrfix
+* JXRDecApp.exe : https://github.com/Knewest/precompiled-jxrlib-binaries
+
+Uses PyTorch pretrained models
+
+GUI theme based on TKinterModernThemes
