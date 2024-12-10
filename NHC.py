@@ -799,7 +799,7 @@ class App(TKMT.ThemedTKinterFrame):
         strength_frame = ttk.Frame(color_frame)
         strength_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
 
-        ttk.Label(strength_frame, text="Color Preservation:").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(strength_frame, text="Strength:").grid(row=0, column=0, sticky="w", padx=(0, 10))
         self.color_strength = tk.DoubleVar(value=DEFAULT_COLOR_STRENGTH)
         color_scale = ttk.Scale(
             strength_frame,
