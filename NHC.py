@@ -704,6 +704,7 @@ def validate_parameters(tone_map: str, pre_gamma: str, auto_exposure: str) -> No
 
 class App(TKMT.ThemedTKinterFrame):
     """Main application class for the NVIDIA HDR Converter GUI."""
+
     def __init__(self, theme="park", mode="dark"):
         super().__init__("NVIDIA HDR Converter", theme, mode)
         self.device_manager = DeviceManager()
@@ -770,6 +771,17 @@ class App(TKMT.ThemedTKinterFrame):
 
         # Center and Initialize Window
         self.center_window(MODES[self.current_mode]['window_width'], MODES[self.current_mode]['window_height'])
+
+        # Set initial state of AI Enhancement controls based on the device
+        if self.device_manager.use_gpu:
+            self.enhance_checkbox.config(state='normal')
+            self.edge_scale.config(state='normal')
+        else:
+            self.enhance_checkbox.config(state='disabled')
+            self.edge_scale.config(state='disabled')
+            self.use_enhancement.set(False)
+            self._update_enhancement_controls()
+
         logging.info(f"Application initialized on {self.device_manager.device}")
 
     def _setup_mode_selection(self, parent_frame):
@@ -1029,6 +1041,16 @@ class App(TKMT.ThemedTKinterFrame):
             if success:
                 device_name = "GPU" if use_gpu and torch.cuda.is_available() else "CPU"
                 self.status_label.config(text=f"Switched to {device_name}", foreground="#CCCCCC")
+
+                # Enable or disable AI Enhancement controls based on the device
+                if self.device_manager.use_gpu:
+                    self.enhance_checkbox.config(state='normal')
+                    self.edge_scale.config(state='normal')
+                else:
+                    self.enhance_checkbox.config(state='disabled')
+                    self.edge_scale.config(state='disabled')
+                    self.use_enhancement.set(False)
+                    self._update_enhancement_controls()
             else:
                 raise RuntimeError("Failed to switch devices")
         except Exception as e:
@@ -1313,10 +1335,12 @@ class App(TKMT.ThemedTKinterFrame):
         enhance_frame = ttk.LabelFrame(self.params_frame, text="Image Enhancement", padding=(10, 10))
         enhance_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         self.use_enhancement = tk.BooleanVar(value=True)
-        enhance_checkbox = ttk.Checkbutton(enhance_frame, text="Enable AI Enhancement",
-                                           variable=self.use_enhancement,
-                                           command=self._update_enhancement_controls)
-        enhance_checkbox.grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
+
+        # Store reference to the Enhance Checkbox
+        self.enhance_checkbox = ttk.Checkbutton(enhance_frame, text="Enable AI Enhancement",
+                                                variable=self.use_enhancement,
+                                                command=self._update_enhancement_controls)
+        self.enhance_checkbox.grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
 
         enhance_frame.grid_columnconfigure(0, minsize=120)
         enhance_frame.grid_columnconfigure(1, weight=1)
