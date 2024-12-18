@@ -699,9 +699,9 @@ class HDRColorProcessor:
         """Switches the processing device and updates model data types accordingly."""
         new_device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
 
-        # Automatically disable FP16 if not using GPU
+        # Automatically disable FP32 if not using GPU
         if new_device.type != 'cuda':
-            use_fp16 = False  # Override FP16 to False for CPU
+            use_fp16 = True  # Override FP16 to True for CPU
 
         if new_device != self.device or use_fp16 != self.use_fp16:
             self.clear_gpu_memory()
@@ -977,7 +977,7 @@ class App(TKMT.ThemedTKinterFrame):
             if use_gpu and torch.cuda.is_available():
                 use_fp16 = self.use_fp16_var.get()
             else:
-                use_fp16 = False  # Always use FP32 when GPU is not selected
+                use_fp16 = True  # Always use FP16 when GPU is not selected
 
             # Attempt to switch device and precision
             success = self.color_processor.switch_device(use_gpu, use_fp16=use_fp16)
@@ -999,12 +999,12 @@ class App(TKMT.ThemedTKinterFrame):
                 self.edge_scale.config(state='normal')
                 self.fp16_toggle.config(state='normal')  # Enable FP16 toggle
             else:
-                self.enhance_checkbox.config(state='enabled')
-                self.edge_scale.config(state='enabled')
+                self.enhance_checkbox.config(state='normal')
+                self.edge_scale.config(state='normal')
                 self.use_enhancement.set(True)
                 self._update_enhancement_controls()
                 self.fp16_toggle.config(state='disabled')  # Disable FP16 toggle
-                self.use_fp16_var.set(True)  # Always use FP32 when GPU is not selected
+                self.use_fp16_var.set(True)  # Always use FP16 when GPU is not selected
 
         except Exception as e:
             error_msg = f"Device switching failed: {str(e)}"
