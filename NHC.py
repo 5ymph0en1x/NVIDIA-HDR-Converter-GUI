@@ -18,7 +18,6 @@ import matplotlib
 import numpy as np
 import imagecodecs
 
-
 # Logging Configuration
 logging.basicConfig(
     filename='hdr_converter.log',
@@ -426,6 +425,9 @@ class OptimizedJXRLoader:
             if self.device.type == 'cuda':
                 tensor = tensor.to(self.device, non_blocking=True)
                 tensor = tensor.half()
+            else:
+                tensor = tensor.to(self.device, non_blocking=True)
+                tensor = tensor.half()  # Always use FP16 with CPU selection
 
             # Apply tone map
             if tone_map == 'hable' or is_preview:
@@ -469,17 +471,36 @@ class OptimizedJXRLoader:
         return torch.stack([x[:,i] * ratio for i in range(3)], dim=1)
 
     def _tone_map_aces(self, x):
-        """Applies ACES tone mapping."""
-        if self.ACES_INPUT_MAT.device != x.device:
+        """Applies ACES tone mapping with improved numerical stability."""
+        if self.ACES_INPUT_MAT.device != x.device or self.ACES_INPUT_MAT.dtype != x.dtype:
             self.ACES_INPUT_MAT = self.ACES_INPUT_MAT.to(x.device, dtype=x.dtype)
             self.ACES_OUTPUT_MAT = self.ACES_OUTPUT_MAT.to(x.device, dtype=x.dtype)
 
         batch, channels, height, width = x.shape
         x_reshaped = x.view(batch, channels, -1)
+
+        # Ensure stable computation by clamping input values
+        x_reshaped = torch.clamp(x_reshaped, min=0.0, max=65504.0)  # Max half-precision value
+
+        # Apply input transform with improved numerical stability
         x_transformed = torch.einsum('ij,bjk->bik', self.ACES_INPUT_MAT, x_reshaped)
+        x_transformed = torch.clamp(x_transformed, min=0.0)
+
+        # ACES RRT and ODT
         a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
-        x_tonemapped = (x_transformed * (a * x_transformed + b)) / (x_transformed * (c * x_transformed + d) + e)
+        numerator = x_transformed * (a * x_transformed + b)
+        denominator = x_transformed * (c * x_transformed + d) + e
+
+        # Prevent division by zero and ensure numerical stability
+        denominator = torch.clamp(denominator, min=1e-8)
+        x_tonemapped = numerator / denominator
+
+        # Apply output transform
         x_output = torch.einsum('ij,bjk->bik', self.ACES_OUTPUT_MAT, x_tonemapped)
+
+        # Final clamp to ensure valid range
+        x_output = torch.clamp(x_output, min=0.0, max=1.0)
+
         return x_output.view(batch, channels, height, width).contiguous()
 
     def _tone_map_filmic(self, x):
@@ -565,16 +586,34 @@ class OptimizedJXRLoader:
 
 class HDRColorProcessor:
     """Processes HDR images with color and edge enhancements."""
-    def __init__(self, device, jxr_loader):
+
+    def __init__(self, device, jxr_loader, use_fp16=False):
         self.device = device
         self.jxr_loader = jxr_loader
+        self.use_fp16 = use_fp16
         self.color_net = ColorCorrectionNet().eval().to(device)
-        # Convert model to half if GPU is available for memory saving
-        if device.type == 'cuda':
+
+        # Convert model to half if GPU is available and FP16 is selected for memory saving
+        if device.type == 'cuda' and self.use_fp16:
             self.color_net.half()
+        elif device.type == 'cpu' and self.use_fp16:
+            # Attempt to convert model to half precision on CPU
+            try:
+                self.color_net.half()
+            except Exception as e:
+                logging.error(f"Failed to convert model to FP16 on CPU: {e}")
+                self.use_fp16 = False  # Revert to FP32 if conversion fails
+
+        # Similarly handle other modules
         self.edge_enhancement = EdgeEnhancementBlock().to(device)
-        if device.type == 'cuda':
+        if device.type == 'cuda' and self.use_fp16:
             self.edge_enhancement.half()
+        elif device.type == 'cpu' and self.use_fp16:
+            try:
+                self.edge_enhancement.half()
+            except Exception as e:
+                logging.error(f"Failed to convert EdgeEnhancementBlock to FP16 on CPU: {e}")
+                self.use_fp16 = False
 
     def clear_gpu_memory(self):
         """Clears GPU memory cache."""
@@ -597,11 +636,7 @@ class HDRColorProcessor:
         """
         try:
             # Move tensor to correct device and set precision
-            tensor = original_tensor.to(self.device)
-            if self.device.type == 'cuda':
-                tensor = tensor.half()  # Use half precision only on GPU
-            else:
-                tensor = tensor.float()  # Use full precision on CPU
+            tensor = original_tensor.to(self.device, dtype=torch.float16 if self.use_fp16 else torch.float32)
 
             # Add padding for processing
             pad_size = 32
@@ -622,7 +657,13 @@ class HDRColorProcessor:
                     enhanced = self.edge_enhancement(enhanced, edge_strength=edge_strength)
 
                 # Remove padding and convert back to float32 for CPU processing
-                enhanced = enhanced[:, :, pad_size:-pad_size, pad_size:-pad_size].float().cpu()
+                enhanced = enhanced[:, :, pad_size:-pad_size, pad_size:-pad_size]
+                if self.device.type == 'cpu' and self.use_fp16:
+                    enhanced = enhanced.float()
+                elif self.device.type == 'cuda' and self.use_fp16:
+                    enhanced = enhanced.float()
+
+                enhanced = enhanced.cpu()
 
                 # Convert to numpy array for saving
                 array = enhanced.squeeze(0).permute(1, 2, 0).numpy()
@@ -654,32 +695,54 @@ class HDRColorProcessor:
             traceback.print_exc()
             return None
 
-    def switch_device(self, use_gpu):
+    def switch_device(self, use_gpu, use_fp16=False):
         """Switches the processing device and updates model data types accordingly."""
         new_device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
-        if new_device != self.device:
+
+        # Automatically disable FP16 if not using GPU
+        if new_device.type != 'cuda':
+            use_fp16 = False  # Override FP16 to False for CPU
+
+        if new_device != self.device or use_fp16 != self.use_fp16:
             self.clear_gpu_memory()
             self.device = new_device
+            self.use_fp16 = use_fp16
 
-            # Define desired data type based on the device
-            desired_dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
+            # Define desired data type based on the device and precision
+            desired_dtype = torch.float16 if (self.device.type == 'cuda' and self.use_fp16) else torch.float32
 
-            # Move color_net and edge_enhancement to the new device and dtype
-            self.color_net = self.color_net.to(device=self.device, dtype=desired_dtype)
-            self.edge_enhancement = self.edge_enhancement.to(device=self.device, dtype=desired_dtype)
+            try:
+                # Move model and components to the new device and dtype
+                self.color_net = self.color_net.to(device=self.device, dtype=desired_dtype)
+                self.edge_enhancement = self.edge_enhancement.to(device=self.device, dtype=desired_dtype)
+                # Move pretrained models inside color_net
+                for model in [self.color_net.vgg, self.color_net.resnet, self.color_net.densenet]:
+                    model.to(device=self.device, dtype=desired_dtype)
 
-            # Move pretrained models inside color_net
-            for model in [self.color_net.vgg, self.color_net.resnet, self.color_net.densenet]:
-                model.to(device=self.device, dtype=desired_dtype)
+                # Move ACES matrices to the new device and dtype
+                self.jxr_loader.ACES_INPUT_MAT = self.jxr_loader.ACES_INPUT_MAT.to(device=self.device,
+                                                                                   dtype=desired_dtype)
+                self.jxr_loader.ACES_OUTPUT_MAT = self.jxr_loader.ACES_OUTPUT_MAT.to(device=self.device,
+                                                                                     dtype=desired_dtype)
+            except Exception as e:
+                logging.error(f"Failed to switch device or precision: {e}")
+                return False  # Indicate failure to the caller
 
-            # Move ACES matrices to the new device and dtype
-            self.jxr_loader.ACES_INPUT_MAT = self.jxr_loader.ACES_INPUT_MAT.to(device=self.device, dtype=desired_dtype)
-            self.jxr_loader.ACES_OUTPUT_MAT = self.jxr_loader.ACES_OUTPUT_MAT.to(device=self.device, dtype=desired_dtype)
+            logging.info(f"Switched to {self.device} with {'FP16' if self.use_fp16 else 'FP32'} precision")
 
-            logging.info(f"Switched to {self.device}")
+            # Verification Logging
+            for name, param in self.color_net.named_parameters():
+                logging.debug(f"Model Parameter - {name}: dtype={param.dtype}, device={param.device}")
+            for name, buffer in self.color_net.named_buffers():
+                logging.debug(f"Model Buffer - {name}: dtype={buffer.dtype}, device={buffer.device}")
+            logging.debug(
+                f"ACES_INPUT_MAT dtype: {self.jxr_loader.ACES_INPUT_MAT.dtype}, device: {self.jxr_loader.ACES_INPUT_MAT.device}")
+            logging.debug(
+                f"ACES_OUTPUT_MAT dtype: {self.jxr_loader.ACES_OUTPUT_MAT.dtype}, device: {self.jxr_loader.ACES_OUTPUT_MAT.device}")
+
             return True
         else:
-            logging.info(f"Already on {self.device}")
+            logging.info(f"Already on {self.device} with {'FP16' if self.use_fp16 else 'FP32'} precision")
             return False
 
 
@@ -709,7 +772,12 @@ class App(TKMT.ThemedTKinterFrame):
         super().__init__("NVIDIA HDR Converter", theme, mode)
         self.device_manager = DeviceManager()
         self.jxr_loader = OptimizedJXRLoader(self.device_manager.get_device())
-        self.color_processor = HDRColorProcessor(self.device_manager.get_device(), self.jxr_loader)
+        self.use_fp16_var = tk.BooleanVar(value=False)  # Variable for FP16 toggle
+        self.color_processor = HDRColorProcessor(
+            self.device_manager.get_device(),
+            self.jxr_loader,
+            use_fp16=self.use_fp16_var.get()
+        )
 
         self.current_before_image_path = None
         self.current_after_image_path = None
@@ -776,11 +844,14 @@ class App(TKMT.ThemedTKinterFrame):
         if self.device_manager.use_gpu:
             self.enhance_checkbox.config(state='normal')
             self.edge_scale.config(state='normal')
+            self.fp16_toggle.config(state='normal')  # Enable FP16 toggle
         else:
             self.enhance_checkbox.config(state='disabled')
             self.edge_scale.config(state='disabled')
             self.use_enhancement.set(False)
             self._update_enhancement_controls()
+            self.fp16_toggle.config(state='disabled')  # Disable FP16 toggle when GPU is not available
+            self.use_fp16_var.set(False)  # Reset FP16 toggle
 
         logging.info(f"Application initialized on {self.device_manager.device}")
 
@@ -860,7 +931,7 @@ class App(TKMT.ThemedTKinterFrame):
         self.output_browse_button.grid(row=1, column=2, padx=(0, 5), pady=5)
 
     def _setup_device_selection(self, parent_frame):
-        """Sets up device selection radio buttons (GPU or CPU)."""
+        """Sets up device selection radio buttons (GPU or CPU) and precision toggle."""
         device_frame = ttk.LabelFrame(parent_frame, text="Processing Device", padding=(10, 10))
         device_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         self.use_gpu_var = tk.BooleanVar(value=self.device_manager.use_gpu)
@@ -874,6 +945,75 @@ class App(TKMT.ThemedTKinterFrame):
         cpu_radio = ttk.Radiobutton(device_frame, text="CPU", variable=self.use_gpu_var, value=False,
                                     command=self.update_device)
         cpu_radio.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+
+        # Add FP16/FP32 Toggle
+        self.fp16_toggle = ttk.Checkbutton(device_frame, text="Use Half-Precision",
+                                           variable=self.use_fp16_var,
+                                           command=self.update_precision)
+        self.fp16_toggle.grid(row=0, column=2, padx=20, pady=5, sticky="w")
+
+    def update_precision(self):
+        """Handles the precision switching logic based on user selection."""
+        use_fp16 = self.use_fp16_var.get()
+        try:
+            if self.device_manager.use_gpu:
+                success = self.color_processor.switch_device(use_gpu=True, use_fp16=use_fp16)
+                if success:
+                    precision = "FP16" if use_fp16 else "FP32"
+                    self.status_label.config(text=f"Precision switched to {precision}", foreground="#CCCCCC")
+            else:
+                raise RuntimeError("Precision selection is only available when GPU is active.")
+        except Exception as e:
+            error_msg = f"Precision switching failed: {str(e)}"
+            self.status_label.config(text=error_msg, foreground="red")
+            logging.error(error_msg)
+            self.use_fp16_var.set(False)  # Reset toggle on failure
+
+    def update_device(self):
+        """Handles the device switching logic based on user selection."""
+        use_gpu = self.use_gpu_var.get()
+        try:
+            # Retrieve the current precision setting
+            if use_gpu and torch.cuda.is_available():
+                use_fp16 = self.use_fp16_var.get()
+            else:
+                use_fp16 = False  # Always use FP32 when GPU is not selected
+
+            # Attempt to switch device and precision
+            success = self.color_processor.switch_device(use_gpu, use_fp16=use_fp16)
+            if success:
+                device_name = "GPU" if use_gpu and torch.cuda.is_available() else "CPU"
+                precision = "FP16" if use_fp16 else "FP32"
+                self.status_label.config(text=f"Switched to {device_name} with {precision} precision",
+                                         foreground="#CCCCCC")
+            else:
+                # No change needed; inform the user
+                device_name = "GPU" if use_gpu and torch.cuda.is_available() else "CPU"
+                precision = "FP16" if use_fp16 else "FP32"
+                self.status_label.config(text=f"Already on {device_name} with {precision} precision",
+                                         foreground="#CCCCCC")
+
+            # Enable or disable AI Enhancement and Precision controls based on the device
+            if use_gpu and torch.cuda.is_available():
+                self.enhance_checkbox.config(state='normal')
+                self.edge_scale.config(state='normal')
+                self.fp16_toggle.config(state='normal')  # Enable FP16 toggle
+            else:
+                self.enhance_checkbox.config(state='enabled')
+                self.edge_scale.config(state='enabled')
+                self.use_enhancement.set(True)
+                self._update_enhancement_controls()
+                self.fp16_toggle.config(state='disabled')  # Disable FP16 toggle
+                self.use_fp16_var.set(True)  # Always use FP32 when GPU is not selected
+
+        except Exception as e:
+            error_msg = f"Device switching failed: {str(e)}"
+            self.status_label.config(text=error_msg, foreground="red")
+            logging.error(error_msg)
+            # Revert GUI selections if necessary
+            self.use_gpu_var.set(not use_gpu)
+            if not use_gpu:
+                self.use_fp16_var.set(False)
 
     def _setup_parameters(self, parent_frame):
         """Sets up parameter input fields for tone mapping, gamma, and exposure."""
@@ -1031,33 +1171,6 @@ class App(TKMT.ThemedTKinterFrame):
         x = (screen_width // 2) - (width // 2)
         y = (screen_height // 2) - (height // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-
-    def update_device(self):
-        """Handles the device switching logic based on user selection."""
-        use_gpu = self.use_gpu_var.get()
-        try:
-            self.device_manager.switch_device(use_gpu)
-            success = self.color_processor.switch_device(use_gpu)
-            if success:
-                device_name = "GPU" if use_gpu and torch.cuda.is_available() else "CPU"
-                self.status_label.config(text=f"Switched to {device_name}", foreground="#CCCCCC")
-
-                # Enable or disable AI Enhancement controls based on the device
-                if self.device_manager.use_gpu:
-                    self.enhance_checkbox.config(state='normal')
-                    self.edge_scale.config(state='normal')
-                else:
-                    self.enhance_checkbox.config(state='disabled')
-                    self.edge_scale.config(state='disabled')
-                    self.use_enhancement.set(False)
-                    self._update_enhancement_controls()
-            else:
-                raise RuntimeError("Failed to switch devices")
-        except Exception as e:
-            error_msg = f"Device switching failed: {str(e)}"
-            self.status_label.config(text=error_msg, foreground="red")
-            logging.error(error_msg)
-            self.use_gpu_var.set(not use_gpu)
 
     def browse_input(self):
         """Handles the input file or folder browsing."""
