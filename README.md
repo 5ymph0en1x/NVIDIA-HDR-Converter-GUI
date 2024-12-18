@@ -1,5 +1,5 @@
 # NVIDIA HDR Converter GUI
-A powerful GUI application for converting NVIDIA JXR (HDR) screenshots to high-quality JPEG images with AI-powered color enhancement.
+Convert NVIDIA HDR screenshots (JXR format) to JPEG with advanced AI enhancement and tone mapping.
 
 <p align="center">
   <img width="1024" src="interface.jpg">
@@ -12,56 +12,54 @@ A powerful GUI application for converting NVIDIA JXR (HDR) screenshots to high-q
 - Advanced HDR tone mapping with multiple algorithms
 - AI-powered color enhancement using deep learning models
 - Batch processing support
-- Live preview functionality
+- Live preview with histogram visualization
 
 ### AI Color Enhancement
-- Neural network-based color correction using pretrained models
-- Edge preservation and enhancement
+- Neural network-based color correction using VGG16, ResNet34, and DenseNet121
+- Edge preservation and enhancement using CBAM attention
+- Adaptive color balancing
 - Intelligent contrast adjustment
-- Vibrance enhancement with natural look preservation
-- Automatic model download and caching
+- Natural color preservation
 
 ### Supported Tone Mapping Algorithms
-- Hable (Default)
-- Reinhard
-- Filmic
-- ACES
-- Uncharted 2
+- **Adaptive** (Default) - Automatically selects the best algorithm based on image content
+- **Hable**
+- **Reinhard**
+- **Filmic**
+- **ACES**
+- **Uncharted 2**
 
 ### User Interface
 - Modern, dark-themed GUI
-- Real-time preview
-- Progress tracking
-- Batch processing support
-- Customizable parameters
+- Real-time preview with before/after comparison
+- Color histogram visualization
+- Progress tracking for batch operations
+- Customizable enhancement parameters
 
 ## Requirements
 
 ### Python Dependencies
-- PyTorch
-- torchvision
-- Pillow
-- TKinterModernThemes
-- tqdm
-- requests
-
-### External Dependencies
-- JXRDecApp.exe (for JXR decoding)
-- hdrfix.exe (for HDR processing)
+```txt
+torch==2.5.1
+torchvision==0.16.1
+Pillow==10.2.0
+numpy==1.26.4
+matplotlib==3.9.3
+imagecodecs==2024.9.22
+TKinterModernThemes==1.10.4
+```
 
 ## Installation
 
 1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/ai-hdr-converter.git
-```
+   ```bash
+   git clone https://github.com/yourusername/ai-hdr-converter.git
+   ```
 
 2. Install Python dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Place required executables (JXRDecApp.exe and hdrfix.exe) in the same directory as the script.
+   ```bash
+   pip install -r requirements.txt
+   ```
 
 ## Usage
 
@@ -70,44 +68,43 @@ pip install -r requirements.txt
 2. Select "Single File" mode
 3. Choose input JXR file
 4. Select output JPEG location
-5. Adjust parameters if needed
+5. Adjust parameters as needed
 6. Click "Convert"
 
 ### Batch Processing
 1. Launch the application
 2. Select "Folder" mode
 3. Choose folder containing JXR files
-4. Adjust parameters if needed
+4. Adjust parameters as needed
 5. Click "Convert"
-- Converted files will be saved in a "Converted_JPGs" subfolder
+
+> **Note**: Converted files will be saved in a "Converted_JPGs" subfolder
 
 ### Parameters
 - **Tone Map**: Select HDR tone mapping algorithm
-- **Pre-gamma**: Adjust gamma before tone mapping
-- **Auto-exposure**: Control exposure adjustment
-- **Color Enhancement**: Toggle AI-powered color enhancement
-- **Color Preservation**: Adjust strength of color enhancement
+- **Gamma**: Adjust gamma correction
+- **Exposure**: Control exposure adjustment
+- **AI Enhancement**: Toggle AI-powered enhancement
+- **Edge Strength**: Adjust edge enhancement intensity
 
 ## Technical Details
 
 ### AI Architecture
-- Uses VGG16 backbone for feature extraction
-- Custom edge enhancement and attention mechanisms
-- Adaptive color transformation
-- Multi-scale feature processing
+- Ensemble of VGG16, ResNet34, and DenseNet121 for feature extraction
+- Convolutional Block Attention Module (CBAM) for spatial and channel attention
+- Edge enhancement block with Sobel filters
+- Adaptive color balancing with preservation controls
+- Multi-scale feature fusion
 
 ### Performance Optimization
-- Efficient memory usage
+- Automatic CPU/GPU detection and switching
+- Memory-efficient tensor operations
 - Multi-threaded batch processing
-- Automatic CPU/GPU detection
 - Progressive image loading
-- Cached model storage
+- Half-precision (FP16) support for GPU processing
 
 ## Acknowledgments
-If you don't trust the exe, go download them here :
-* hdrfix.exe : https://github.com/bvibber/hdrfix
-* JXRDecApp.exe : https://github.com/Knewest/precompiled-jxrlib-binaries
 
-Uses PyTorch pretrained models
-
-GUI theme based on TKinterModernThemes
+- Uses PyTorch pretrained models (VGG16, ResNet34, DenseNet121)
+- GUI theme based on TKinterModernThemes
+- JXR decoding powered by imagecodecs library
