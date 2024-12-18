@@ -1,723 +1,690 @@
 import os
 import sys
-import subprocess
-import tempfile
+import gc
+import traceback
+import io
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import TKinterModernThemes as TKMT
-import concurrent.futures
 import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-import torchvision.transforms as transforms
-import requests
-from tqdm import tqdm
-import time
-import traceback
+import logging
+import matplotlib
+import numpy as np
+import imagecodecs
 
-# ============================================================
-# CONFIGURATION AND CONSTANTS
-# ============================================================
-DEFAULT_TONE_MAP = "hable"
-DEFAULT_PREGAMMA = "1.2"
-DEFAULT_AUTOEXPOSURE = "0.9"
-DEFAULT_COLOR_STRENGTH = 0.25
 
-SUPPORTED_TONE_MAPS = {"hable", "reinhard", "filmic", "aces", "uncharted2"}
+# Logging Configuration
+logging.basicConfig(
+    filename='hdr_converter.log',
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
 
-PREVIEW_WIDTH = 512
-PREVIEW_HEIGHT = 288
+# Use 'Agg' backend for matplotlib to prevent GUI issues
+matplotlib.use('Agg')
 
-# Model configuration
+# Constants
+DEFAULT_TONE_MAP = "adaptive"
+DEFAULT_PREGAMMA = "1.0"
+DEFAULT_AUTOEXPOSURE = "1.0"
+SUPPORTED_TONE_MAPS = {"adaptive", "hable", "reinhard", "filmic", "aces", "uncharted2"}
+
 PRETRAINED_MODELS = {
     'vgg': models.vgg16,
     'resnet': models.resnet34,
     'densenet': models.densenet121
 }
 
+MODES = {
+    'big': {
+        'window_width': 2200,
+        'window_height': 850,
+        'preview_width': 720,
+        'preview_height': 406,
+    },
+    'small': {
+        'window_width': 1760,
+        'window_height': 840,
+        'preview_width': 512,
+        'preview_height': 288,
+    },
+}
 
-class AttentionBlock(nn.Module):
-    """Spatial and channel attention for feature enhancement"""
+# Set PyTorch backend configurations for reproducibility
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
 
-    def __init__(self, channels):
-        super(AttentionBlock, self).__init__()
-        self.spatial_pool = nn.Sequential(
-            nn.Conv2d(channels, channels // 8, 1),
+
+class DeviceManager:
+    """Manages the computational device (GPU or CPU) for the application."""
+    def __init__(self):
+        self.use_gpu = torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.use_gpu else "cpu")
+        if self.use_gpu:
+            torch.cuda.empty_cache()
+        logging.info(f"DeviceManager initialized on {self.device}")
+
+    def switch_device(self, use_gpu: bool):
+        """Switches the device between GPU and CPU based on availability and user preference."""
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        new_device = torch.device("cuda" if self.use_gpu else "cpu")
+        if new_device != self.device:
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+            self.device = new_device
+            logging.info(f"DeviceManager switched to {self.device}")
+
+    def get_device(self):
+        """Returns the current computational device."""
+        return self.device
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module."""
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
             nn.ReLU(),
-            nn.Conv2d(channels // 8, 1, 1),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False),
             nn.Sigmoid()
         )
-        self.channel_pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 8, 1),
-            nn.ReLU(),
-            nn.Conv2d(channels // 8, channels, 1),
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        spatial_att = self.spatial_pool(x)
-        channel_att = self.channel_pool(x)
-        return x * spatial_att * channel_att
+        ca = self.channel_attention(x)
+        x = x * ca
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        sa_input = torch.cat([avg_out, max_out], dim=1)
+        sa = self.spatial_attention(sa_input)
+        x = x * sa
+        return x
 
 
 class EdgeEnhancementBlock(nn.Module):
-    """Edge detection and enhancement using learned filters"""
-
-    def __init__(self, in_channels):
+    """Enhances edges in the image using Sobel filters."""
+    def __init__(self):
         super(EdgeEnhancementBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, in_channels, kernel_size=3, padding=1)
-        self.edge_weights = nn.Parameter(torch.randn(8, 1, 3, 3))
+        gaussian_kernel = torch.tensor([
+            [1, 4, 6, 4, 1],
+            [4,16,24,16, 4],
+            [6,24,36,24, 6],
+            [4,16,24,16, 4],
+            [1, 4, 6, 4, 1]
+        ], dtype=torch.float32)/256.0
+        self.register_buffer('gaussian_kernel',
+                             gaussian_kernel.view(1, 1, 5, 5).repeat(3, 1, 1, 1))
+
+        kernel_x = torch.tensor([
+            [-1.0, 0.0, 1.0],
+            [-2.0, 0.0, 2.0],
+            [-1.0, 0.0, 1.0]
+        ], dtype=torch.float32)/4.0
+        kernel_y = torch.tensor([
+            [-1.0,-2.0,-1.0],
+            [ 0.0, 0.0, 0.0],
+            [ 1.0, 2.0, 1.0]
+        ], dtype=torch.float32)/4.0
+
+        self.register_buffer('kernel_x', kernel_x.view(1,1,3,3))
+        self.register_buffer('kernel_y', kernel_y.view(1,1,3,3))
+
+    def forward(self, x, edge_strength=0.0):
+        if edge_strength <= 0.0:
+            return x
+        orig_min = x.min()
+        orig_max = x.max()
+        x_norm = (x - orig_min)/(orig_max - orig_min + 1e-8)
+        luminance = 0.2989*x_norm[:,0:1]+0.5870*x_norm[:,1:2]+0.1140*x_norm[:,2:3]
+        edge_x = F.conv2d(luminance, self.kernel_x, padding=1)
+        edge_y = F.conv2d(luminance, self.kernel_y, padding=1)
+        edge_magnitude = torch.sqrt(edge_x.pow(2)+edge_y.pow(2))
+        edge_magnitude = edge_magnitude/(edge_magnitude.max()+1e-8)
+        edge_strength = (edge_strength/100.0)*0.2
+        enhancement = edge_magnitude*edge_strength
+        result = torch.zeros_like(x_norm)
+        for c in range(3):
+            result[:,c:c+1] = x_norm[:,c:c+1]*(1.0+enhancement)
+        result = (result - result.min())/(result.max()-result.min()+1e-8)
+        result = result*(orig_max - orig_min)+orig_min
+        result = torch.clamp(result, min=orig_min, max=orig_max)
+        return result
+
+
+class ColorBalanceBlock(nn.Module):
+    """Balances colors across different luminance ranges."""
+    def __init__(self, channels, color_preservation=0.5):
+        super(ColorBalanceBlock, self).__init__()
+        self.color_preservation = color_preservation
+        self.shadows_param = nn.Parameter(torch.zeros(channels))
+        self.midtones_param = nn.Parameter(torch.zeros(channels))
+        self.highlights_param = nn.Parameter(torch.zeros(channels))
+        self.color_temp = nn.Parameter(torch.tensor([0.0]))
+        self.channel_corr = nn.Linear(channels, channels, bias=False)
+        self.shadow_threshold = nn.Parameter(torch.tensor([0.2]))
+        self.highlight_threshold = nn.Parameter(torch.tensor([0.8]))
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.context_transform = nn.Sequential(
+            nn.Conv2d(channels, channels // 2, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 2, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        print(f"EdgeEnhancementBlock Input Shape: {x.shape}")  # Debug
-        if x.dim() != 4:
-            raise ValueError(f"Expected 4D tensor, but got {x.dim()}D tensor")
+        B, C, H, W = x.shape
+        luminance = 0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3]
+        shadows_mask = (luminance < self.shadow_threshold).float()
+        highlights_mask = (luminance > self.highlight_threshold).float()
+        midtones_mask = 1.0 - shadows_mask - highlights_mask
 
-        # Extract edges using learned filters
-        edges = x.mean(dim=1, keepdim=True)  # [batch, 1, H, W]
-        print(f"After Mean Shape: {edges.shape}")  # Debug
+        shadows_adjust = self.shadows_param.view(1, C, 1, 1)
+        midtones_adjust = self.midtones_param.view(1, C, 1, 1)
+        highlights_adjust = self.highlights_param.view(1, C, 1, 1)
+        adjust_map = shadows_mask * shadows_adjust + midtones_mask * midtones_adjust + highlights_mask * highlights_adjust
+        x_balanced = x + adjust_map
 
-        edges = F.conv2d(edges, self.edge_weights, padding=1)  # [batch, 8, H, W]
-        print(f"After Conv2d Shape: {edges.shape}")  # Debug
+        x_reshaped = x_balanced.view(B, C, -1).transpose(1, 2)
 
-        edges = torch.sigmoid(edges)
-        print(f"After Sigmoid Shape: {edges.shape}")  # Debug
+        # Ensure x_reshaped is the same dtype as channel_corr's weights
+        x_reshaped = x_reshaped.to(self.channel_corr.weight.dtype)
 
-        if edges.dim() < 2:
-            raise ValueError(f"Expected tensor with at least 2 dimensions, but got {edges.dim()}")
+        x_corr = self.channel_corr(x_reshaped).transpose(1, 2).view(B, C, H, W)
 
-        try:
-            edges = edges.max(dim=1, keepdim=True)[0]  # [batch, 1, H, W]
-            print(f"After Max Shape: {edges.shape}")  # Debug
-        except Exception as e:
-            print(f"Error during torch.max: {e}")
-            raise
+        temp_val = self.color_temp
+        x_corr[:, 0, :, :] += temp_val * 0.05
+        x_corr[:, 2, :, :] -= temp_val * 0.05
 
-        # Enhance features near edges
-        features = F.relu(self.conv1(x))
-        print(f"After Conv1 Shape: {features.shape}")  # Debug
-
-        enhanced = self.conv2(features)
-        print(f"After Conv2 Shape: {enhanced.shape}")  # Debug
-
-        return x + enhanced * edges
+        context = self.global_pool(x_corr)
+        context = self.context_transform(context)
+        x_corr = x_corr * context
+        x_final = self.color_preservation * x + (1.0 - self.color_preservation) * x_corr
+        return x_final
 
 
 class ColorCorrectionNet(nn.Module):
-    """Neural network for HDR-aware color correction"""
+    """Neural network for color correction using pretrained models."""
 
     def __init__(self):
         super(ColorCorrectionNet, self).__init__()
+        try:
+            self.vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
+            self.resnet = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
+            self.densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+        except Exception as e:
+            print(f"Error loading pre-trained models: {e}")
+            sys.exit(1)
 
-        # Load pre-trained backbone models
-        self.vgg = PRETRAINED_MODELS['vgg'](weights=models.VGG16_Weights.DEFAULT)
-        self.resnet = PRETRAINED_MODELS['resnet'](weights=models.ResNet34_Weights.DEFAULT)
-        self.densenet = PRETRAINED_MODELS['densenet'](weights=models.DenseNet121_Weights.DEFAULT)
-
-        # Freeze backbone models
+        # Freeze pretrained models
         for model in [self.vgg, self.resnet, self.densenet]:
             for param in model.parameters():
                 param.requires_grad = False
+            model.eval()
 
-        # Initial feature extraction and dimension reduction
-        self.init_conv = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True)
-        )
-
-        # Adaptation layers for each network's features
+        # Simplified adaptation layers
         self.vgg_adapt = nn.Sequential(
-            nn.Conv2d(64, 32, 1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(64, 256, 1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
 
         self.resnet_adapt = nn.Sequential(
-            nn.Conv2d(64, 32, 1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(64, 256, 1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
 
         self.densenet_adapt = nn.Sequential(
-            nn.Conv2d(64, 32, 1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(64, 256, 1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
 
-        # Feature fusion
+        # Simplified fusion with anti-artifact measures
         self.fusion = nn.Sequential(
-            nn.Conv2d(96, 64, 1),  # 32*3 = 96 channels
-            nn.BatchNorm2d(64),
+            nn.Conv2d(768, 384, 1),
+            nn.BatchNorm2d(384),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(384, 192, 1),
+            nn.BatchNorm2d(192),
             nn.ReLU(inplace=True)
         )
 
-        # Edge enhancement blocks
-        self.edge_blocks = nn.ModuleList([
-            EdgeEnhancementBlock(64) for _ in range(2)
-        ])
-
-        # Attention blocks
-        self.attention_blocks = nn.ModuleList([
-            AttentionBlock(64) for _ in range(2)
-        ])
-
-        # Final color transformation
+        # Modified color transform to prevent banding
         self.color_transform = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.Conv2d(192, 96, 3, padding=1),
+            nn.BatchNorm2d(96),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.Conv2d(96, 48, 3, padding=1),
+            nn.BatchNorm2d(48),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=3, padding=1),
-            nn.Tanh()
+            nn.Conv2d(48, 3, 3, padding=1),
+            nn.Sigmoid()  # Changed to Sigmoid for smoother color transitions
         )
 
-    def extract_vgg_features(self, x):
-        features = []
-        for i, layer in enumerate(self.vgg.features):
-            x = layer(x)
-            if i == 4:  # After second conv layer
-                features.append(x)
-                break
-        return features[0]
+        # Minimal enhancement blocks
+        self.edge_enhance = EdgeEnhancementBlock()
+        self.cbam = CBAM(192, reduction=8)  # Reduced complexity
 
-    def extract_resnet_features(self, x):
-        x = self.resnet.conv1(x)
-        x = self.resnet.bn1(x)
-        x = self.resnet.relu(x)
-        x = self.resnet.maxpool(x)
-        x = self.resnet.layer1(x)
-        return x
+    def extract_features(self, x):
+        # VGG features
+        vgg_feat = self.vgg.features[:5](x)
+        vgg_feat = self.vgg_adapt(vgg_feat)
 
-    def extract_densenet_features(self, x):
-        x = self.densenet.features[:4](x)  # First dense block
-        return x
+        # ResNet features
+        x_res = self.resnet.conv1(x)
+        x_res = self.resnet.bn1(x_res)
+        x_res = self.resnet.relu(x_res)
+        resnet_feat = self.resnet_adapt(x_res)
+
+        # DenseNet features
+        densenet_feat = self.densenet.features[:4](x)
+        densenet_feat = self.densenet_adapt(densenet_feat)
+
+        return vgg_feat, resnet_feat, densenet_feat
 
     def forward(self, x):
-        # Initial feature extraction
-        init_features = self.init_conv(x)
+        with torch.inference_mode():
+            # Ensure proper dtype and range
+            if x.device.type == 'cpu':
+                x = x.float()
 
-        # Extract features from each backbone
-        vgg_features = self.extract_vgg_features(x)
-        resnet_features = self.extract_resnet_features(x)
-        densenet_features = self.extract_densenet_features(x)
+            # Preserve original range
+            x_min = x.amin(dim=[2, 3], keepdim=True)
+            x_max = x.amax(dim=[2, 3], keepdim=True)
+            x_range = x_max - x_min
+            eps = 1e-8
 
-        # Ensure all features have the same spatial dimensions
-        target_size = (x.shape[2] // 2, x.shape[3] // 2)
-        vgg_features = F.interpolate(vgg_features, size=target_size, mode='bilinear', align_corners=True)
-        resnet_features = F.interpolate(resnet_features, size=target_size, mode='bilinear', align_corners=True)
-        densenet_features = F.interpolate(densenet_features, size=target_size, mode='bilinear', align_corners=True)
+            # Normalize with epsilon to prevent division by zero
+            x_normalized = (x - x_min) / (x_range + eps)
 
-        # Adapt features
-        vgg_adapted = self.vgg_adapt(vgg_features)
-        resnet_adapted = self.resnet_adapt(resnet_features)
-        densenet_adapted = self.densenet_adapt(densenet_features)
+            # Extract features
+            vgg_feat, resnet_feat, densenet_feat = self.extract_features(x_normalized)
 
-        # Concatenate features
-        combined = torch.cat([vgg_adapted, resnet_adapted, densenet_adapted], dim=1)
+            # Ensure consistent spatial dimensions
+            target_size = vgg_feat.shape[-2:]
+            resnet_feat = F.interpolate(resnet_feat, size=target_size, mode='bilinear', align_corners=False)
+            densenet_feat = F.interpolate(densenet_feat, size=target_size, mode='bilinear', align_corners=False)
 
-        # Fuse features
-        fused = self.fusion(combined)
+            # Fuse features
+            fused = self.fusion(torch.cat([vgg_feat, resnet_feat, densenet_feat], dim=1))
+            del vgg_feat, resnet_feat, densenet_feat
 
-        # Apply edge enhancement and attention
-        features = fused
-        for edge_block, attention_block in zip(self.edge_blocks, self.attention_blocks):
-            features = edge_block(features)
-            features = attention_block(features)
+            # Apply attention and enhancement
+            fused = self.cbam(fused)
 
-        # Final color transformation
-        residual = self.color_transform(features)
+            # Generate color adjustment
+            delta = self.color_transform(fused)
+            del fused
 
-        # Upsample residual to match input size
-        residual = F.interpolate(residual, size=(x.shape[2], x.shape[3]), mode='bilinear', align_corners=True)
+            # Upsample delta to match input resolution
+            delta = F.interpolate(delta, size=x.shape[-2:], mode='bilinear', align_corners=False)
 
-        # Add residual and clamp
-        enhanced = x + residual
-        return torch.clamp(enhanced, -1, 1)
+            # Apply subtle color enhancement
+            delta = (delta - 0.5) * 0.2  # Scale adjustments to ±0.1 range
+            enhanced = x_normalized * (1.0 + delta)
+
+            # Restore original range with smooth clamping
+            enhanced = enhanced * x_range + x_min
+            enhanced = torch.clamp(enhanced, min=x_min, max=x_max)
+
+            # Cleanup
+            if x.device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+            return enhanced
 
 
-class VibrancyEnhancer:
-    """Handles color vibrance enhancement while preserving natural look"""
+class OptimizedJXRLoader:
+    """Handles loading and processing of JXR images."""
+    def __init__(self, device):
+        self.device = device
+        self.hdr_peak_luminance = 10000.0
+        self.selected_tone_map = "adaptive"
+        self.selected_pre_gamma = 1.0
+        self.selected_auto_exposure = 1.0
+        self.ACES_INPUT_MAT = torch.tensor([
+            [0.59719,0.35458,0.04823],
+            [0.07600,0.90834,0.01566],
+            [0.02840,0.13383,0.83777]
+        ])
+        self.ACES_OUTPUT_MAT = torch.tensor([
+            [1.60475,-0.53108,-0.07367],
+            [-0.10208,1.10813,-0.00605],
+            [-0.00327,-0.07276,1.07602]
+        ])
 
-    def __init__(self):
-        self.saturation_boost = 1.2
-        self.vibrance_threshold = 0.5
+    def _apply_gamma_correction(self, image: np.ndarray, gamma: float) -> np.ndarray:
+        pos_mask = image > 0
+        result = np.zeros_like(image)
+        if np.any(pos_mask):
+            result[pos_mask] = np.power(image[pos_mask], gamma)
+        return result
 
-    def rgb_to_hsv(self, rgb):
-        """Convert RGB to HSV color space"""
-        print(f"VibrancyEnhancer.rgb_to_hsv: Input RGB shape: {rgb.shape}")  # Debug
-        # Ensure input is in range [0, 1]
-        rgb = torch.clamp(rgb, 0, 1)
-        print(f"VibrancyEnhancer.rgb_to_hsv: After clamp RGB shape: {rgb.shape}")  # Debug
-
-        # Get max and min values across channels
-        cmax, cmax_idx = torch.max(rgb, dim=1, keepdim=True)
-        cmin = torch.min(rgb, dim=1, keepdim=True)[0]
-        delta = cmax - cmin
-        print(f"VibrancyEnhancer.rgb_to_hsv: cmax shape: {cmax.shape}, cmin shape: {cmin.shape}, delta shape: {delta.shape}")  # Debug
-
-        # Calculate Hue
-        hue = torch.zeros_like(cmax)
-        print(f"VibrancyEnhancer.rgb_to_hsv: Initialized hue shape: {hue.shape}")  # Debug
-
-        # Red is max
-        red_mask = (cmax_idx == 0) & (delta != 0)
-        hue[red_mask] = (((rgb[:, 1:2] - rgb[:, 2:3]) / delta) % 6)[red_mask]
-        print(f"VibrancyEnhancer.rgb_to_hsv: After red_mask hue shape: {hue.shape}")  # Debug
-
-        # Green is max
-        green_mask = (cmax_idx == 1) & (delta != 0)
-        hue[green_mask] = (((rgb[:, 2:3] - rgb[:, 0:1]) / delta) + 2)[green_mask]
-        print(f"VibrancyEnhancer.rgb_to_hsv: After green_mask hue shape: {hue.shape}")  # Debug
-
-        # Blue is max
-        blue_mask = (cmax_idx == 2) & (delta != 0)
-        hue[blue_mask] = (((rgb[:, 0:1] - rgb[:, 1:2]) / delta) + 4)[blue_mask]
-        print(f"VibrancyEnhancer.rgb_to_hsv: After blue_mask hue shape: {hue.shape}")  # Debug
-
-        hue = hue / 6
-        print(f"VibrancyEnhancer.rgb_to_hsv: After normalization hue shape: {hue.shape}")  # Debug
-
-        # Calculate Saturation
-        saturation = torch.where(cmax != 0, delta / cmax, torch.zeros_like(delta))
-        print(f"VibrancyEnhancer.rgb_to_hsv: Saturation shape: {saturation.shape}")  # Debug
-
-        # Value is maximum of RGB channels
-        value = cmax
-        print(f"VibrancyEnhancer.rgb_to_hsv: Value shape: {value.shape}")  # Debug
-
-        hsv = torch.cat([hue, saturation, value], dim=1)
-        print(f"VibrancyEnhancer.rgb_to_hsv: Concatenated HSV shape: {hsv.shape}")  # Debug
-        return hsv
-
-    def hsv_to_rgb(self, hsv):
-        """Convert HSV to RGB color space"""
-        print(f"VibrancyEnhancer.hsv_to_rgb: Input HSV shape: {hsv.shape}")  # Debug
-        h, s, v = hsv[:, 0:1], hsv[:, 1:2], hsv[:, 2:3]
-        print(f"VibrancyEnhancer.hsv_to_rgb: Split H, S, V shapes: {h.shape}, {s.shape}, {v.shape}")  # Debug
-        h = h * 6
-        print(f"VibrancyEnhancer.hsv_to_rgb: H scaled shape: {h.shape}")  # Debug
-
-        c = v * s
-        x = c * (1 - torch.abs(h % 2 - 1))
-        m = v - c
-        print(f"VibrancyEnhancer.hsv_to_rgb: C, X, M shapes: {c.shape}, {x.shape}, {m.shape}")  # Debug
-
-        rgb = torch.zeros_like(hsv)
-        print(f"VibrancyEnhancer.hsv_to_rgb: Initialized RGB shape: {rgb.shape}")  # Debug
-
-        # Masks for different hue ranges
-        mask1 = (h < 1)
-        mask2 = (h >= 1) & (h < 2)
-        mask3 = (h >= 2) & (h < 3)
-        mask4 = (h >= 3) & (h < 4)
-        mask5 = (h >= 4) & (h < 5)
-        mask6 = (h >= 5)
-
-        # Apply masks to assign RGB values
-        # For mask1: R = C, G = X, B = 0
-        rgb[:, 0][mask1[:, 0]] = c[mask1]
-        rgb[:, 1][mask1[:, 0]] = x[mask1]
-        rgb[:, 2][mask1[:, 0]] = torch.zeros_like(x[mask1])
-
-        # For mask2: R = X, G = C, B = 0
-        rgb[:, 0][mask2[:, 0]] = x[mask2]
-        rgb[:, 1][mask2[:, 0]] = c[mask2]
-        rgb[:, 2][mask2[:, 0]] = torch.zeros_like(x[mask2])
-
-        # For mask3: R = 0, G = C, B = X
-        rgb[:, 0][mask3[:, 0]] = torch.zeros_like(x[mask3])
-        rgb[:, 1][mask3[:, 0]] = c[mask3]
-        rgb[:, 2][mask3[:, 0]] = x[mask3]
-
-        # For mask4: R = 0, G = X, B = C
-        rgb[:, 0][mask4[:, 0]] = torch.zeros_like(x[mask4])
-        rgb[:, 1][mask4[:, 0]] = x[mask4]
-        rgb[:, 2][mask4[:, 0]] = c[mask4]
-
-        # For mask5: R = X, G = 0, B = C
-        rgb[:, 0][mask5[:, 0]] = x[mask5]
-        rgb[:, 1][mask5[:, 0]] = torch.zeros_like(x[mask5])
-        rgb[:, 2][mask5[:, 0]] = c[mask5]
-
-        # For mask6: R = C, G = 0, B = X
-        rgb[:, 0][mask6[:, 0]] = c[mask6]
-        rgb[:, 1][mask6[:, 0]] = torch.zeros_like(x[mask6])
-        rgb[:, 2][mask6[:, 0]] = x[mask6]
-
-        rgb = rgb + m
-        print(f"VibrancyEnhancer.hsv_to_rgb: After adding M RGB shape: {rgb.shape}")  # Debug
-        return rgb
-
-    def enhance(self, image_tensor):
-        """Apply vibrance enhancement to image tensor"""
+    def load_jxr(self, file_path: str, is_preview: bool=False):
+        """Loads and preprocesses a JXR image."""
         try:
-            print(f"VibrancyEnhancer.enhance: Input tensor shape: {image_tensor.shape}")  # Debug
-            # Convert to HSV space
-            rgb_scaled = (image_tensor + 1) / 2
-            print(f"VibrancyEnhancer.enhance: RGB_scaled shape: {rgb_scaled.shape}")  # Debug
-            hsv = self.rgb_to_hsv(rgb_scaled)
-            print(f"VibrancyEnhancer.enhance: HSV shape: {hsv.shape}")  # Debug
+            with open(file_path, 'rb') as f:
+                jxr_data = f.read()
 
-            # Selectively boost saturation based on current levels
-            mask = hsv[:, 1:2, :, :] < self.vibrance_threshold
-            print(f"VibrancyEnhancer.enhance: Mask shape: {mask.shape}")  # Debug
-            hsv[:, 1:2, :, :] = torch.where(
-                mask,
-                hsv[:, 1:2, :, :] * self.saturation_boost,
-                hsv[:, 1:2, :, :]
-            )
-            print("VibrancyEnhancer.enhance: Saturation boosted based on mask")  # Debug
+            image = imagecodecs.jpegxr_decode(jxr_data)
+            if image is None:
+                raise ValueError("Failed to decode JXR image")
+            image = image.astype(np.float32)
 
-            # Convert back to RGB
-            rgb = self.hsv_to_rgb(hsv)
-            print(f"VibrancyEnhancer.enhance: RGB shape after conversion: {rgb.shape}")  # Debug
-            return rgb * 2 - 1
+            if is_preview:
+                pre_gamma = 1.0
+                auto_exposure = 1.0
+                tone_map = 'uncharted2'
+            else:
+                pre_gamma = 1.0 + (self.selected_pre_gamma - 1.0)/3.0
+                auto_exposure = 1.0 + (self.selected_auto_exposure - 1.0)/3.0
+                tone_map = self.selected_tone_map
 
+            if pre_gamma != 1.0:
+                gamma = 1.0 / pre_gamma
+                image = self._apply_gamma_correction(image, gamma)
+
+            if auto_exposure != 1.0:
+                mean_luminance = np.mean(image)
+                exposure_factor = auto_exposure
+                if mean_luminance > 0:
+                    exposure_factor *= (0.18 / mean_luminance)
+                image *= exposure_factor
+
+            display_peak = 1000.0
+            image = image * (display_peak / self.hdr_peak_luminance)
+
+            if image.ndim == 2:
+                image = np.stack([image]*3, axis=-1)
+            elif image.shape[2] == 4:
+                image = image[:,:,:3]
+
+            image = np.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
+            tensor = torch.from_numpy(image).float().permute(2,0,1).contiguous().unsqueeze(0)
+            # Move tensor to device and maybe half precision for memory saving
+            if self.device.type == 'cuda':
+                tensor = tensor.to(self.device, non_blocking=True)
+                tensor = tensor.half()
+
+            # Apply tone map
+            if tone_map == 'hable' or is_preview:
+                tensor = self._tone_map_hable(tensor)
+            elif tone_map == 'reinhard':
+                tensor = self._tone_map_reinhard(tensor)
+            elif tone_map == 'filmic':
+                tensor = self._tone_map_filmic(tensor)
+            elif tone_map == 'aces':
+                tensor = self._tone_map_aces(tensor)
+            elif tone_map == 'uncharted2':
+                tensor = self._tone_map_uncharted2(tensor)
+            elif tone_map == 'adaptive':
+                tensor = self._tone_map_adaptive(tensor)
+
+            tensor = self.linear_to_srgb(tensor)
+            return tensor, None, {}
         except Exception as e:
-            print(f"VibrancyEnhancer.enhance: Failed with error: {e}")  # Debug
-            raise
+            logging.error(f"Failed to load HDR image: {e}")
+            return None, str(e), {}
+
+    def _tone_map_hable(self, x):
+        """Applies Hable's tone mapping."""
+        A,B,C,D,E,F_=0.22,0.30,0.10,0.20,0.01,0.30
+        W=11.2
+        def evaluate(v):
+            num=(v*(A*v+C*B)+D*E)
+            den=(v*(A*v+B)+D*F_)
+            return num/(den+1e-6)-E/F_
+        nom = evaluate(x)
+        denom = evaluate(torch.tensor(W, device=x.device, dtype=x.dtype))
+        return nom/(denom+1e-6)
+
+    def _tone_map_reinhard(self, x, L_white=4.0):
+        """Applies Reinhard's tone mapping."""
+        L = 0.2126*x[:,0] + 0.7152*x[:,1] + 0.0722*x[:,2]
+        L_avg = torch.mean(L)
+        L = L / (L_avg + 1e-6)
+        L_scaled = (L * (1.0 + L / (L_white * L_white))) / (1.0 + L)
+        ratio = torch.where(L > 1e-8, L_scaled / (L + 1e-6), torch.ones_like(L))
+        return torch.stack([x[:,i] * ratio for i in range(3)], dim=1)
+
+    def _tone_map_aces(self, x):
+        """Applies ACES tone mapping."""
+        if self.ACES_INPUT_MAT.device != x.device:
+            self.ACES_INPUT_MAT = self.ACES_INPUT_MAT.to(x.device, dtype=x.dtype)
+            self.ACES_OUTPUT_MAT = self.ACES_OUTPUT_MAT.to(x.device, dtype=x.dtype)
+
+        batch, channels, height, width = x.shape
+        x_reshaped = x.view(batch, channels, -1)
+        x_transformed = torch.einsum('ij,bjk->bik', self.ACES_INPUT_MAT, x_reshaped)
+        a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
+        x_tonemapped = (x_transformed * (a * x_transformed + b)) / (x_transformed * (c * x_transformed + d) + e)
+        x_output = torch.einsum('ij,bjk->bik', self.ACES_OUTPUT_MAT, x_tonemapped)
+        return x_output.view(batch, channels, height, width).contiguous()
+
+    def _tone_map_filmic(self, x):
+        """Applies Filmic tone mapping."""
+        x = torch.max(torch.zeros_like(x), x)
+        A,B,C,D,E,F_=0.22,0.30,0.10,0.20,0.01,0.30
+        def filmic_curve(v):
+            return ((v*(A*v+C*B)+D*E)/(v*(A*v+B)+D*F_))-E/F_
+        return filmic_curve(x)
+
+    def _tone_map_uncharted2(self, x):
+        """Applies Uncharted2 tone mapping."""
+        A,B,C,D,E,F_=0.15,0.50,0.10,0.20,0.02,0.30
+        def uncharted2_tonemap(v):
+            return ((v*(A*v+C*B)+D*E)/(v*(A*v+B)+D*F_))-E/F_
+        exposure_bias = 2.0
+        curr = uncharted2_tonemap(x * exposure_bias)
+        W = 11.2
+        white_scale = uncharted2_tonemap(torch.tensor(W, device=x.device, dtype=x.dtype))
+        return curr / white_scale
+
+    def _tone_map_adaptive(self, x):
+        """Applies adaptive tone mapping based on dynamic range."""
+        L = 0.2126*x[:,0] + 0.7152*x[:,1] + 0.0722*x[:,2]
+        avg_luminance = torch.mean(L)
+        max_luminance = torch.max(L)
+        dynamic_range = max_luminance / (avg_luminance + 1e-6)
+        if dynamic_range > 100:
+            return self._tone_map_aces(x)
+        elif dynamic_range > 10:
+            return self._tone_map_hable(x)
+        elif avg_luminance < 0.1:
+            return self._tone_map_uncharted2(x)
+        else:
+            return self._tone_map_reinhard(x)
+
+    def linear_to_srgb(self, linear_rgb):
+        """Converts linear RGB to sRGB."""
+        linear_rgb = torch.clamp(linear_rgb, 0.0, 1.0)
+        a = 0.055
+        gamma = 2.4
+        srgb = torch.where(
+            linear_rgb <= 0.0031308,
+            12.92 * linear_rgb,
+            (1 + a) * torch.pow(linear_rgb, 1.0 / gamma) - a
+        )
+        return torch.clamp(srgb, 0.0, 1.0)
+
+    def process_preview(self, tensor_data, target_width: int, target_height: int):
+        """Generates a preview tensor resized to target dimensions."""
+        try:
+            tensor = tensor_data[0] if isinstance(tensor_data, tuple) else tensor_data
+            if tensor is None:
+                return None
+            _, _, h, w = tensor.shape
+            width_ratio = target_width / w
+            height_ratio = target_height / h
+            scale_factor = min(width_ratio, height_ratio)
+            new_width = int(w * scale_factor)
+            new_height = int(h * scale_factor)
+            with torch.inference_mode():
+                preview_tensor = F.interpolate(tensor, size=(new_height, new_width),
+                                               mode='bicubic', align_corners=False, antialias=True)
+            return torch.clamp(preview_tensor, 0.0, 1.0)
+        except Exception as e:
+            logging.error(f"Preview generation failed: {str(e)}")
+            return None
+
+    def tensor_to_pil(self, tensor: torch.Tensor):
+        """Converts a tensor to a PIL Image."""
+        try:
+            if tensor.is_cuda:
+                tensor = tensor.cpu()
+            tensor = tensor.float()  # Convert back to float32 for PIL
+            tensor = torch.clamp(tensor, 0.0, 1.0)
+            tensor = (tensor * 255).byte()
+            img_array = tensor.squeeze(0).permute(1, 2, 0).numpy()
+            return Image.fromarray(img_array)
+        except Exception as e:
+            logging.error(f"Tensor to PIL conversion failed: {e}")
+            return None
 
 
-# ============================================================
-# COLOR PROCESSING CLASSES
-# ============================================================
 class HDRColorProcessor:
-    """Handles HDR color processing and correction"""
+    """Processes HDR images with color and edge enhancements."""
+    def __init__(self, device, jxr_loader):
+        self.device = device
+        self.jxr_loader = jxr_loader
+        self.color_net = ColorCorrectionNet().eval().to(device)
+        # Convert model to half if GPU is available for memory saving
+        if device.type == 'cuda':
+            self.color_net.half()
+        self.edge_enhancement = EdgeEnhancementBlock().to(device)
+        if device.type == 'cuda':
+            self.edge_enhancement.half()
 
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Initializing color processor on {self.device}")
+    def clear_gpu_memory(self):
+        """Clears GPU memory cache."""
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-        print("Checking and downloading pre-trained models...")
-        self.download_models()
+    def process_image(self, original_tensor, output_path, color_strength=0.0, edge_strength=0.0, use_enhancement=True):
+        """
+        Process an HDR image tensor with color and edge enhancements.
 
-        print("Loading models...")
-        self.color_net = ColorCorrectionNet().to(self.device)
-        self.vibrance_enhancer = VibrancyEnhancer()
+        Args:
+            original_tensor (torch.Tensor): Input HDR image tensor
+            output_path (str): Path to save the processed image
+            color_strength (float): Strength of color enhancement (0-100)
+            edge_strength (float): Strength of edge enhancement (0-100)
+            use_enhancement (bool): Whether to apply AI enhancement
 
-        # Set model to evaluation mode
-        self.color_net.eval()
-        print("Models loaded successfully")
-
-    def download_models(self):
-        """Download pre-trained models if not present"""
-        model_configs = {
-            'vgg16': models.VGG16_Weights.DEFAULT,
-            'resnet34': models.ResNet34_Weights.DEFAULT,
-            'densenet121': models.DenseNet121_Weights.DEFAULT
-        }
-
-        for model_name, weights in model_configs.items():
-            print(f"\nChecking {model_name}...")
-            try:
-                # Get the download URL
-                url = weights.url
-
-                # Get the cached file path
-                filename = url.split('/')[-1]
-                cache_dir = os.path.expanduser('~/.cache/torch/hub/checkpoints')
-                os.makedirs(cache_dir, exist_ok=True)
-                cached_file = os.path.join(cache_dir, filename)
-
-                if os.path.exists(cached_file):
-                    print(f"{model_name} already cached at {cached_file}")
-                    continue
-
-                # Download the file with progress bar
-                print(f"Downloading {model_name} from {url}")
-                response = requests.get(url, stream=True)
-                total_size = int(response.headers.get('content-length', 0))
-
-                with open(cached_file, 'wb') as f, tqdm(
-                        desc=f"Downloading {model_name}",
-                        total=total_size,
-                        unit='iB',
-                        unit_scale=True
-                ) as pbar:
-                    for data in response.iter_content(chunk_size=1024):
-                        size = f.write(data)
-                        pbar.update(size)
-
-                print(f"Successfully downloaded {model_name}")
-
-            except Exception as e:
-                print(f"Warning: Error downloading {model_name}: {str(e)}")
-                print("Will attempt to download during model initialization")
-
-    def _preprocess_image(self, image):
-        """Preprocess image for the neural network"""
+        Returns:
+            PIL.Image or None: Processed image if successful, None if failed
+        """
         try:
-            # Ensure the image is in RGB mode
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            # Move tensor to correct device and set precision
+            tensor = original_tensor.to(self.device)
+            if self.device.type == 'cuda':
+                tensor = tensor.half()  # Use half precision only on GPU
+            else:
+                tensor = tensor.float()  # Use full precision on CPU
 
-            transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-            ])
-            tensor = transform(image).unsqueeze(0).to(self.device)
-            print(f"DEBUG: Preprocessed tensor shape: {tensor.shape}")  # Debug
-            return tensor
-        except Exception as e:
-            print(f"DEBUG: Preprocessing failed: {str(e)}")  # Debug
-            raise
+            # Add padding for processing
+            pad_size = 32
+            padded_tensor = F.pad(tensor, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
 
-    def _postprocess_image(self, tensor):
-        """Convert tensor back to PIL Image"""
-        tensor = (tensor + 1) / 2.0
-        tensor = tensor.squeeze(0).cpu()
-        return transforms.ToPILImage()(tensor)
+            with torch.inference_mode():
+                # Apply color enhancement if enabled
+                if use_enhancement and color_strength > 0:
+                    enhanced = self.color_net(padded_tensor)
+                    normalized_strength = (color_strength / 100.0) * 1.5
+                    enhanced_strength = pow(normalized_strength, 0.7)
+                    enhanced = padded_tensor * (1 - enhanced_strength) + enhanced * enhanced_strength
+                else:
+                    enhanced = padded_tensor
 
-    def process_image(self, input_path, output_path, color_features=None, strength=0.7):
-        """Process image with HDR-aware color correction"""
-        try:
-            print(f"DEBUG: Opening input file: {input_path}")  # Debug
-            # Open image without specifying format
-            image = Image.open(input_path)
+                # Apply edge enhancement if enabled
+                if edge_strength > 0:
+                    enhanced = self.edge_enhancement(enhanced, edge_strength=edge_strength)
 
-            print(f"DEBUG: Image format: {image.format}")  # Debug
-            print(f"DEBUG: Image mode: {image.mode}")  # Debug
-            print(f"DEBUG: Image size: {image.size}")  # Debug
+                # Remove padding and convert back to float32 for CPU processing
+                enhanced = enhanced[:, :, pad_size:-pad_size, pad_size:-pad_size].float().cpu()
 
-            if image.mode != 'RGB':
-                print(f"DEBUG: Converting image from {image.mode} to RGB")  # Debug
-                image = image.convert('RGB')
+                # Convert to numpy array for saving
+                array = enhanced.squeeze(0).permute(1, 2, 0).numpy()
 
-            # Transform to tensor
-            image_tensor = self._preprocess_image(image)
+                # Clean up GPU memory
+                del enhanced, padded_tensor, tensor
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
-            with torch.no_grad():
-                # Apply color correction
-                enhanced = self.color_net(image_tensor)
+                # Normalize the array for saving as JPEG
+                array_max = array.max(axis=(0, 1), keepdims=True)
+                array_min = array.min(axis=(0, 1), keepdims=True)
+                array = (array - array_min) / (array_max - array_min + 1e-8) * 255.0
+                array = np.clip(array, 0, 255).astype(np.uint8)
 
-                # Enhance vibrance
-                enhanced = self.vibrance_enhancer.enhance(enhanced)
+                # Convert to PIL Image and save
+                result_image = Image.fromarray(array)
+                result_image.save(output_path, 'JPEG', quality=95, optimize=True)
 
-                # Blend with original based on strength
-                blend_factor = strength
-                blended = (
-                        blend_factor * enhanced +
-                        (1.0 - blend_factor) * image_tensor
-                )
-
-                # Convert to image and save
-                result_image = self._postprocess_image(blended)
-                result_image.save(output_path, 'JPEG', quality=95)
+                # Final cleanup
+                gc.collect()
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
                 return result_image
 
         except Exception as e:
-            traceback.print_exc()  # Print full traceback
-            print(f"DEBUG: Color correction failed: {str(e)}")  # Debug
-            print(f"DEBUG: Attempting fallback conversion")  # Debug
+            print(f"Processing failed: {str(e)}")
+            traceback.print_exc()
+            return None
 
-            # Fallback: direct conversion if AI processing fails
-            try:
-                image = Image.open(input_path)
-                print(f"DEBUG: Fallback - Image format: {image.format}, mode: {image.mode}")  # Debug
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                image.save(output_path, 'JPEG', quality=95)
-                print("DEBUG: Fallback conversion successful")  # Debug
-                return image
-            except Exception as fallback_error:
-                print(f"DEBUG: Fallback conversion also failed: {str(fallback_error)}")  # Debug
-                raise
+    def switch_device(self, use_gpu):
+        """Switches the processing device and updates model data types accordingly."""
+        new_device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+        if new_device != self.device:
+            self.clear_gpu_memory()
+            self.device = new_device
 
-    def apply_color_preservation(self, image_tensor, reference_tensor, strength=0.7):
-        """Apply color preservation using color transfer in LAB space"""
-        # Convert to LAB space using approximate conversion
-        image_lab = self._rgb_to_lab(image_tensor)
-        reference_lab = self._rgb_to_lab(reference_tensor)
+            # Define desired data type based on the device
+            desired_dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
 
-        # Compute statistics
-        image_mean = torch.mean(image_lab, dim=(2, 3), keepdim=True)
-        image_std = torch.std(image_lab, dim=(2, 3), keepdim=True)
-        ref_mean = torch.mean(reference_lab, dim=(2, 3), keepdim=True)
-        ref_std = torch.std(reference_lab, dim=(2, 3), keepdim=True)
+            # Move color_net and edge_enhancement to the new device and dtype
+            self.color_net = self.color_net.to(device=self.device, dtype=desired_dtype)
+            self.edge_enhancement = self.edge_enhancement.to(device=self.device, dtype=desired_dtype)
 
-        # Apply color transfer with strength parameter
-        normalized = (image_lab - image_mean) / (image_std + 1e-6)
-        matched = normalized * (ref_std * strength + image_std * (1 - strength)) + \
-                  (ref_mean * strength + image_mean * (1 - strength))
+            # Move pretrained models inside color_net
+            for model in [self.color_net.vgg, self.color_net.resnet, self.color_net.densenet]:
+                model.to(device=self.device, dtype=desired_dtype)
 
-        # Convert back to RGB
-        return self._lab_to_rgb(matched)
+            # Move ACES matrices to the new device and dtype
+            self.jxr_loader.ACES_INPUT_MAT = self.jxr_loader.ACES_INPUT_MAT.to(device=self.device, dtype=desired_dtype)
+            self.jxr_loader.ACES_OUTPUT_MAT = self.jxr_loader.ACES_OUTPUT_MAT.to(device=self.device, dtype=desired_dtype)
 
-    def _rgb_to_lab(self, rgb):
-        """Convert RGB to LAB color space"""
-        # RGB to XYZ
-        rgb = (rgb + 1) / 2.0  # Scale from [-1, 1] to [0, 1]
-        print(f"HDRColorProcessor._rgb_to_lab: Input RGB shape: {rgb.shape}")  # Debug
-
-        # Define conversion matrices
-        rgb_to_xyz = torch.tensor([
-            [0.412453, 0.357580, 0.180423],
-            [0.212671, 0.715160, 0.072169],
-            [0.019334, 0.119193, 0.950227]
-        ]).to(rgb.device)
-
-        # Convert to XYZ
-        xyz = torch.einsum('ci,bchw->bihw', rgb_to_xyz, rgb)
-        print(f"HDRColorProcessor._rgb_to_lab: After RGB to XYZ shape: {xyz.shape}")  # Debug
-
-        # XYZ to LAB
-        # Reference white point (D65)
-        xyz_ref = torch.tensor([0.95047, 1.0, 1.08883]).view(1, 3, 1, 1).to(rgb.device)
-
-        # Scale XYZ relative to reference white
-        xyz_scaled = xyz / (xyz_ref + 1e-10)
-        print(f"HDRColorProcessor._rgb_to_lab: Scaled XYZ shape: {xyz_scaled.shape}")  # Debug
-
-        # Apply cube root transformation
-        mask = xyz_scaled > 0.008856
-        xyz_scaled[mask] = torch.pow(xyz_scaled[mask], 1 / 3)
-        xyz_scaled[~mask] = 7.787 * xyz_scaled[~mask] + 16 / 116
-        print(f"HDRColorProcessor._rgb_to_lab: After cube root transformation shape: {xyz_scaled.shape}")  # Debug
-
-        # Calculate LAB channels
-        L = (116 * xyz_scaled[:, 1:2] - 16)
-        a = 500 * (xyz_scaled[:, 0:1] - xyz_scaled[:, 1:2])
-        b = 200 * (xyz_scaled[:, 1:2] - xyz_scaled[:, 2:3])
-
-        lab = torch.cat([L, a, b], dim=1)
-        print(f"HDRColorProcessor._rgb_to_lab: LAB shape: {lab.shape}")  # Debug
-        return lab
-
-    def _lab_to_rgb(self, lab):
-        """Convert LAB to RGB color space"""
-        # LAB to XYZ
-        L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
-        print(f"HDRColorProcessor._lab_to_rgb: Split L, a, b shapes: {L.shape}, {a.shape}, {b.shape}")  # Debug
-
-        # Reference white point (D65)
-        xyz_ref = torch.tensor([0.95047, 1.0, 1.08883]).view(1, 3, 1, 1).to(lab.device)
-
-        # Calculate intermediate values
-        y = (L + 16) / 116
-        x = a / 500 + y
-        z = y - b / 200
-        print(f"HDRColorProcessor._lab_to_rgb: Intermediate x, y, z shapes: {x.shape}, {y.shape}, {z.shape}")  # Debug
-
-        # Apply inverse cube root transformation
-        xyz = torch.cat([x, y, z], dim=1)
-        mask = xyz > 0.206893
-        xyz[mask] = torch.pow(xyz[mask], 3)
-        xyz[~mask] = (xyz[~mask] - 16 / 116) / 7.787
-        print(f"HDRColorProcessor._lab_to_rgb: After inverse transformation XYZ shape: {xyz.shape}")  # Debug
-
-        # Scale by reference white
-        xyz = xyz * xyz_ref
-        print(f"HDRColorProcessor._lab_to_rgb: Scaled XYZ shape: {xyz.shape}")  # Debug
-
-        # XYZ to RGB
-        xyz_to_rgb = torch.tensor([
-            [3.240479, -1.537150, -0.498535],
-            [-0.969256, 1.875992, 0.041556],
-            [0.055648, -0.204043, 1.057311]
-        ]).to(lab.device)
-
-        rgb = torch.einsum('ci,bihw->bchw', xyz_to_rgb, xyz)
-        print(f"HDRColorProcessor._lab_to_rgb: After XYZ to RGB shape: {rgb.shape}")  # Debug
-
-        # Clip and scale to [-1, 1]
-        rgb = torch.clamp(rgb, 0, 1) * 2 - 1
-        print(f"HDRColorProcessor._lab_to_rgb: Final RGB shape: {rgb.shape}")  # Debug
-        return rgb
-
-
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
-def resource_path(relative_path):
-    """Get absolute path to resource, works for development and for PyInstaller"""
-    try:
-        base_path = sys._MEIPASS
-    except AttributeError:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-
-
-def decode_jxr_to_tiff(jxr_path: str) -> str:
-    """Decode JXR file to TIFF format"""
-    JXRDEC_PATH = resource_path("JXRDecApp.exe")
-    if not os.path.exists(JXRDEC_PATH):
-        raise FileNotFoundError("JXRDecApp.exe not found")
-
-    if not os.path.exists(jxr_path):
-        raise FileNotFoundError(f"Input JXR file not found: {jxr_path}")
-
-    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-        tiff_path = tmp.name
-
-    cmd = [JXRDEC_PATH, "-i", jxr_path, "-o", tiff_path]
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True, shell=True)
-
-    if not os.path.exists(tiff_path) or os.path.getsize(tiff_path) == 0:
-        raise subprocess.CalledProcessError(
-            returncode=result.returncode,
-            cmd=cmd,
-            stderr="Failed to create valid TIFF file"
-        )
-    return tiff_path
-
-
-def convert_tiff_to_png(tiff_path: str) -> str:
-    """Convert TIFF to PNG format"""
-    temp_png = tiff_path + ".png"
-    try:
-        subprocess.run(['magick', 'convert', tiff_path, temp_png],
-                       check=True, capture_output=True, text=True)
-        return temp_png
-    except:
-        try:
-            img = Image.open(tiff_path)
-            img.save(temp_png, 'PNG')
-            return temp_png
-        except Exception as e:
-            raise RuntimeError(f"Failed to convert TIFF to PNG: {str(e)}")
-
-
-def run_hdrfix(input_file: str, output_file: str, tone_map: str,
-               pre_gamma: str, auto_exposure: str) -> str:
-    """Run HDR conversion with specified parameters and verify output"""
-    HDRFIX_PATH = resource_path("hdrfix.exe")
-    if not os.path.exists(HDRFIX_PATH):
-        raise FileNotFoundError("hdrfix.exe not found")
-
-    # Force PNG output regardless of the extension provided
-    output_png = os.path.splitext(output_file)[0] + '.png'
-
-    print(f"DEBUG: Running HDRfix command with PNG output: {output_png}")  # Debug
-    cmd = [
-        HDRFIX_PATH, input_file, output_png,
-        "--tone-map", tone_map,
-        "--pre-gamma", pre_gamma,
-        "--auto-exposure", auto_exposure
-    ]
-
-    # Run HDRfix and capture output
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    print(f"DEBUG: HDRfix stdout: {result.stdout}")  # Debug
-    print(f"DEBUG: HDRfix stderr: {result.stderr}")  # Debug
-
-    # Verify output file exists and is valid
-    if not os.path.exists(output_png):
-        raise FileNotFoundError(f"HDRfix failed to create output file: {output_png}")
-
-    # Return the actual output file path
-    return output_png
+            logging.info(f"Switched to {self.device}")
+            return True
+        else:
+            logging.info(f"Already on {self.device}")
+            return False
 
 
 def validate_files(input_file: str, output_file: str) -> None:
-    """Validate input and output file paths"""
+    """Validates the existence of input and output file paths."""
     if not input_file or not os.path.exists(input_file):
         raise FileNotFoundError("Input file does not exist")
     if not output_file:
@@ -725,7 +692,7 @@ def validate_files(input_file: str, output_file: str) -> None:
 
 
 def validate_parameters(tone_map: str, pre_gamma: str, auto_exposure: str) -> None:
-    """Validate conversion parameters"""
+    """Validates the tone map, pre-gamma, and auto-exposure parameters."""
     if tone_map not in SUPPORTED_TONE_MAPS:
         raise ValueError(f"Unsupported tone map: {tone_map}")
     try:
@@ -735,261 +702,90 @@ def validate_parameters(tone_map: str, pre_gamma: str, auto_exposure: str) -> No
         raise ValueError("Pre-gamma and auto-exposure must be numeric")
 
 
-# ============================================================
-# MAIN APP CLASS
-# ============================================================
 class App(TKMT.ThemedTKinterFrame):
+    """Main application class for the NVIDIA HDR Converter GUI."""
     def __init__(self, theme="park", mode="dark"):
         super().__init__("NVIDIA HDR Converter", theme, mode)
+        self.device_manager = DeviceManager()
+        self.jxr_loader = OptimizedJXRLoader(self.device_manager.get_device())
+        self.color_processor = HDRColorProcessor(self.device_manager.get_device(), self.jxr_loader)
 
-        # Initialize color processing components
-        self.color_processor = HDRColorProcessor()
+        self.current_before_image_path = None
+        self.current_after_image_path = None
+        self.original_input_tensor = None
 
-        # Create main container frame
+        self.before_image_ref = None
+        self.after_image_ref = None
+        self.before_hist_ref = None
+        self.after_hist_ref = None
+
+        # Main Frame Setup
         main_frame = ttk.Frame(self.master, padding=(10, 10))
         main_frame.grid(row=0, column=0, sticky="nsew")
-
-        # Configure grid weights
         self.master.grid_rowconfigure(0, weight=1)
         self.master.grid_columnconfigure(0, weight=1)
         main_frame.grid_rowconfigure(0, weight=1)
         main_frame.grid_columnconfigure(0, weight=1)
 
-        # Create left and right frames
+        # Left Frame: Controls
         left_frame = ttk.Frame(main_frame, padding=(10, 10))
         left_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nw")
 
+        # Right Frame: Previews and Histograms
         right_frame = ttk.Frame(main_frame, padding=(10, 10))
         right_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nw")
 
-        # Setup GUI components
+        # Setup various UI components
         self._setup_mode_selection(left_frame)
         self._setup_file_selection(left_frame)
+        self._setup_device_selection(left_frame)
         self._setup_parameters(left_frame)
-        self._setup_color_controls()
+        self._setup_color_controls(left_frame)
         self._setup_conversion_button(left_frame)
         self._setup_progress_bar(left_frame)
         self._setup_status_label(left_frame)
+
+        # Mode Selection Variables
+        self.mode_size_var = tk.StringVar(value='small')
+        self.current_mode = 'small'
+        self.preview_width = MODES[self.current_mode]['preview_width']
+        self.preview_height = MODES[self.current_mode]['preview_height']
+
+        # Setup Previews and Histograms
         self._setup_previews(right_frame)
-
-        self.before_image_ref = None
-        self.after_image_ref = None
-
-        # Thread-safe UI updates
+        self._setup_histograms(right_frame)
+        self.update_mode_size()
         self.ui_lock = threading.Lock()
 
-        # Run the application
-        self.run()
+        # Mode Switch Frame
+        mode_switch_frame = ttk.Frame(main_frame, padding=(10, 10))
+        mode_switch_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        ttk.Label(mode_switch_frame, text="UI Mode:").grid(row=0, column=0, sticky="e", padx=(0, 5))
+        big_radio = ttk.Radiobutton(mode_switch_frame, text="Big", variable=self.mode_size_var, value='big',
+                                    command=self.update_mode_size)
+        big_radio.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        small_radio = ttk.Radiobutton(mode_switch_frame, text="Small", variable=self.mode_size_var, value='small',
+                                      command=self.update_mode_size)
+        small_radio.grid(row=0, column=2, padx=5, pady=5, sticky="w")
 
-    def _setup_color_controls(self):
-        """Setup color enhancement controls"""
-        color_frame = ttk.LabelFrame(self.params_frame, text="Color Enhancement", padding=(10, 10))
-        color_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-
-        # Enable/disable color correction
-        self.use_color_correction = tk.BooleanVar(value=True)
-        color_checkbox = ttk.Checkbutton(
-            color_frame,
-            text="Enable AI Color Enhancement",
-            variable=self.use_color_correction
-        )
-        color_checkbox.grid(row=0, column=0, pady=5)
-
-        # Color preservation strength
-        strength_frame = ttk.Frame(color_frame)
-        strength_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
-
-        ttk.Label(strength_frame, text="Strength:").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.color_strength = tk.DoubleVar(value=DEFAULT_COLOR_STRENGTH)
-        color_scale = ttk.Scale(
-            strength_frame,
-            from_=0.0,
-            to=1.0,
-            variable=self.color_strength,
-            orient="horizontal",
-            length=200
-        )
-        color_scale.grid(row=0, column=1, sticky="ew")
-
-        # Add value label with fixed width to prevent resizing, initialized with the default value
-        self.strength_label = ttk.Label(strength_frame, text=f"{DEFAULT_COLOR_STRENGTH * 100:.0f}%", width=5,
-                                        anchor="e")
-        self.strength_label.grid(row=0, column=2, padx=(10, 0))
-
-        # Update label when slider changes
-        def update_strength_label(*args):
-            value = self.color_strength.get() * 100
-            self.strength_label.config(text=f"{value:.0f}%")
-
-        self.color_strength.trace_add("write", update_strength_label)
+        # Center and Initialize Window
+        self.center_window(MODES[self.current_mode]['window_width'], MODES[self.current_mode]['window_height'])
+        logging.info(f"Application initialized on {self.device_manager.device}")
 
     def _setup_mode_selection(self, parent_frame):
-        """Setup conversion mode selection"""
+        """Sets up the mode selection radio buttons (Single File or Folder)."""
         mode_frame = ttk.LabelFrame(parent_frame, text="Mode Selection", padding=(10, 10))
         mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-
         self.mode_var = tk.StringVar(value="single")
-
-        single_radio = ttk.Radiobutton(
-            mode_frame,
-            text="Single File",
-            variable=self.mode_var,
-            value="single",
-            command=self.update_mode
-        )
+        single_radio = ttk.Radiobutton(mode_frame, text="Single File", variable=self.mode_var, value="single",
+                                       command=self.update_mode)
         single_radio.grid(row=0, column=0, padx=5, pady=5, sticky="w")
-
-        folder_radio = ttk.Radiobutton(
-            mode_frame,
-            text="Folder",
-            variable=self.mode_var,
-            value="folder",
-            command=self.update_mode
-        )
+        folder_radio = ttk.Radiobutton(mode_frame, text="Folder", variable=self.mode_var, value="folder",
+                                       command=self.update_mode)
         folder_radio.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
-    def _setup_file_selection(self, parent_frame):
-        """Setup file selection controls"""
-        self.file_frame = ttk.LabelFrame(parent_frame, text="File Selection", padding=(10, 10))
-        self.file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-
-        # Input selection
-        self.input_label = ttk.Label(self.file_frame, text="Input JXR:")
-        self.input_label.grid(row=0, column=0, sticky="e", padx=(0, 5), pady=5)
-        self.input_entry = ttk.Entry(self.file_frame, width=40)
-        self.input_entry.grid(row=0, column=1, padx=(0, 5), pady=5)
-        self.browse_button = ttk.Button(
-            self.file_frame,
-            text="Browse...",
-            command=self.browse_input
-        )
-        self.browse_button.grid(row=0, column=2, padx=(0, 5), pady=5)
-
-        # Output selection
-        self.output_label = ttk.Label(self.file_frame, text="Output JPG:")
-        self.output_label.grid(row=1, column=0, sticky="e", padx=(0, 5), pady=5)
-        self.output_entry = ttk.Entry(self.file_frame, width=40)
-        self.output_entry.grid(row=1, column=1, padx=(0, 5), pady=5)
-        self.output_browse_button = ttk.Button(
-            self.file_frame,
-            text="Browse...",
-            command=self.browse_output
-        )
-        self.output_browse_button.grid(row=1, column=2, padx=(0, 5), pady=5)
-
-    def _setup_parameters(self, parent_frame):
-        """Setup conversion parameters controls"""
-        self.params_frame = ttk.LabelFrame(parent_frame, text="Parameters", padding=(10, 10))
-        self.params_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-
-        # Tone Map
-        ttk.Label(self.params_frame, text="Tone Map:").grid(
-            row=0, column=0, sticky="e", padx=(0, 5), pady=5
-        )
-        self.tonemap_var = tk.StringVar(value=DEFAULT_TONE_MAP)
-        tone_map_values = sorted(list(SUPPORTED_TONE_MAPS))
-        tone_map_dropdown = ttk.Combobox(
-            self.params_frame,
-            textvariable=self.tonemap_var,
-            values=tone_map_values,
-            state='readonly'
-        )
-        tone_map_dropdown.grid(row=0, column=1, padx=(0, 5), pady=5)
-
-        # Pre-gamma
-        ttk.Label(self.params_frame, text="Pre-gamma:").grid(
-            row=1, column=0, sticky="e", padx=(0, 5), pady=5
-        )
-        self.pregamma_var = tk.StringVar(value=DEFAULT_PREGAMMA)
-        ttk.Entry(
-            self.params_frame,
-            textvariable=self.pregamma_var,
-            width=15
-        ).grid(row=1, column=1, padx=(0, 5), pady=5)
-
-        # Auto-exposure
-        ttk.Label(self.params_frame, text="Auto-exposure:").grid(
-            row=2, column=0, sticky="e", padx=(0, 5), pady=5
-        )
-        self.autoexposure_var = tk.StringVar(value=DEFAULT_AUTOEXPOSURE)
-        ttk.Entry(
-            self.params_frame,
-            textvariable=self.autoexposure_var,
-            width=15
-        ).grid(row=2, column=1, padx=(0, 5), pady=5)
-
-    def _setup_conversion_button(self, parent_frame):
-        """Setup conversion button"""
-        self.convert_btn = ttk.Button(
-            parent_frame,
-            text="Convert",
-            command=self.convert_image
-        )
-        self.convert_btn.grid(row=3, column=0, pady=(10, 10), sticky="ew")
-
-    def _setup_progress_bar(self, parent_frame):
-        """Setup progress bar"""
-        self.progress = ttk.Progressbar(
-            parent_frame,
-            orient="horizontal",
-            mode="determinate"
-        )
-        self.progress.grid(row=4, column=0, sticky="ew", pady=(0, 10))
-
-    def _setup_status_label(self, parent_frame):
-        """Setup status label"""
-        self.status_label = ttk.Label(parent_frame, text="", foreground="#CCCCCC")
-        self.status_label.grid(row=5, column=0, sticky="w", pady=(0, 10))
-
-    def _setup_previews(self, parent_frame):
-        """Setup preview panels"""
-        previews_frame = ttk.Frame(parent_frame, padding=(10, 10))
-        previews_frame.grid(row=0, column=0, sticky="nsew")
-
-        # Before preview
-        before_frame = ttk.LabelFrame(
-            previews_frame,
-            text="Before Conversion",
-            padding=(10, 10)
-        )
-        before_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
-
-        before_canvas = tk.Canvas(
-            before_frame,
-            width=PREVIEW_WIDTH,
-            height=PREVIEW_HEIGHT
-        )
-        before_canvas.pack(padx=10, pady=10)
-        self.before_label = ttk.Label(before_canvas)
-        before_canvas.create_window(
-            PREVIEW_WIDTH // 2,
-            PREVIEW_HEIGHT // 2,
-            window=self.before_label
-        )
-
-        # After preview
-        after_frame = ttk.LabelFrame(
-            previews_frame,
-            text="After Conversion",
-            padding=(10, 10)
-        )
-        after_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
-
-        after_canvas = tk.Canvas(
-            after_frame,
-            width=PREVIEW_WIDTH,
-            height=PREVIEW_HEIGHT
-        )
-        after_canvas.pack(padx=10, pady=10)
-        self.after_label = ttk.Label(after_canvas)
-        after_canvas.create_window(
-            PREVIEW_WIDTH // 2,
-            PREVIEW_HEIGHT // 2,
-            window=self.after_label
-        )
-
     def update_mode(self):
-        """Handle mode selection changes"""
+        """Updates the UI based on the selected mode (Single File or Folder)."""
         mode = self.mode_var.get()
         if mode == "single":
             self.file_frame.config(text="File Selection")
@@ -997,6 +793,8 @@ class App(TKMT.ThemedTKinterFrame):
             self.output_label.grid()
             self.output_entry.grid()
             self.output_browse_button.grid()
+            self.status_label.config(text="")
+            self.convert_btn.config(state='normal')
         else:
             self.file_frame.config(text="Folder Selection")
             self.input_label.config(text="Input Folder:")
@@ -1004,13 +802,243 @@ class App(TKMT.ThemedTKinterFrame):
             self.output_entry.grid_remove()
             self.output_browse_button.grid_remove()
             self.output_entry.delete(0, tk.END)
+            folder_path = self.input_entry.get().strip()
+            if folder_path and os.path.isdir(folder_path):
+                jxr_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.jxr')]
+                file_count = len(jxr_files)
+                if file_count == 0:
+                    self.status_label.config(text="No JXR files found in selected folder.", foreground="red")
+                    self.convert_btn.config(state='disabled')
+                else:
+                    self.status_label.config(
+                        text=f"Found {file_count} JXR files ready for conversion.",
+                        foreground="#00FF00"
+                    )
+                    self.convert_btn.config(state='normal')
+            else:
+                self.status_label.config(text="Please select a folder containing JXR files.", foreground="#CCCCCC")
+                self.convert_btn.config(state='disabled')
+
+            # Clear previews and histograms
             self.before_label.config(image="", text="No Preview")
             self.before_image_ref = None
             self.after_label.config(image="", text="No Preview")
             self.after_image_ref = None
+            self.before_hist_label.config(image="", text="No Histogram")
+            self.before_hist_ref = None
+            self.after_hist_label.config(image="", text="No Histogram")
+            self.after_hist_ref = None
+
+    def _setup_file_selection(self, parent_frame):
+        """Sets up file or folder selection widgets."""
+        self.file_frame = ttk.LabelFrame(parent_frame, text="File Selection", padding=(10, 10))
+        self.file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.input_label = ttk.Label(self.file_frame, text="Input JXR:")
+        self.input_label.grid(row=0, column=0, sticky="e", padx=(0, 5), pady=5)
+        self.input_entry = ttk.Entry(self.file_frame, width=40)
+        self.input_entry.grid(row=0, column=1, padx=(0, 5), pady=5)
+        self.browse_button = ttk.Button(self.file_frame, text="Browse...", command=self.browse_input)
+        self.browse_button.grid(row=0, column=2, padx=(0, 5), pady=5)
+
+        self.output_label = ttk.Label(self.file_frame, text="Output JPG:")
+        self.output_label.grid(row=1, column=0, sticky="e", padx=(0, 5), pady=5)
+        self.output_entry = ttk.Entry(self.file_frame, width=40)
+        self.output_entry.grid(row=1, column=1, padx=(0, 5), pady=5)
+        self.output_browse_button = ttk.Button(self.file_frame, text="Browse...", command=self.browse_output)
+        self.output_browse_button.grid(row=1, column=2, padx=(0, 5), pady=5)
+
+    def _setup_device_selection(self, parent_frame):
+        """Sets up device selection radio buttons (GPU or CPU)."""
+        device_frame = ttk.LabelFrame(parent_frame, text="Processing Device", padding=(10, 10))
+        device_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.use_gpu_var = tk.BooleanVar(value=self.device_manager.use_gpu)
+        gpu_state = 'normal' if torch.cuda.is_available() else 'disabled'
+        gpu_label = "GPU (CUDA)" if torch.cuda.is_available() else "GPU (Not Available)"
+        gpu_radio = ttk.Radiobutton(device_frame, text=gpu_label,
+                                    variable=self.use_gpu_var, value=True,
+                                    command=self.update_device,
+                                    state=gpu_state)
+        gpu_radio.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        cpu_radio = ttk.Radiobutton(device_frame, text="CPU", variable=self.use_gpu_var, value=False,
+                                    command=self.update_device)
+        cpu_radio.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+
+    def _setup_parameters(self, parent_frame):
+        """Sets up parameter input fields for tone mapping, gamma, and exposure."""
+        self.params_frame = ttk.LabelFrame(parent_frame, text="Parameters", padding=(10, 10))
+        self.params_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        ttk.Label(self.params_frame, text="Tone Map:").grid(row=0, column=0, sticky="e", padx=(0, 5), pady=5)
+        self.tonemap_var = tk.StringVar(value=DEFAULT_TONE_MAP)
+        tone_map_values = sorted(list(SUPPORTED_TONE_MAPS))
+        tone_map_dropdown = ttk.Combobox(self.params_frame, textvariable=self.tonemap_var, values=tone_map_values,
+                                         state='readonly')
+        tone_map_dropdown.grid(row=0, column=1, padx=(0, 5), pady=5)
+
+        ttk.Label(self.params_frame, text="Gamma:").grid(row=1, column=0, sticky="e", padx=(0, 5), pady=5)
+        self.pregamma_var = tk.StringVar(value=DEFAULT_PREGAMMA)
+        pregamma_entry = ttk.Entry(self.params_frame, textvariable=self.pregamma_var, width=15)
+        pregamma_entry.grid(row=1, column=1, padx=(0, 5), pady=5)
+
+        ttk.Label(self.params_frame, text="Exposure:").grid(row=2, column=0, sticky="e", padx=(0, 5), pady=5)
+        self.autoexposure_var = tk.StringVar(value=DEFAULT_AUTOEXPOSURE)
+        autoexposure_entry = ttk.Entry(self.params_frame, textvariable=self.autoexposure_var, width=15)
+        autoexposure_entry.grid(row=2, column=1, padx=(0, 5), pady=5)
+
+    def _setup_conversion_button(self, parent_frame):
+        """Sets up the conversion button."""
+        convert_frame = ttk.Frame(parent_frame, padding=(0, 0))
+        convert_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        convert_frame.grid_columnconfigure(0, weight=1)
+        self.convert_btn = ttk.Button(convert_frame, text="Convert", command=self.convert_image, style="Accent.TButton")
+        self.convert_btn.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        style = ttk.Style()
+        try:
+            if 'Accent.TButton' not in style.element_names():
+                style.configure(
+                    'Accent.TButton',
+                    font=('Segoe UI', 10),
+                    padding=5,
+                    foreground='white',
+                    background='#007ACC'
+                )
+                style.map('Accent.TButton',
+                          background=[('active', '#005A9E')],
+                          foreground=[('active', 'white')])
+        except:
+            pass
+
+    def _setup_progress_bar(self, parent_frame):
+        """Sets up the progress bar."""
+        progress_frame = ttk.Frame(parent_frame, padding=(0, 0))
+        progress_frame.grid(row=5, column=0, sticky="ew", pady=(5, 10))
+        progress_frame.grid_columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
+        self.progress.grid(row=0, column=0, sticky="ew")
+
+    def _setup_status_label(self, parent_frame):
+        """Sets up the status label to display messages."""
+        self.status_label = ttk.Label(parent_frame, text="", foreground="#CCCCCC")
+        self.status_label.grid(row=6, column=0, sticky="w", pady=(0, 10))
+
+    def _setup_previews(self, parent_frame):
+        """Sets up the preview image canvases."""
+        previews_frame = ttk.Frame(parent_frame, padding=(10, 10))
+        previews_frame.grid(row=0, column=0, sticky="nsew")
+        previews_frame.grid_columnconfigure(0, weight=1)
+        previews_frame.grid_columnconfigure(1, weight=1)
+        previews_frame.grid_rowconfigure(0, weight=1)
+
+        before_frame = ttk.LabelFrame(previews_frame, text="Before Conversion", padding=(10, 10))
+        before_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self.before_canvas = tk.Canvas(before_frame, width=self.preview_width, height=self.preview_height)
+        self.before_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        self.before_label = ttk.Label(self.before_canvas)
+        self.before_canvas.create_window(self.preview_width // 2, self.preview_height // 2, window=self.before_label)
+
+        after_frame = ttk.LabelFrame(previews_frame, text="After Conversion", padding=(10, 10))
+        after_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
+        self.after_canvas = tk.Canvas(after_frame, width=self.preview_width, height=self.preview_height)
+        self.after_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        self.after_label = ttk.Label(self.after_canvas)
+        self.after_canvas.create_window(self.preview_width // 2, self.preview_height // 2, window=self.after_label)
+
+    def _setup_histograms(self, parent_frame):
+        """Sets up the histogram canvases for before and after images."""
+        histograms_frame = ttk.Frame(parent_frame, padding=(10, 10))
+        histograms_frame.grid(row=1, column=0, sticky="nsew")
+
+        before_hist_frame = ttk.LabelFrame(histograms_frame, text="Before Conversion Histogram", padding=(10, 10))
+        before_hist_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self.before_hist_canvas = tk.Canvas(before_hist_frame, width=self.preview_width, height=150)
+        self.before_hist_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        self.before_hist_label = ttk.Label(self.before_hist_canvas)
+        self.before_hist_canvas.create_window(self.preview_width // 2, 75, window=self.before_hist_label)
+
+        after_hist_frame = ttk.LabelFrame(histograms_frame, text="After Conversion Histogram", padding=(10, 10))
+        after_hist_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
+        self.after_hist_canvas = tk.Canvas(after_hist_frame, width=self.preview_width, height=150)
+        self.after_hist_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        self.after_hist_label = ttk.Label(self.after_hist_canvas)
+        self.after_hist_canvas.create_window(self.preview_width // 2, 75, window=self.after_hist_label)
+
+    def update_mode_size(self):
+        """Updates the window and preview sizes based on selected mode."""
+        mode = self.mode_size_var.get()
+        logging.info(f"Switching to mode: {mode}")
+        self.current_mode = mode
+        self.preview_width = MODES[mode]['preview_width']
+        self.preview_height = MODES[mode]['preview_height']
+        self.root.minsize(MODES[mode]['window_width'], MODES[mode]['window_height'])
+        self.root.geometry(f"{MODES[mode]['window_width']}x{MODES[mode]['window_height']}")
+
+        self.adjust_preview_canvases()
+        self.adjust_histogram_canvases()
+
+        if self.original_input_tensor is not None:
+            self.before_hist_label.config(image="", text="")
+            self.before_hist_ref = None
+            preview_tensor = self.jxr_loader.process_preview(
+                self.original_input_tensor,
+                self.preview_width,
+                self.preview_height
+            )
+            self._update_preview_ui(preview_tensor)
+            self.show_color_spectrum_from_tensor(self.original_input_tensor, is_before=True)
+
+        if getattr(self, 'current_after_image_path', None):
+            self.show_preview_from_file(self.current_after_image_path, is_before=False)
+            self.show_color_spectrum(self.current_after_image_path, is_before=False)
+
+        self.center_window(MODES[mode]['window_width'], MODES[mode]['window_height'])
+        self.status_label.config(text=f"Switched to {mode} mode", foreground="#CCCCCC")
+
+    def adjust_preview_canvases(self):
+        """Adjusts the size of preview canvases based on the current mode."""
+        self.before_canvas.config(width=self.preview_width, height=self.preview_height)
+        self.before_canvas.delete("all")
+        self.before_canvas.create_window(self.preview_width // 2, self.preview_height // 2, window=self.before_label)
+
+        self.after_canvas.config(width=self.preview_width, height=self.preview_height)
+        self.after_canvas.delete("all")
+        self.after_canvas.create_window(self.preview_width // 2, self.preview_height // 2, window=self.after_label)
+
+    def adjust_histogram_canvases(self):
+        """Adjusts the size of histogram canvases based on the current mode."""
+        self.before_hist_canvas.config(width=self.preview_width, height=150)
+        self.before_hist_canvas.delete("all")
+        self.before_hist_canvas.create_window(self.preview_width // 2, 75, window=self.before_hist_label)
+
+        self.after_hist_canvas.config(width=self.preview_width, height=150)
+        self.after_hist_canvas.delete("all")
+        self.after_hist_canvas.create_window(self.preview_width // 2, 75, window=self.after_hist_label)
+
+    def center_window(self, width, height):
+        """Centers the application window on the screen."""
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width // 2) - (width // 2)
+        y = (screen_height // 2) - (height // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def update_device(self):
+        """Handles the device switching logic based on user selection."""
+        use_gpu = self.use_gpu_var.get()
+        try:
+            self.device_manager.switch_device(use_gpu)
+            success = self.color_processor.switch_device(use_gpu)
+            if success:
+                device_name = "GPU" if use_gpu and torch.cuda.is_available() else "CPU"
+                self.status_label.config(text=f"Switched to {device_name}", foreground="#CCCCCC")
+            else:
+                raise RuntimeError("Failed to switch devices")
+        except Exception as e:
+            error_msg = f"Device switching failed: {str(e)}"
+            self.status_label.config(text=error_msg, foreground="red")
+            logging.error(error_msg)
+            self.use_gpu_var.set(not use_gpu)
 
     def browse_input(self):
-        """Handle input file/folder selection"""
+        """Handles the input file or folder browsing."""
         mode = self.mode_var.get()
         if mode == "single":
             filename = filedialog.askopenfilename(
@@ -1020,30 +1048,38 @@ class App(TKMT.ThemedTKinterFrame):
             if filename:
                 self.input_entry.delete(0, tk.END)
                 self.input_entry.insert(0, filename)
-                self.status_label.config(
-                    text="Loading preview...",
-                    foreground="#CCCCCC"
-                )
+                self.status_label.config(text="Loading preview...", foreground="#CCCCCC")
                 self.master.update_idletasks()
                 self.create_preview_from_jxr(filename)
         else:
-            foldername = filedialog.askdirectory(
-                title="Select Folder Containing JXR Files"
-            )
+            foldername = filedialog.askdirectory(title="Select Folder Containing JXR Files")
             if foldername:
                 self.input_entry.delete(0, tk.END)
                 self.input_entry.insert(0, foldername)
-                self.status_label.config(
-                    text="Folder selected. Ready to convert all JXR files.",
-                    foreground="#CCCCCC"
-                )
+                jxr_files = [f for f in os.listdir(foldername) if f.lower().endswith('.jxr')]
+                file_count = len(jxr_files)
+                if file_count == 0:
+                    self.status_label.config(text="No JXR files found in selected folder.", foreground="red")
+                    self.convert_btn.config(state='disabled')
+                else:
+                    self.status_label.config(
+                        text=f"Found {file_count} JXR files ready for conversion.",
+                        foreground="#00FF00"
+                    )
+                    self.convert_btn.config(state='normal')
+
+                # Clear previews and histograms
                 self.before_label.config(image="", text="No Preview")
                 self.before_image_ref = None
                 self.after_label.config(image="", text="No Preview")
                 self.after_image_ref = None
+                self.before_hist_label.config(image="", text="No Histogram")
+                self.before_hist_ref = None
+                self.after_hist_label.config(image="", text="No Histogram")
+                self.after_hist_ref = None
 
     def browse_output(self):
-        """Handle output file selection"""
+        """Handles the output file browsing."""
         filename = filedialog.asksaveasfilename(
             title="Select Output JPG File",
             defaultextension=".jpg",
@@ -1053,8 +1089,257 @@ class App(TKMT.ThemedTKinterFrame):
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, filename)
 
+    def create_preview_from_jxr(self, jxr_file: str):
+        """Generates a preview from a selected JXR file."""
+        if not jxr_file or not jxr_file.lower().endswith('.jxr'):
+            self._clear_preview()
+            self.status_label.config(text="Invalid JXR file", foreground="red")
+            return
+        if not os.path.exists(jxr_file):
+            self._clear_preview()
+            self.status_label.config(text="File not found", foreground="red")
+            return
+
+        self.status_label.config(text="Loading preview...", foreground="#CCCCCC")
+        self.master.update_idletasks()
+
+        def process_jxr():
+            try:
+                tensor, error, metadata = self.jxr_loader.load_jxr(jxr_file, is_preview=True)
+                if tensor is None:
+                    raise RuntimeError("Failed to load JXR file.")
+                self.original_input_tensor = tensor.clone()  # Store original always
+                preview_tensor = self.jxr_loader.process_preview(
+                    tensor,
+                    self.preview_width,
+                    self.preview_height
+                )
+                if preview_tensor is None:
+                    raise RuntimeError("Failed to generate preview")
+
+                self.master.after(0, lambda: self._update_preview_ui(preview_tensor))
+            except Exception as e:
+                error_msg = str(e)
+                logging.error(f"Preview generation error: {error_msg}")
+                self.master.after(0, lambda: self._handle_preview_error(error_msg))
+
+        thread = threading.Thread(target=process_jxr, daemon=True)
+        thread.start()
+
+    def _handle_preview_error(self, error_msg: str):
+        """Handles errors during preview generation."""
+        self.status_label.config(text=f"Preview failed: {error_msg}", foreground="red")
+        self.before_label.config(image="", text="Preview Failed")
+        self.before_image_ref = None
+        self.before_hist_label.config(image="", text="No Histogram")
+        self.before_hist_ref = None
+
+    def _clear_preview(self):
+        """Clears the preview and histogram displays."""
+        self.before_label.config(image="", text="No Preview")
+        self.before_image_ref = None
+        self.before_hist_label.config(image="", text="No Histogram")
+        self.before_hist_ref = None
+
+    def show_preview_from_file(self, filepath: str, is_before: bool):
+        """Displays a preview image from a file."""
+        label = self.before_label if is_before else self.after_label
+        if is_before:
+            if self.before_image_ref:
+                self.before_label.config(image="")
+                self.before_image_ref = None
+            self.current_before_image_path = filepath
+        else:
+            if self.after_image_ref:
+                self.after_label.config(image="")
+                self.after_image_ref = None
+            self.current_after_image_path = filepath
+
+        try:
+            img = Image.open(filepath).convert('RGB')
+            img = self._resize_image(img, self.preview_width, self.preview_height)
+            img_tk = ImageTk.PhotoImage(img)
+            label.config(image=img_tk, text="")
+            if is_before:
+                self.before_image_ref = img_tk
+            else:
+                self.after_image_ref = img_tk
+            img.close()
+        except Exception as e:
+            label.config(image="", text=f"Preview Error: {str(e)}")
+            if is_before:
+                self.before_image_ref = None
+            else:
+                self.after_image_ref = None
+            logging.error(f"Error loading preview: {str(e)}")
+
+    def show_color_spectrum(self, filepath: str, is_before: bool):
+        """Generates and displays a color spectrum histogram from an image file."""
+        label = self.before_hist_label if is_before else self.after_hist_label
+        if is_before and self.before_hist_ref:
+            self.before_hist_label.config(image="", text="")
+            self.before_hist_ref = None
+        elif not is_before and self.after_hist_ref:
+            self.after_hist_label.config(image="", text="")
+            self.after_hist_ref = None
+
+        try:
+            img = Image.open(filepath).convert('RGB')
+            vis_img = self._create_histogram_image(np.array(img))
+            vis_tk = ImageTk.PhotoImage(vis_img)
+            def update_visualization():
+                label.config(image=vis_tk, text="")
+                if is_before:
+                    self.before_hist_ref = vis_tk
+                else:
+                    self.after_hist_ref = vis_tk
+            self.master.after(0, update_visualization)
+        except Exception as e:
+            label.config(image="", text=f"Visualization Error: {str(e)}")
+            if is_before:
+                self.before_hist_ref = None
+            else:
+                self.after_hist_ref = None
+            logging.error(f"Error generating color spectrum: {str(e)}")
+
+    def show_color_spectrum_from_tensor(self, tensor: torch.Tensor, is_before: bool):
+        """Generates and displays a color spectrum histogram from a tensor."""
+        label = self.before_hist_label if is_before else self.after_hist_label
+        if is_before and self.before_hist_ref:
+            self.before_hist_label.config(image="", text="")
+            self.before_hist_ref = None
+        elif not is_before and self.after_hist_ref:
+            self.after_hist_label.config(image="", text="")
+            self.after_hist_ref = None
+
+        try:
+            img_tensor = tensor.squeeze(0)
+            if img_tensor.shape[0] != 3:
+                img_tensor = img_tensor[:3, :, :]
+            img_data = (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            vis_img = self._create_histogram_image(img_data)
+            vis_tk = ImageTk.PhotoImage(vis_img)
+
+            def update_visualization():
+                label.config(image=vis_tk, text="")
+                if is_before:
+                    self.before_hist_ref = vis_tk
+                else:
+                    self.after_hist_ref = vis_tk
+
+            self.master.after(0, update_visualization)
+        except Exception as e:
+            label.config(image="", text=f"Visualization Error: {str(e)}")
+            if is_before:
+                self.before_hist_ref = None
+            else:
+                self.after_hist_ref = None
+            logging.error(f"Error generating color spectrum from tensor: {str(e)}")
+
+    def _create_histogram_image(self, img_array: np.ndarray) -> Image.Image:
+        """Creates a histogram visualization from an image array."""
+        vis_img = Image.new('RGB', (self.preview_width, 150), '#1e1e1e')
+        draw = ImageDraw.Draw(vis_img, 'RGBA')
+        draw.rectangle([0,0,self.preview_width,150], fill='#2b2b2b')
+        grid_spacing = 150//4
+        for i in range(5):
+            y = i*grid_spacing
+            draw.line([(0,y),(self.preview_width,y)], fill='#40404040', width=1)
+        channels = [
+            (img_array[:,:,0], '#ff000066'),
+            (img_array[:,:,1], '#00ff0066'),
+            (img_array[:,:,2], '#0000ff66')
+        ]
+        for channel_data, color in channels:
+            hist, _ = np.histogram(channel_data, bins=self.preview_width, range=(0,255))
+            if hist.max() > 0:
+                hist = hist / hist.max() * (150 - 10)
+            points = [(0,150)]
+            for x in range(self.preview_width):
+                y = 150 - hist[x]
+                points.append((x,y))
+            points.append((self.preview_width,150))
+            draw.polygon(points, fill=color)
+        return vis_img
+
+    def _resize_image(self, image: Image.Image, max_width: int, max_height: int) -> Image.Image:
+        """Resizes an image while maintaining aspect ratio."""
+        original_width, original_height = image.size
+        ratio = min(max_width / original_width, max_height / original_height)
+        new_size = (int(original_width * ratio), int(original_height * ratio))
+        return image.resize(new_size, Image.Resampling.LANCZOS)
+
+    def _update_preview_ui(self, tensor: torch.Tensor):
+        """Updates the UI with the generated preview image."""
+        try:
+            preview_image = self.jxr_loader.tensor_to_pil(tensor)
+            if preview_image is None:
+                raise RuntimeError("Failed to convert preview to image")
+
+            orig_width, orig_height = preview_image.size
+            width_ratio = self.preview_width / orig_width
+            height_ratio = self.preview_height / orig_height
+            scale_factor = min(width_ratio, height_ratio)
+            new_width = int(orig_width * scale_factor)
+            new_height = int(orig_height * scale_factor)
+
+            preview_image = preview_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            if new_width < self.preview_width or new_height < self.preview_height:
+                bg = Image.new('RGB', (self.preview_width, self.preview_height), (46, 46, 46))
+                offset_x = (self.preview_width - new_width) // 2
+                offset_y = (self.preview_height - new_height) // 2
+                bg.paste(preview_image, (offset_x, offset_y))
+                preview_image = bg
+
+            buffer = io.BytesIO()
+            preview_image.save(buffer, format='PNG')
+            buffer.seek(0)
+            preview_tk = ImageTk.PhotoImage(Image.open(buffer))
+            self.before_label.config(image=preview_tk, text="")
+            self.before_image_ref = preview_tk
+            self.show_color_spectrum_from_tensor(tensor, is_before=True)
+            self.status_label.config(text="Preview loaded successfully", foreground="#00FF00")
+
+        except Exception as e:
+            self._handle_preview_error(str(e))
+
+    def _update_enhancement_controls(self):
+        """Enables or disables enhancement controls based on user selection."""
+        state = 'normal' if self.use_enhancement.get() else 'disabled'
+        self.edge_scale.configure(state=state)
+
+    def _setup_color_controls(self, parent_frame):
+        """Sets up image enhancement controls (AI Enhancement and Edge Strength)."""
+        enhance_frame = ttk.LabelFrame(self.params_frame, text="Image Enhancement", padding=(10, 10))
+        enhance_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.use_enhancement = tk.BooleanVar(value=True)
+        enhance_checkbox = ttk.Checkbutton(enhance_frame, text="Enable AI Enhancement",
+                                           variable=self.use_enhancement,
+                                           command=self._update_enhancement_controls)
+        enhance_checkbox.grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
+
+        enhance_frame.grid_columnconfigure(0, minsize=120)
+        enhance_frame.grid_columnconfigure(1, weight=1)
+        enhance_frame.grid_columnconfigure(2, minsize=50)
+
+        # Edge Enhancement Controls
+        ttk.Label(enhance_frame, text="Strength:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
+        self.edge_strength = tk.DoubleVar(value=0.0)
+        self.edge_scale = ttk.Scale(enhance_frame, from_=0.0, to=100.0,
+                                    variable=self.edge_strength, orient="horizontal")
+        self.edge_scale.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
+        self.edge_label = ttk.Label(enhance_frame, text="0%", width=4, anchor="e")
+        self.edge_label.grid(row=1, column=2, sticky="e", pady=(10, 0))
+
+        def update_edge_label(*args):
+            value = self.edge_strength.get()
+            self.edge_label.config(text=f"{int(value)}%")
+
+        self.edge_strength.trace_add("write", update_edge_label)
+        self._update_enhancement_controls()
+
     def convert_image(self):
-        """Handle image conversion based on selected mode"""
+        """Initiates the image conversion process based on selected mode."""
         mode = self.mode_var.get()
         if mode == "single":
             self._convert_single_file()
@@ -1062,282 +1347,129 @@ class App(TKMT.ThemedTKinterFrame):
             self._convert_folder()
 
     def _convert_single_file(self):
-        """Convert a single JXR file"""
+        """Converts a single JXR file to JPEG."""
         input_file = self.input_entry.get().strip()
         original_output_file = self.output_entry.get().strip()
+        tone_map = self.tonemap_var.get().strip()
+        pre_gamma_str = self.pregamma_var.get().strip()
+        auto_exposure_str = self.autoexposure_var.get().strip()
+        use_enhancement = self.use_enhancement.get()
 
-        # Validate parameters
+        # Set color_strength to 100 if enhancement is enabled, else 0
+        color_strength = 100.0 if use_enhancement else 0.0
+        edge_strength = self.edge_strength.get() if use_enhancement else 0.0
+
         try:
             validate_files(input_file, original_output_file)
-            validate_parameters(
-                self.tonemap_var.get().strip(),
-                self.pregamma_var.get().strip(),
-                self.autoexposure_var.get().strip()
-            )
+            validate_parameters(tone_map, pre_gamma_str, auto_exposure_str)
         except (FileNotFoundError, ValueError) as e:
             messagebox.showerror("Error", str(e))
             self.status_label.config(text=str(e), foreground="red")
             return
 
-        # Prepare for conversion
+        pre_gamma = float(pre_gamma_str)
+        auto_exposure = float(auto_exposure_str)
+        self.jxr_loader.selected_tone_map = tone_map
+        self.jxr_loader.selected_pre_gamma = pre_gamma
+        self.jxr_loader.selected_auto_exposure = auto_exposure
+
         self.status_label.config(text="Converting...", foreground="#CCCCCC")
         self.progress['value'] = 0
         self.master.update_idletasks()
         self.convert_btn.config(state='disabled')
 
         def process_task():
-            # Create a local copy of the output path that we can modify if needed
-            output_file = original_output_file
-            temp_hdr_output = None
-
             try:
-                # Create temporary file for HDR conversion result
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    temp_hdr_output = tmp.name
+                # Always reload original tensor to avoid cumulative effects
+                tensor, error, metadata = self.jxr_loader.load_jxr(input_file)
+                if tensor is None:
+                    raise RuntimeError("Failed to load JXR file.")
 
-                print(f"DEBUG: Running HDRfix on {input_file}")  # Debug
-                # Run HDR conversion to PNG first
-                actual_output = run_hdrfix(
-                    input_file,
-                    temp_hdr_output,
-                    self.tonemap_var.get().strip(),
-                    self.pregamma_var.get().strip(),
-                    self.autoexposure_var.get().strip()
+                # Use the original tensor for processing
+                result = self.color_processor.process_image(
+                    tensor.clone(),
+                    original_output_file,
+                    color_strength=color_strength,
+                    edge_strength=edge_strength,
+                    use_enhancement=use_enhancement
                 )
-                temp_hdr_output = actual_output  # Use the actual PNG output path
 
-                print(f"DEBUG: HDRfix completed, checking output file: {temp_hdr_output}")  # Debug
-                if not os.path.exists(temp_hdr_output):
-                    raise FileNotFoundError(f"HDRfix failed to create output file: {temp_hdr_output}")
-
-                # Verify PNG file is valid
-                try:
-                    with Image.open(temp_hdr_output) as test_img:
-                        print(
-                            f"DEBUG: Temporary PNG properties - Format: {test_img.format}, Mode: {test_img.mode}, Size: {test_img.size}")  # Debug
-                        # Force load the image data to verify it's valid
-                        test_img.load()
-                except Exception as png_error:
-                    raise RuntimeError(f"HDRfix created invalid PNG file: {str(png_error)}")
-
-                try:
-                    # Try to remove existing output file
-                    if os.path.exists(output_file):
-                        os.remove(output_file)
-                except PermissionError:
-                    # If file is locked or can't be removed, create new filename
-                    base, ext = os.path.splitext(output_file)
-                    output_file = f"{base}_{int(time.time())}{ext}"
-
-                if self.use_color_correction.get():
-                    print("DEBUG: Applying color correction")  # Debug
-                    try:
-                        # Process with AI color enhancement
-                        self.color_processor.process_image(
-                            temp_hdr_output,
-                            output_file,
-                            strength=self.color_strength.get()
-                        )
-                    except Exception as e:
-                        print(f"DEBUG: Color correction failed: {str(e)}, attempting direct conversion")  # Debug
-                        # Fallback to direct conversion
-                        img = Image.open(temp_hdr_output)
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        img.save(output_file, 'JPEG', quality=95)
-                        img.close()
+                if result:
+                    self.master.after(0, lambda: self.show_color_spectrum(original_output_file, is_before=False))
+                    self.safe_update_ui("Conversion successful!", "#00FF00")
+                    self.master.after(0, lambda: self.show_preview_from_file(original_output_file, is_before=False))
                 else:
-                    print("DEBUG: Converting directly to JPG")  # Debug
-                    # Convert PNG to JPG directly without AI processing
-                    img = Image.open(temp_hdr_output)
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    img.save(output_file, 'JPEG', quality=95)
-                    img.close()
-
-                print(f"DEBUG: Checking final output: {output_file}")  # Debug
-                if not os.path.exists(output_file):
-                    raise FileNotFoundError(f"Failed to create final output file: {output_file}")
-
-                self.safe_update_ui(
-                    "Conversion successful!",
-                    "#00FF00"
-                )
-
-                # Update preview
-                if os.path.exists(output_file):
-                    self.show_preview_from_file(output_file, is_before=False)
-
+                    raise RuntimeError("Image processing failed to produce output")
             except Exception as e:
-                print(f"DEBUG: Conversion failed with error: {str(e)}")  # Debug
-                self.safe_update_ui(
-                    f"Conversion failed: {str(e)}",
-                    "red"
-                )
-                messagebox.showerror("Error", str(e))
-
+                error_msg = str(e)
+                logging.error(f"Conversion failed with error: {error_msg}")
+                self.safe_update_ui(f"Conversion failed: {error_msg}", "red")
+                messagebox.showerror("Error", error_msg)
             finally:
-                # Clean up temporary file
-                if temp_hdr_output and os.path.exists(temp_hdr_output):
-                    try:
-                        os.remove(temp_hdr_output)
-                    except:
-                        pass
                 self.safe_enable_convert_button()
 
-        # Start processing in a separate thread
         threading.Thread(target=process_task, daemon=True).start()
 
     def _convert_folder(self):
-        """Convert all JXR files in a folder"""
+        """Converts all JXR files in a selected folder to JPEG."""
         folder_path = self.input_entry.get().strip()
-
-        # Validate folder
         if not folder_path or not os.path.isdir(folder_path):
             error_msg = "Please select a valid folder."
             messagebox.showerror("Error", error_msg)
             self.status_label.config(text=error_msg, foreground="red")
             return
 
-        # Find JXR files
-        jxr_files = [f for f in os.listdir(folder_path)
-                     if f.lower().endswith('.jxr')]
+        jxr_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.jxr')]
         if not jxr_files:
             error_msg = "No JXR files found in the selected folder."
             messagebox.showerror("Error", error_msg)
             self.status_label.config(text=error_msg, foreground="red")
             return
 
-        # Create output folder
         output_folder = os.path.join(folder_path, "Converted_JPGs")
         os.makedirs(output_folder, exist_ok=True)
 
-        # Prepare for conversion
-        self.status_label.config(
-            text=f"Converting {len(jxr_files)} files...",
-            foreground="#CCCCCC"
-        )
+        use_enhancement = self.use_enhancement.get()
+        color_strength = 100.0 if use_enhancement else 0.0
+        edge_strength = self.edge_strength.get() if use_enhancement else 0.0
+
+        self.status_label.config(text=f"Converting {len(jxr_files)} files...", foreground="#CCCCCC")
         self.progress['maximum'] = len(jxr_files)
         self.progress['value'] = 0
         self.convert_btn.config(state='disabled')
 
-        def process_file(jxr_file):
-            """Process a single JXR file in the batch conversion"""
-            print(f"\nDEBUG: Processing {jxr_file}")  # Debug
-            input_path = os.path.join(folder_path, jxr_file)
-            temp_hdr_output = os.path.join(
-                output_folder,
-                f"temp_hdr_{os.path.splitext(jxr_file)[0]}.png"  # Changed to PNG
-            )
-            final_output = os.path.join(
-                output_folder,
-                f"{os.path.splitext(jxr_file)[0]}.jpg"
-            )
-
-            try:
-                print(f"DEBUG: Running HDRfix on {input_path}")  # Debug
-                # Run HDR conversion to PNG
-                actual_output = run_hdrfix(
-                    input_path,
-                    temp_hdr_output,
-                    self.tonemap_var.get().strip(),
-                    self.pregamma_var.get().strip(),
-                    self.autoexposure_var.get().strip()
-                )
-                temp_hdr_output = actual_output  # Use the actual PNG output path
-
-                if not os.path.exists(temp_hdr_output):
-                    raise FileNotFoundError(f"HDRfix failed to create output file: {temp_hdr_output}")
-
-                # Verify PNG file is valid
-                try:
-                    with Image.open(temp_hdr_output) as test_img:
-                        print(
-                            f"DEBUG: Temporary PNG properties - Format: {test_img.format}, Mode: {test_img.mode}, Size: {test_img.size}")  # Debug
-                        # Force load the image data to verify it's valid
-                        test_img.load()
-                except Exception as png_error:
-                    raise RuntimeError(f"HDRfix created invalid PNG file: {str(png_error)}")
-
-                if self.use_color_correction.get():
-                    print(f"DEBUG: Applying color correction for {jxr_file}")  # Debug
-                    try:
-                        # Process with AI color enhancement
-                        self.color_processor.process_image(
-                            temp_hdr_output,
-                            final_output,
-                            strength=self.color_strength.get()
-                        )
-                    except Exception as e:
-                        print(f"DEBUG: Color correction failed for {jxr_file}: {str(e)}, attempting direct conversion")  # Debug
-                        # Fallback to direct conversion
-                        img = Image.open(temp_hdr_output)
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        img.save(final_output, 'JPEG', quality=95)
-                        img.close()
-                else:
-                    print(f"DEBUG: Converting directly to JPG for {jxr_file}")  # Debug
-                    # Convert PNG to JPG directly without AI processing
-                    img = Image.open(temp_hdr_output)
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    img.save(final_output, 'JPEG', quality=95)
-                    img.close()
-
-                print(f"DEBUG: Checking final output: {final_output}")  # Debug
-                if not os.path.exists(final_output):
-                    raise FileNotFoundError(f"Failed to create final output file: {final_output}")
-
-                self.safe_increment_progress()
-                print(f"DEBUG: Successfully processed {jxr_file}")  # Debug
-                return True
-
-            except Exception as e:
-                print(f"DEBUG: Error processing {jxr_file}: {str(e)}")  # Debug
-                return False
-
-            finally:
-                # Clean up temporary file
-                if os.path.exists(temp_hdr_output):
-                    try:
-                        os.remove(temp_hdr_output)
-                    except:
-                        pass
-
-        def batch_process():
-            """Handle the batch processing of all files"""
+        def process_files():
             successful_conversions = 0
             failed_conversions = 0
             failed_files = []
-
             try:
-                # Determine optimal number of worker threads
-                cpu_cores = os.cpu_count() or 1
-                max_workers = max(1, cpu_cores // 2)  # Use half of available cores
-                print(f"DEBUG: Using {max_workers} worker threads for batch processing")  # Debug
+                for jxr_file in jxr_files:
+                    try:
+                        input_path = os.path.join(folder_path, jxr_file)
+                        final_output = os.path.join(output_folder, f"{os.path.splitext(jxr_file)[0]}.jpg")
+                        self.safe_update_ui(f"Processing: {jxr_file}", "#CCCCCC")
+                        tensor, error, metadata = self.jxr_loader.load_jxr(input_path)
+                        if tensor is None:
+                            raise RuntimeError(f"Failed to load {jxr_file}")
 
-                # Process files in parallel
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    # Submit all files for processing
-                    future_to_file = {executor.submit(process_file, f): f for f in jxr_files}
+                        self.color_processor.process_image(
+                            tensor.clone(),
+                            final_output,
+                            color_strength=color_strength,
+                            edge_strength=edge_strength,
+                            use_enhancement=use_enhancement
+                        )
+                        successful_conversions += 1
+                        self.safe_increment_progress()
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception as e:
+                        logging.error(f"Failed to process {jxr_file}: {e}")
+                        failed_conversions += 1
+                        failed_files.append(jxr_file)
+                        self.safe_increment_progress()
 
-                    # Process results as they complete
-                    for future in concurrent.futures.as_completed(future_to_file):
-                        jxr_file = future_to_file[future]
-                        try:
-                            success = future.result()
-                            if success:
-                                successful_conversions += 1
-                            else:
-                                failed_conversions += 1
-                                failed_files.append(jxr_file)
-                        except Exception as e:
-                            print(f"DEBUG: Failed to process {jxr_file}: {str(e)}")  # Debug
-                            failed_conversions += 1
-                            failed_files.append(jxr_file)
-
-                # Update UI with final status
                 if failed_conversions == 0:
                     self.safe_update_ui(
                         f"Batch conversion completed! All {successful_conversions} files processed successfully.",
@@ -1348,142 +1480,48 @@ class App(TKMT.ThemedTKinterFrame):
                                  f"Successful: {successful_conversions}, Failed: {failed_conversions}\n"
                                  f"Failed files: {', '.join(failed_files)}")
                     self.safe_update_ui(error_msg, "orange" if successful_conversions > 0 else "red")
-                    print(f"DEBUG: {error_msg}")  # Debug
-
+                    logging.error(error_msg)
             except Exception as e:
-                print(f"DEBUG: Batch processing error: {str(e)}")  # Debug
-                self.safe_update_ui(
-                    f"Batch processing error: {str(e)}",
-                    "red"
-                )
-
+                logging.exception("Batch processing error.")
+                self.safe_update_ui(f"Batch processing error: {str(e)}", "red")
             finally:
                 self.safe_enable_convert_button()
 
-        # Start batch processing in a separate thread
-        threading.Thread(target=batch_process, daemon=True).start()
-
-    def create_preview_from_jxr(self, jxr_file: str):
-        """Create preview from JXR file"""
-        if not jxr_file.lower().endswith('.jxr'):
-            self.status_label.config(text="Not a JXR file", foreground="red")
-            self.before_label.config(image="", text="No Preview")
-            self.before_image_ref = None
-            return
-
-        tiff_path = None
-        try:
-            tiff_path = decode_jxr_to_tiff(jxr_file)
-            self.show_preview_from_file(tiff_path, is_before=True)
-            self.status_label.config(
-                text="Preview loaded successfully",
-                foreground="#00FF00"
-            )
-        except FileNotFoundError as e:
-            self.status_label.config(text=str(e), foreground="red")
-            messagebox.showerror("Error", str(e))
-            self.before_label.config(image="", text="No Preview")
-            self.before_image_ref = None
-        except subprocess.CalledProcessError:
-            self.status_label.config(
-                text="Preview failed: JXRDecApp error",
-                foreground="red"
-            )
-            self.before_label.config(text="Preview Failed")
-            self.before_image_ref = None
-        except Exception as e:
-            self.status_label.config(
-                text=f"Preview failed: {str(e)}",
-                foreground="red"
-            )
-            self.before_label.config(text="Preview Failed")
-            self.before_image_ref = None
-        finally:
-            if tiff_path and os.path.exists(tiff_path):
-                try:
-                    os.remove(tiff_path)
-                except:
-                    pass
-
-    def show_preview_from_file(self, filepath: str, is_before: bool):
-        """Show image preview"""
-        temp_png = None
-        label = self.before_label if is_before else self.after_label
-
-        # Clear existing image reference first
-        if is_before:
-            if self.before_image_ref:
-                self.before_label.config(image="")
-                self.before_image_ref = None
-        else:
-            if self.after_image_ref:
-                self.after_label.config(image="")
-                self.after_image_ref = None
-
-        try:
-            if filepath.lower().endswith(('.tif', '.tiff')):
-                temp_png = convert_tiff_to_png(filepath)
-                filepath = temp_png
-
-            # Load and convert image
-            img = Image.open(filepath).convert('RGB')
-            img_ratio = img.width / img.height
-            target_ratio = PREVIEW_WIDTH / PREVIEW_HEIGHT
-
-            # Calculate new size maintaining aspect ratio
-            if img_ratio > target_ratio:
-                new_size = (PREVIEW_WIDTH, int(PREVIEW_WIDTH / img_ratio))
-            else:
-                new_size = (int(PREVIEW_HEIGHT * img_ratio), PREVIEW_HEIGHT)
-
-            # Resize and create PhotoImage
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-            img_tk = ImageTk.PhotoImage(img)
-
-            # Update label with new image
-            label.config(image=img_tk, text="")
-            if is_before:
-                self.before_image_ref = img_tk
-            else:
-                self.after_image_ref = img_tk
-
-            # Force garbage collection of the old image
-            img.close()
-
-        except Exception as e:
-            label_text = f"Preview Error: {str(e)}"
-            label.config(image="", text=label_text)
-            if is_before:
-                self.before_image_ref = None
-            else:
-                self.after_image_ref = None
-
-        finally:
-            if temp_png and os.path.exists(temp_png):
-                try:
-                    os.remove(temp_png)
-                except:
-                    pass
+        threading.Thread(target=process_files, daemon=True).start()
 
     def safe_update_ui(self, message, color):
-        """Thread-safe UI update"""
+        """Safely updates the UI status label from any thread."""
         with self.ui_lock:
             self.status_label.config(text=message, foreground=color)
 
     def safe_increment_progress(self):
-        """Thread-safe progress bar update"""
+        """Safely increments the progress bar from any thread."""
         with self.ui_lock:
             self.progress['value'] += 1
             self.master.update_idletasks()
 
     def safe_enable_convert_button(self):
-        """Thread-safe convert button enable"""
+        """Safely enables the convert button from any thread."""
         with self.ui_lock:
             self.convert_btn.config(state='normal')
 
 
-# ============================================================
-# MAIN ENTRY POINT
-# ============================================================
 if __name__ == "__main__":
-    App("park", "dark")
+    try:
+        app = App("park", "dark")
+        root = app.master
+        root.title("NVIDIA HDR Converter")
+        root.minsize(1760, 840)
+        window_width = 1760
+        window_height = 840
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        center_x = int((screen_width - window_width) / 2)
+        center_y = int((screen_height - window_height) / 2)
+        root.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+        logging.info("Starting main event loop...")
+        root.mainloop()
+    except Exception as e:
+        logging.exception("Error starting application.")
+        messagebox.showerror("Fatal Error", f"An unexpected error occurred:\n{str(e)}")
+        sys.exit(1)
