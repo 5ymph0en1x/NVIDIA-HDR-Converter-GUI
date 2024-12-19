@@ -50,7 +50,7 @@ excludes = [
 ]
 
 a = Analysis(
-    ['app.py'],  # Replace with your main script
+    ['NHC.py'],  # Replace with your main script
     pathex=[os.path.abspath('.')],
     binaries=additional_dlls,  # Include additional DLLs
     datas=datas,
