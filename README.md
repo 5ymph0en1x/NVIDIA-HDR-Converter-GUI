@@ -62,6 +62,11 @@ TKinterModernThemes==1.10.4
    pip install -r requirements.txt
    ```
 
+3. Run NHC.py
+   ```bash
+   python NHC.py
+   ```
+
 ## Usage
 
 ### Single File Conversion
