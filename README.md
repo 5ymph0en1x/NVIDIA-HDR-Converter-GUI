@@ -53,7 +53,7 @@ TKinterModernThemes==1.10.4
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/ai-hdr-converter.git
+   git clone https://github.com/5ymph0en1x/NVIDIA-HDR-Converter-GUI.git
    ```
 
 2. Install Python dependencies:
