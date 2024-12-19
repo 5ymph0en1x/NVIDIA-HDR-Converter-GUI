@@ -32,8 +32,7 @@ hidden_imports = (
     ["imagecodecs._shared"] + [x.__name__ for x in napari.plugins.plugin_manager.plugins.values()] +
     collect_submodules('TKinterModernThemes') +
     collect_submodules('torch') +
-    collect_submodules('torchvision') +
-    collect_submodules('imagecodecs') +
+    collect_submodules('torchvision') + 
     [
         'tensorboard',                        # Manually add missing hidden imports
         'tzdata',
