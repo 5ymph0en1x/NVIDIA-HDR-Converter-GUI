@@ -70,7 +70,10 @@ if torch.cuda.is_available():
 
 
 class DeviceManager:
-    """Manages the computational device (GPU or CPU) for the application."""
+    """
+    Manages the computational device (GPU or CPU) for the application.
+    """
+
     def __init__(self):
         self.use_gpu = torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_gpu else "cpu")
@@ -79,7 +82,9 @@ class DeviceManager:
         logging.info(f"DeviceManager initialized on {self.device}")
 
     def switch_device(self, use_gpu: bool):
-        """Switches the device between GPU and CPU based on availability and user preference."""
+        """
+        Switches the device between GPU and CPU based on availability and user preference.
+        """
         self.use_gpu = use_gpu and torch.cuda.is_available()
         new_device = torch.device("cuda" if self.use_gpu else "cpu")
         if new_device != self.device:
@@ -94,7 +99,11 @@ class DeviceManager:
 
 
 class CBAM(nn.Module):
-    """Convolutional Block Attention Module."""
+    """
+    Convolutional Block Attention Module (CBAM).
+    Provides channel and spatial attention to enhance relevant features.
+    """
+
     def __init__(self, channels, reduction=16, kernel_size=7):
         super(CBAM, self).__init__()
         self.channel_attention = nn.Sequential(
@@ -110,8 +119,11 @@ class CBAM(nn.Module):
         )
 
     def forward(self, x):
+        # Channel Attention
         ca = self.channel_attention(x)
         x = x * ca
+
+        # Spatial Attention
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         sa_input = torch.cat([avg_out, max_out], dim=1)
@@ -121,16 +133,19 @@ class CBAM(nn.Module):
 
 
 class EdgeEnhancementBlock(nn.Module):
-    """Enhances edges in the image using Sobel filters."""
+    """
+    Enhances edges in the image using Sobel filters.
+    """
+
     def __init__(self):
         super(EdgeEnhancementBlock, self).__init__()
         gaussian_kernel = torch.tensor([
             [1, 4, 6, 4, 1],
-            [4,16,24,16, 4],
-            [6,24,36,24, 6],
-            [4,16,24,16, 4],
+            [4, 16, 24, 16, 4],
+            [6, 24, 36, 24, 6],
+            [4, 16, 24, 16, 4],
             [1, 4, 6, 4, 1]
-        ], dtype=torch.float32)/256.0
+        ], dtype=torch.float32) / 256.0
         self.register_buffer('gaussian_kernel',
                              gaussian_kernel.view(1, 1, 5, 5).repeat(3, 1, 1, 1))
 
@@ -138,40 +153,62 @@ class EdgeEnhancementBlock(nn.Module):
             [-1.0, 0.0, 1.0],
             [-2.0, 0.0, 2.0],
             [-1.0, 0.0, 1.0]
-        ], dtype=torch.float32)/4.0
+        ], dtype=torch.float32) / 4.0
         kernel_y = torch.tensor([
-            [-1.0,-2.0,-1.0],
-            [ 0.0, 0.0, 0.0],
-            [ 1.0, 2.0, 1.0]
-        ], dtype=torch.float32)/4.0
+            [-1.0, -2.0, -1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 1.0]
+        ], dtype=torch.float32) / 4.0
 
-        self.register_buffer('kernel_x', kernel_x.view(1,1,3,3))
-        self.register_buffer('kernel_y', kernel_y.view(1,1,3,3))
+        self.register_buffer('kernel_x', kernel_x.view(1, 1, 3, 3))
+        self.register_buffer('kernel_y', kernel_y.view(1, 1, 3, 3))
 
     def forward(self, x, edge_strength=0.0):
+        """
+        Performs edge enhancement using Sobel filters.
+
+        :param x: Input tensor of shape (B, 3, H, W)
+        :param edge_strength: Strength of the edge enhancement [0-100]
+        """
         if edge_strength <= 0.0:
             return x
+
+        # Normalize input for edge detection
         orig_min = x.min()
         orig_max = x.max()
-        x_norm = (x - orig_min)/(orig_max - orig_min + 1e-8)
-        luminance = 0.2989*x_norm[:,0:1]+0.5870*x_norm[:,1:2]+0.1140*x_norm[:,2:3]
+        x_norm = (x - orig_min) / (orig_max - orig_min + 1e-8)
+
+        # Calculate luminance for edge detection
+        luminance = 0.2989 * x_norm[:, 0:1] + 0.5870 * x_norm[:, 1:2] + 0.1140 * x_norm[:, 2:3]
+
+        # Sobel filters
         edge_x = F.conv2d(luminance, self.kernel_x, padding=1)
         edge_y = F.conv2d(luminance, self.kernel_y, padding=1)
-        edge_magnitude = torch.sqrt(edge_x.pow(2)+edge_y.pow(2))
-        edge_magnitude = edge_magnitude/(edge_magnitude.max()+1e-8)
-        edge_strength = (edge_strength/100.0)*0.2
-        enhancement = edge_magnitude*edge_strength
+        edge_magnitude = torch.sqrt(edge_x.pow(2) + edge_y.pow(2))
+        edge_magnitude = edge_magnitude / (edge_magnitude.max() + 1e-8)
+
+        # Scale edge strength
+        edge_strength = (edge_strength / 100.0) * 0.2
+        enhancement = edge_magnitude * edge_strength
+
+        # Apply enhancement
         result = torch.zeros_like(x_norm)
         for c in range(3):
-            result[:,c:c+1] = x_norm[:,c:c+1]*(1.0+enhancement)
-        result = (result - result.min())/(result.max()-result.min()+1e-8)
-        result = result*(orig_max - orig_min)+orig_min
+            result[:, c:c + 1] = x_norm[:, c:c + 1] * (1.0 + enhancement)
+
+        # Re-normalize to original range
+        result = (result - result.min()) / (result.max() - result.min() + 1e-8)
+        result = result * (orig_max - orig_min) + orig_min
         result = torch.clamp(result, min=orig_min, max=orig_max)
         return result
 
 
 class ColorBalanceBlock(nn.Module):
-    """Balances colors across different luminance ranges."""
+    """
+    Balances colors across different luminance ranges (shadows, midtones, highlights).
+    Also applies optional color temperature adjustments and channel correlations.
+    """
+
     def __init__(self, channels, color_preservation=0.5):
         super(ColorBalanceBlock, self).__init__()
         self.color_preservation = color_preservation
@@ -203,26 +240,32 @@ class ColorBalanceBlock(nn.Module):
         adjust_map = shadows_mask * shadows_adjust + midtones_mask * midtones_adjust + highlights_mask * highlights_adjust
         x_balanced = x + adjust_map
 
+        # Linear transformation across channels for color correlation
         x_reshaped = x_balanced.view(B, C, -1).transpose(1, 2)
-
-        # Ensure x_reshaped is the same dtype as channel_corr's weights
         x_reshaped = x_reshaped.to(self.channel_corr.weight.dtype)
 
         x_corr = self.channel_corr(x_reshaped).transpose(1, 2).view(B, C, H, W)
 
+        # Apply color temperature offset (simple red/blue shift)
         temp_val = self.color_temp
         x_corr[:, 0, :, :] += temp_val * 0.05
         x_corr[:, 2, :, :] -= temp_val * 0.05
 
+        # Context-based scaling
         context = self.global_pool(x_corr)
         context = self.context_transform(context)
         x_corr = x_corr * context
+
+        # Blend between original and corrected
         x_final = self.color_preservation * x + (1.0 - self.color_preservation) * x_corr
         return x_final
 
 
 class ColorCorrectionNet(nn.Module):
-    """Neural network for color correction using pretrained models."""
+    """
+    Neural network for color correction using pretrained models (VGG16, ResNet34, DenseNet121).
+    Combines feature extraction from all three models and fuses them into a final color transform.
+    """
 
     def __init__(self):
         super(ColorCorrectionNet, self).__init__()
@@ -240,7 +283,7 @@ class ColorCorrectionNet(nn.Module):
                 param.requires_grad = False
             model.eval()
 
-        # Simplified adaptation layers
+        # Simplified adaptation layers (reduces dimension to a common size)
         self.vgg_adapt = nn.Sequential(
             nn.Conv2d(64, 256, 1),
             nn.BatchNorm2d(256),
@@ -259,7 +302,7 @@ class ColorCorrectionNet(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Simplified fusion with anti-artifact measures
+        # Fusion and post-processing
         self.fusion = nn.Sequential(
             nn.Conv2d(768, 384, 1),
             nn.BatchNorm2d(384),
@@ -269,7 +312,8 @@ class ColorCorrectionNet(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Modified color transform to prevent banding
+        # CBAM attention and final color transform
+        self.cbam = CBAM(192, reduction=8)
         self.color_transform = nn.Sequential(
             nn.Conv2d(192, 96, 3, padding=1),
             nn.BatchNorm2d(96),
@@ -278,14 +322,17 @@ class ColorCorrectionNet(nn.Module):
             nn.BatchNorm2d(48),
             nn.ReLU(inplace=True),
             nn.Conv2d(48, 3, 3, padding=1),
-            nn.Sigmoid()  # Changed to Sigmoid for smoother color transitions
+            nn.Sigmoid()  # Sigmoid for smoother color transitions
         )
 
-        # Minimal enhancement blocks
+        # Minimal edge enhancement block, if desired
         self.edge_enhance = EdgeEnhancementBlock()
-        self.cbam = CBAM(192, reduction=8)  # Reduced complexity
 
     def extract_features(self, x):
+        """
+        Extracts lower-level features from VGG, ResNet, and DenseNet.
+        We only take the earliest layers for a simpler memory footprint.
+        """
         # VGG features
         vgg_feat = self.vgg.features[:5](x)
         vgg_feat = self.vgg_adapt(vgg_feat)
@@ -303,8 +350,10 @@ class ColorCorrectionNet(nn.Module):
         return vgg_feat, resnet_feat, densenet_feat
 
     def forward(self, x):
+        """
+        Forward pass for color correction and minor enhancement.
+        """
         with torch.inference_mode():
-            # Ensure proper dtype and range
             if x.device.type == 'cpu':
                 x = x.float()
 
@@ -314,13 +363,13 @@ class ColorCorrectionNet(nn.Module):
             x_range = x_max - x_min
             eps = 1e-8
 
-            # Normalize with epsilon to prevent division by zero
+            # Normalize
             x_normalized = (x - x_min) / (x_range + eps)
 
             # Extract features
             vgg_feat, resnet_feat, densenet_feat = self.extract_features(x_normalized)
 
-            # Ensure consistent spatial dimensions
+            # Ensure consistent spatial dimensions before fusion
             target_size = vgg_feat.shape[-2:]
             resnet_feat = F.interpolate(resnet_feat, size=target_size, mode='bilinear', align_corners=False)
             densenet_feat = F.interpolate(densenet_feat, size=target_size, mode='bilinear', align_corners=False)
@@ -329,21 +378,21 @@ class ColorCorrectionNet(nn.Module):
             fused = self.fusion(torch.cat([vgg_feat, resnet_feat, densenet_feat], dim=1))
             del vgg_feat, resnet_feat, densenet_feat
 
-            # Apply attention and enhancement
+            # Apply CBAM attention
             fused = self.cbam(fused)
 
             # Generate color adjustment
             delta = self.color_transform(fused)
             del fused
 
-            # Upsample delta to match input resolution
+            # Upsample to match input resolution
             delta = F.interpolate(delta, size=x.shape[-2:], mode='bilinear', align_corners=False)
 
-            # Apply subtle color enhancement
-            delta = (delta - 0.5) * 0.2  # Scale adjustments to ±0.1 range
+            # Scale adjustments to ±0.1 range
+            delta = (delta - 0.5) * 0.2
             enhanced = x_normalized * (1.0 + delta)
 
-            # Restore original range with smooth clamping
+            # Restore original range
             enhanced = enhanced * x_range + x_min
             enhanced = torch.clamp(enhanced, min=x_min, max=x_max)
 
@@ -355,7 +404,11 @@ class ColorCorrectionNet(nn.Module):
 
 
 class OptimizedJXRLoader:
-    """Handles loading and processing of JXR images."""
+    """
+    Handles loading and processing of JXR images.
+    This class includes tone mapping operations for preview and final processing.
+    """
+
     def __init__(self, device):
         self.device = device
         self.hdr_peak_luminance = 10000.0
@@ -363,25 +416,31 @@ class OptimizedJXRLoader:
         self.selected_pre_gamma = 1.0
         self.selected_auto_exposure = 1.0
         self.ACES_INPUT_MAT = torch.tensor([
-            [0.59719,0.35458,0.04823],
-            [0.07600,0.90834,0.01566],
-            [0.02840,0.13383,0.83777]
+            [0.59719, 0.35458, 0.04823],
+            [0.07600, 0.90834, 0.01566],
+            [0.02840, 0.13383, 0.83777]
         ])
         self.ACES_OUTPUT_MAT = torch.tensor([
-            [1.60475,-0.53108,-0.07367],
-            [-0.10208,1.10813,-0.00605],
-            [-0.00327,-0.07276,1.07602]
+            [1.60475, -0.53108, -0.07367],
+            [-0.10208, 1.10813, -0.00605],
+            [-0.00327, -0.07276, 1.07602]
         ])
 
     def _apply_gamma_correction(self, image: np.ndarray, gamma: float) -> np.ndarray:
+        """
+        Safely applies gamma correction to the input image array.
+        """
         pos_mask = image > 0
         result = np.zeros_like(image)
         if np.any(pos_mask):
             result[pos_mask] = np.power(image[pos_mask], gamma)
         return result
 
-    def load_jxr(self, file_path: str, is_preview: bool=False):
-        """Loads and preprocesses a JXR image."""
+    def load_jxr(self, file_path: str, is_preview: bool = False):
+        """
+        Loads and preprocesses a JXR image for tone mapping and optional preview.
+        Returns a torch Tensor on the configured device.
+        """
         try:
             with open(file_path, 'rb') as f:
                 jxr_data = f.read()
@@ -392,18 +451,21 @@ class OptimizedJXRLoader:
             image = image.astype(np.float32)
 
             if is_preview:
+                # Use simpler parameters for preview
                 pre_gamma = 1.0
                 auto_exposure = 1.0
                 tone_map = 'uncharted2'
             else:
-                pre_gamma = 1.0 + (self.selected_pre_gamma - 1.0)/3.0
-                auto_exposure = 1.0 + (self.selected_auto_exposure - 1.0)/3.0
+                pre_gamma = 1.0 + (self.selected_pre_gamma - 1.0) / 3.0
+                auto_exposure = 1.0 + (self.selected_auto_exposure - 1.0) / 3.0
                 tone_map = self.selected_tone_map
 
+            # Apply gamma correction
             if pre_gamma != 1.0:
                 gamma = 1.0 / pre_gamma
                 image = self._apply_gamma_correction(image, gamma)
 
+            # Apply auto-exposure
             if auto_exposure != 1.0:
                 mean_luminance = np.mean(image)
                 exposure_factor = auto_exposure
@@ -411,25 +473,24 @@ class OptimizedJXRLoader:
                     exposure_factor *= (0.18 / mean_luminance)
                 image *= exposure_factor
 
+            # Scale image to display range
             display_peak = 1000.0
             image = image * (display_peak / self.hdr_peak_luminance)
 
+            # Handle grayscale or RGBA
             if image.ndim == 2:
-                image = np.stack([image]*3, axis=-1)
+                image = np.stack([image] * 3, axis=-1)
             elif image.shape[2] == 4:
-                image = image[:,:,:3]
+                image = image[:, :, :3]
 
+            # Replace NaNs and inf
             image = np.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
-            tensor = torch.from_numpy(image).float().permute(2,0,1).contiguous().unsqueeze(0)
-            # Move tensor to device and maybe half precision for memory saving
-            if self.device.type == 'cuda':
-                tensor = tensor.to(self.device, non_blocking=True)
-                tensor = tensor.half()
-            else:
-                tensor = tensor.to(self.device, non_blocking=True)
-                tensor = tensor.half()  # Always use FP16 with CPU selection
 
-            # Apply tone map
+            # Convert to torch Tensor
+            tensor = torch.from_numpy(image).float().permute(2, 0, 1).contiguous().unsqueeze(0)
+            tensor = tensor.to(self.device, non_blocking=True)
+
+            # Apply tone mapping
             if tone_map == 'hable' or is_preview:
                 tensor = self._tone_map_hable(tensor)
             elif tone_map == 'reinhard':
@@ -443,6 +504,7 @@ class OptimizedJXRLoader:
             elif tone_map == 'adaptive':
                 tensor = self._tone_map_adaptive(tensor)
 
+            # Convert linear RGB to sRGB
             tensor = self.linear_to_srgb(tensor)
             return tensor, None, {}
         except Exception as e:
@@ -451,24 +513,26 @@ class OptimizedJXRLoader:
 
     def _tone_map_hable(self, x):
         """Applies Hable's tone mapping."""
-        A,B,C,D,E,F_=0.22,0.30,0.10,0.20,0.01,0.30
-        W=11.2
+        A, B, C, D, E, F_ = 0.22, 0.30, 0.10, 0.20, 0.01, 0.30
+        W = 11.2
+
         def evaluate(v):
-            num=(v*(A*v+C*B)+D*E)
-            den=(v*(A*v+B)+D*F_)
-            return num/(den+1e-6)-E/F_
+            num = (v * (A * v + C * B) + D * E)
+            den = (v * (A * v + B) + D * F_)
+            return num / (den + 1e-6) - E / F_
+
         nom = evaluate(x)
         denom = evaluate(torch.tensor(W, device=x.device, dtype=x.dtype))
-        return nom/(denom+1e-6)
+        return nom / (denom + 1e-6)
 
     def _tone_map_reinhard(self, x, L_white=4.0):
         """Applies Reinhard's tone mapping."""
-        L = 0.2126*x[:,0] + 0.7152*x[:,1] + 0.0722*x[:,2]
+        L = 0.2126 * x[:, 0] + 0.7152 * x[:, 1] + 0.0722 * x[:, 2]
         L_avg = torch.mean(L)
         L = L / (L_avg + 1e-6)
         L_scaled = (L * (1.0 + L / (L_white * L_white))) / (1.0 + L)
         ratio = torch.where(L > 1e-8, L_scaled / (L + 1e-6), torch.ones_like(L))
-        return torch.stack([x[:,i] * ratio for i in range(3)], dim=1)
+        return torch.stack([x[:, i] * ratio for i in range(3)], dim=1)
 
     def _tone_map_aces(self, x):
         """Applies ACES tone mapping with improved numerical stability."""
@@ -479,43 +543,43 @@ class OptimizedJXRLoader:
         batch, channels, height, width = x.shape
         x_reshaped = x.view(batch, channels, -1)
 
-        # Ensure stable computation by clamping input values
-        x_reshaped = torch.clamp(x_reshaped, min=0.0, max=65504.0)  # Max half-precision value
+        # Clamp input for safety
+        x_reshaped = torch.clamp(x_reshaped, min=0.0, max=65504.0)
 
-        # Apply input transform with improved numerical stability
+        # Apply ACES input transform
         x_transformed = torch.einsum('ij,bjk->bik', self.ACES_INPUT_MAT, x_reshaped)
         x_transformed = torch.clamp(x_transformed, min=0.0)
 
-        # ACES RRT and ODT
+        # RRT and ODT fit
         a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
         numerator = x_transformed * (a * x_transformed + b)
         denominator = x_transformed * (c * x_transformed + d) + e
-
-        # Prevent division by zero and ensure numerical stability
         denominator = torch.clamp(denominator, min=1e-8)
         x_tonemapped = numerator / denominator
 
-        # Apply output transform
+        # Output transform
         x_output = torch.einsum('ij,bjk->bik', self.ACES_OUTPUT_MAT, x_tonemapped)
-
-        # Final clamp to ensure valid range
         x_output = torch.clamp(x_output, min=0.0, max=1.0)
 
         return x_output.view(batch, channels, height, width).contiguous()
 
     def _tone_map_filmic(self, x):
-        """Applies Filmic tone mapping."""
+        """Applies a filmic tone mapping curve."""
         x = torch.max(torch.zeros_like(x), x)
-        A,B,C,D,E,F_=0.22,0.30,0.10,0.20,0.01,0.30
+        A, B, C, D, E, F_ = 0.22, 0.30, 0.10, 0.20, 0.01, 0.30
+
         def filmic_curve(v):
-            return ((v*(A*v+C*B)+D*E)/(v*(A*v+B)+D*F_))-E/F_
+            return ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F_)) - E / F_
+
         return filmic_curve(x)
 
     def _tone_map_uncharted2(self, x):
         """Applies Uncharted2 tone mapping."""
-        A,B,C,D,E,F_=0.15,0.50,0.10,0.20,0.02,0.30
+        A, B, C, D, E, F_ = 0.15, 0.50, 0.10, 0.20, 0.02, 0.30
+
         def uncharted2_tonemap(v):
-            return ((v*(A*v+C*B)+D*E)/(v*(A*v+B)+D*F_))-E/F_
+            return ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F_)) - E / F_
+
         exposure_bias = 2.0
         curr = uncharted2_tonemap(x * exposure_bias)
         W = 11.2
@@ -523,8 +587,10 @@ class OptimizedJXRLoader:
         return curr / white_scale
 
     def _tone_map_adaptive(self, x):
-        """Applies adaptive tone mapping based on dynamic range."""
-        L = 0.2126*x[:,0] + 0.7152*x[:,1] + 0.0722*x[:,2]
+        """
+        Automatically selects a tone mapping operator based on the image's dynamic range.
+        """
+        L = 0.2126 * x[:, 0] + 0.7152 * x[:, 1] + 0.0722 * x[:, 2]
         avg_luminance = torch.mean(L)
         max_luminance = torch.max(L)
         dynamic_range = max_luminance / (avg_luminance + 1e-6)
@@ -550,7 +616,9 @@ class OptimizedJXRLoader:
         return torch.clamp(srgb, 0.0, 1.0)
 
     def process_preview(self, tensor_data, target_width: int, target_height: int):
-        """Generates a preview tensor resized to target dimensions."""
+        """
+        Generates a lower-resolution preview from the loaded tensor.
+        """
         try:
             tensor = tensor_data[0] if isinstance(tensor_data, tuple) else tensor_data
             if tensor is None:
@@ -570,11 +638,13 @@ class OptimizedJXRLoader:
             return None
 
     def tensor_to_pil(self, tensor: torch.Tensor):
-        """Converts a tensor to a PIL Image."""
+        """
+        Converts a tensor (0-1 range in float) to a PIL Image.
+        """
         try:
             if tensor.is_cuda:
                 tensor = tensor.cpu()
-            tensor = tensor.float()  # Convert back to float32 for PIL
+            tensor = tensor.float()  # Convert to float32 if not already
             tensor = torch.clamp(tensor, 0.0, 1.0)
             tensor = (tensor * 255).byte()
             img_array = tensor.squeeze(0).permute(1, 2, 0).numpy()
@@ -585,7 +655,10 @@ class OptimizedJXRLoader:
 
 
 class HDRColorProcessor:
-    """Processes HDR images with color and edge enhancements."""
+    """
+    Processes HDR images with optional color correction and edge enhancements.
+    Manages GPU/CPU usage and half-precision toggling if desired.
+    """
 
     def __init__(self, device, jxr_loader, use_fp16=False):
         self.device = device
@@ -597,14 +670,14 @@ class HDRColorProcessor:
         if device.type == 'cuda' and self.use_fp16:
             self.color_net.half()
         elif device.type == 'cpu' and self.use_fp16:
-            # Attempt to convert model to half precision on CPU
+            # This can be optional; half precision is often slower on CPU, but we respect the user flag.
             try:
                 self.color_net.half()
             except Exception as e:
                 logging.error(f"Failed to convert model to FP16 on CPU: {e}")
-                self.use_fp16 = False  # Revert to FP32 if conversion fails
+                self.use_fp16 = False  # Revert if CPU half-precision fails
 
-        # Similarly handle other modules
+        # Edge enhancement block
         self.edge_enhancement = EdgeEnhancementBlock().to(device)
         if device.type == 'cuda' and self.use_fp16:
             self.edge_enhancement.half()
@@ -616,7 +689,7 @@ class HDRColorProcessor:
                 self.use_fp16 = False
 
     def clear_gpu_memory(self):
-        """Clears GPU memory cache."""
+        """Clears GPU memory cache if on CUDA."""
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -624,26 +697,22 @@ class HDRColorProcessor:
         """
         Process an HDR image tensor with color and edge enhancements.
 
-        Args:
-            original_tensor (torch.Tensor): Input HDR image tensor
-            output_path (str): Path to save the processed image
-            color_strength (float): Strength of color enhancement (0-100)
-            edge_strength (float): Strength of edge enhancement (0-100)
-            use_enhancement (bool): Whether to apply AI enhancement
-
-        Returns:
-            PIL.Image or None: Processed image if successful, None if failed
+        :param original_tensor: Input HDR image tensor
+        :param output_path: Path to save the processed image
+        :param color_strength: Strength of color enhancement (0-100)
+        :param edge_strength: Strength of edge enhancement (0-100)
+        :param use_enhancement: Whether to apply the AI-based color enhancement
+        :return: PIL.Image or None
         """
         try:
-            # Move tensor to correct device and set precision
             tensor = original_tensor.to(self.device, dtype=torch.float16 if self.use_fp16 else torch.float32)
 
-            # Add padding for processing
+            # Pad to avoid edge issues in convolution
             pad_size = 32
             padded_tensor = F.pad(tensor, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
 
             with torch.inference_mode():
-                # Apply color enhancement if enabled
+                # Color enhancement
                 if use_enhancement and color_strength > 0:
                     enhanced = self.color_net(padded_tensor)
                     normalized_strength = (color_strength / 100.0) * 1.5
@@ -652,34 +721,34 @@ class HDRColorProcessor:
                 else:
                     enhanced = padded_tensor
 
-                # Apply edge enhancement if enabled
+                # Edge enhancement
                 if edge_strength > 0:
                     enhanced = self.edge_enhancement(enhanced, edge_strength=edge_strength)
 
-                # Remove padding and convert back to float32 for CPU processing
+                # Remove padding
                 enhanced = enhanced[:, :, pad_size:-pad_size, pad_size:-pad_size]
-                if self.device.type == 'cpu' and self.use_fp16:
-                    enhanced = enhanced.float()
-                elif self.device.type == 'cuda' and self.use_fp16:
+
+                # Convert back to float32 if needed
+                if self.device.type == 'cpu' or (self.device.type == 'cuda' and self.use_fp16):
                     enhanced = enhanced.float()
 
                 enhanced = enhanced.cpu()
 
-                # Convert to numpy array for saving
+                # Convert to numpy for JPEG saving
                 array = enhanced.squeeze(0).permute(1, 2, 0).numpy()
 
-                # Clean up GPU memory
+                # Cleanup
                 del enhanced, padded_tensor, tensor
                 if self.device.type == 'cuda':
                     torch.cuda.empty_cache()
 
-                # Normalize the array for saving as JPEG
+                # Simple normalization for JPEG
                 array_max = array.max(axis=(0, 1), keepdims=True)
                 array_min = array.min(axis=(0, 1), keepdims=True)
                 array = (array - array_min) / (array_max - array_min + 1e-8) * 255.0
                 array = np.clip(array, 0, 255).astype(np.uint8)
 
-                # Convert to PIL Image and save
+                # Save the result
                 result_image = Image.fromarray(array)
                 result_image.save(output_path, 'JPEG', quality=95, optimize=True)
 
@@ -696,37 +765,41 @@ class HDRColorProcessor:
             return None
 
     def switch_device(self, use_gpu, use_fp16=False):
-        """Switches the processing device and updates model data types accordingly."""
-        new_device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+        """
+        Switches the processing device and updates model data types accordingly.
+        Corrected comment and logic below:
 
-        # Automatically disable FP32 if not using GPU
+        * We disable half precision if not using GPU, since CPU half-precision can be undesirable or slow.
+        """
+        new_device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+
+        # Corrected approach: If not on CUDA, force FP16 = False to stay in float32
+        # because half precision on CPU is typically not beneficial.
         if new_device.type != 'cuda':
-            use_fp16 = True  # Override FP16 to True for CPU
+            use_fp16 = False  # Override FP16 to False for CPU
 
         if new_device != self.device or use_fp16 != self.use_fp16:
             self.clear_gpu_memory()
             self.device = new_device
             self.use_fp16 = use_fp16
 
-            # Define desired data type based on the device and precision
             desired_dtype = torch.float16 if (self.device.type == 'cuda' and self.use_fp16) else torch.float32
 
             try:
-                # Move model and components to the new device and dtype
+                # Move model components to new device
                 self.color_net = self.color_net.to(device=self.device, dtype=desired_dtype)
                 self.edge_enhancement = self.edge_enhancement.to(device=self.device, dtype=desired_dtype)
-                # Move pretrained models inside color_net
                 for model in [self.color_net.vgg, self.color_net.resnet, self.color_net.densenet]:
                     model.to(device=self.device, dtype=desired_dtype)
 
-                # Move ACES matrices to the new device and dtype
+                # Move ACES matrices to new device/dtype
                 self.jxr_loader.ACES_INPUT_MAT = self.jxr_loader.ACES_INPUT_MAT.to(device=self.device,
                                                                                    dtype=desired_dtype)
                 self.jxr_loader.ACES_OUTPUT_MAT = self.jxr_loader.ACES_OUTPUT_MAT.to(device=self.device,
                                                                                      dtype=desired_dtype)
             except Exception as e:
                 logging.error(f"Failed to switch device or precision: {e}")
-                return False  # Indicate failure to the caller
+                return False
 
             logging.info(f"Switched to {self.device} with {'FP16' if self.use_fp16 else 'FP32'} precision")
 
@@ -766,13 +839,16 @@ def validate_parameters(tone_map: str, pre_gamma: str, auto_exposure: str) -> No
 
 
 class App(TKMT.ThemedTKinterFrame):
-    """Main application class for the NVIDIA HDR Converter GUI."""
+    """
+    Main application class for the NVIDIA HDR Converter GUI.
+    Sets up the UI, configures user options, and handles file/folder batch conversions.
+    """
 
     def __init__(self, theme="park", mode="dark"):
         super().__init__("NVIDIA HDR Converter", theme, mode)
         self.device_manager = DeviceManager()
         self.jxr_loader = OptimizedJXRLoader(self.device_manager.get_device())
-        self.use_fp16_var = tk.BooleanVar(value=False)  # Variable for FP16 toggle
+        self.use_fp16_var = tk.BooleanVar(value=False)  # Variable for half precision toggle
         self.color_processor = HDRColorProcessor(
             self.device_manager.get_device(),
             self.jxr_loader,
@@ -977,9 +1053,8 @@ class App(TKMT.ThemedTKinterFrame):
             if use_gpu and torch.cuda.is_available():
                 use_fp16 = self.use_fp16_var.get()
             else:
-                use_fp16 = True  # Always use FP16 when GPU is not selected
+                use_fp16 = False  # <-- CHANGED: Now False instead of True on CPU
 
-            # Attempt to switch device and precision
             success = self.color_processor.switch_device(use_gpu, use_fp16=use_fp16)
             if success:
                 device_name = "GPU" if use_gpu and torch.cuda.is_available() else "CPU"
@@ -1001,10 +1076,9 @@ class App(TKMT.ThemedTKinterFrame):
             else:
                 self.enhance_checkbox.config(state='normal')
                 self.edge_scale.config(state='normal')
-                self.use_enhancement.set(True)
                 self._update_enhancement_controls()
-                self.fp16_toggle.config(state='disabled')  # Disable FP16 toggle
-                self.use_fp16_var.set(True)  # Always use FP16 when GPU is not selected
+                self.fp16_toggle.config(state='disabled')
+                self.use_fp16_var.set(False)
 
         except Exception as e:
             error_msg = f"Device switching failed: {str(e)}"
@@ -1322,12 +1396,14 @@ class App(TKMT.ThemedTKinterFrame):
             img = Image.open(filepath).convert('RGB')
             vis_img = self._create_histogram_image(np.array(img))
             vis_tk = ImageTk.PhotoImage(vis_img)
+
             def update_visualization():
                 label.config(image=vis_tk, text="")
                 if is_before:
                     self.before_hist_ref = vis_tk
                 else:
                     self.after_hist_ref = vis_tk
+
             self.master.after(0, update_visualization)
         except Exception as e:
             label.config(image="", text=f"Visualization Error: {str(e)}")
@@ -1375,25 +1451,25 @@ class App(TKMT.ThemedTKinterFrame):
         """Creates a histogram visualization from an image array."""
         vis_img = Image.new('RGB', (self.preview_width, 150), '#1e1e1e')
         draw = ImageDraw.Draw(vis_img, 'RGBA')
-        draw.rectangle([0,0,self.preview_width,150], fill='#2b2b2b')
-        grid_spacing = 150//4
+        draw.rectangle([0, 0, self.preview_width, 150], fill='#2b2b2b')
+        grid_spacing = 150 // 4
         for i in range(5):
-            y = i*grid_spacing
-            draw.line([(0,y),(self.preview_width,y)], fill='#40404040', width=1)
+            y = i * grid_spacing
+            draw.line([(0, y), (self.preview_width, y)], fill='#40404040', width=1)
         channels = [
-            (img_array[:,:,0], '#ff000066'),
-            (img_array[:,:,1], '#00ff0066'),
-            (img_array[:,:,2], '#0000ff66')
+            (img_array[:, :, 0], '#ff000066'),
+            (img_array[:, :, 1], '#00ff0066'),
+            (img_array[:, :, 2], '#0000ff66')
         ]
         for channel_data, color in channels:
-            hist, _ = np.histogram(channel_data, bins=self.preview_width, range=(0,255))
+            hist, _ = np.histogram(channel_data, bins=self.preview_width, range=(0, 255))
             if hist.max() > 0:
                 hist = hist / hist.max() * (150 - 10)
-            points = [(0,150)]
+            points = [(0, 150)]
             for x in range(self.preview_width):
                 y = 150 - hist[x]
-                points.append((x,y))
-            points.append((self.preview_width,150))
+                points.append((x, y))
+            points.append((self.preview_width, 150))
             draw.polygon(points, fill=color)
         return vis_img
 
@@ -1461,11 +1537,11 @@ class App(TKMT.ThemedTKinterFrame):
 
         # Edge Enhancement Controls
         ttk.Label(enhance_frame, text="Strength:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
-        self.edge_strength = tk.DoubleVar(value=0.0)
+        self.edge_strength = tk.DoubleVar(value=50.0)  # <-- Changed to 50.0
         self.edge_scale = ttk.Scale(enhance_frame, from_=0.0, to=100.0,
                                     variable=self.edge_strength, orient="horizontal")
         self.edge_scale.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
-        self.edge_label = ttk.Label(enhance_frame, text="0%", width=4, anchor="e")
+        self.edge_label = ttk.Label(enhance_frame, text="50%", width=4, anchor="e")  # Optional: Start label at 50%
         self.edge_label.grid(row=1, column=2, sticky="e", pady=(10, 0))
 
         def update_edge_label(*args):
