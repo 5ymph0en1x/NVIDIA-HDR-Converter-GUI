@@ -40,14 +40,13 @@ Convert NVIDIA HDR screenshots (JXR format) to JPEG with advanced AI enhancement
 
 ### Python Dependencies
 ```txt
-torch==2.5.1
-torchvision==0.16.1
 Pillow==10.2.0
 numpy==1.26.4
 matplotlib==3.9.3
 imagecodecs==2024.9.22
 TKinterModernThemes==1.10.4
 ```
+Install pytorch using this link : https://pytorch.org/
 
 ## Installation
 
