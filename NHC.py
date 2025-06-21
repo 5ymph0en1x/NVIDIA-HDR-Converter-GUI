@@ -17,6 +17,9 @@ import logging
 import matplotlib
 import numpy as np
 import imagecodecs
+import struct
+from typing import Dict, Tuple, Optional, List
+import json
 
 # Logging Configuration
 logging.basicConfig(
@@ -35,10 +38,11 @@ logging.getLogger('').addHandler(console)
 matplotlib.use('Agg')
 
 # Constants
-DEFAULT_TONE_MAP = "adaptive"
+DEFAULT_TONE_MAP = "perceptual"
 DEFAULT_PREGAMMA = "1.0"
 DEFAULT_AUTOEXPOSURE = "1.0"
-SUPPORTED_TONE_MAPS = {"adaptive", "hable", "reinhard", "filmic", "aces", "uncharted2"}
+SUPPORTED_TONE_MAPS = {"perceptual", "adaptive", "hable", "reinhard", "filmic", "aces", "uncharted2", "mantiuk06",
+                       "drago03"}
 
 PRETRAINED_MODELS = {
     'vgg': models.vgg16,
@@ -67,6 +71,514 @@ torch.backends.cudnn.benchmark = False
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
+
+
+class HDRMetadata:
+    """Stores and manages HDR metadata extracted from JXR files."""
+
+    def __init__(self):
+        self.max_luminance = 10000.0
+        self.min_luminance = 0.0
+        self.white_point = 1000.0
+        self.color_primaries = "bt2020"
+        self.transfer_function = "pq"
+        self.color_space = "rec2020"
+        self.bit_depth = 10
+        self.has_metadata = False
+
+    def extract_from_jxr(self, jxr_data: bytes) -> bool:
+        """Extract HDR metadata from JXR file data."""
+        try:
+            # Look for HDR metadata markers in JXR container
+            # This is a simplified version - real implementation would parse JPEGXR container properly
+            if b'hdrf' in jxr_data:
+                # Extract luminance values
+                idx = jxr_data.find(b'hdrf')
+                if idx != -1 and idx + 16 <= len(jxr_data):
+                    # Parse metadata block (simplified)
+                    try:
+                        self.max_luminance = struct.unpack('<f', jxr_data[idx + 4:idx + 8])[0]
+                        self.min_luminance = struct.unpack('<f', jxr_data[idx + 8:idx + 12])[0]
+                        self.white_point = struct.unpack('<f', jxr_data[idx + 12:idx + 16])[0]
+                    except struct.error:
+                        # If metadata format is different, use defaults
+                        pass
+                    self.has_metadata = True
+                    return True
+        except Exception as e:
+            logging.debug(f"No HDR metadata found: {e}")
+        return False
+
+    def to_dict(self) -> Dict:
+        """Convert metadata to dictionary."""
+        return {
+            'max_luminance': self.max_luminance,
+            'min_luminance': self.min_luminance,
+            'white_point': self.white_point,
+            'color_primaries': self.color_primaries,
+            'transfer_function': self.transfer_function,
+            'color_space': self.color_space,
+            'bit_depth': self.bit_depth,
+            'has_metadata': self.has_metadata
+        }
+
+
+class PerceptualColorPreserver:
+    """Preserves perceptual color relationships during tone mapping."""
+
+    def __init__(self, device):
+        self.device = device
+        # CIE LAB conversion matrices
+        self.xyz_to_rgb = torch.tensor([
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252]
+        ], device=device)
+        self.rgb_to_xyz = torch.tensor([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041]
+        ], device=device)
+
+    def rgb_to_lab(self, rgb: torch.Tensor) -> torch.Tensor:
+        """Convert RGB to CIE LAB color space."""
+        # Linearize RGB
+        rgb = torch.where(rgb > 0.04045,
+                          torch.pow((rgb + 0.055) / 1.055, 2.4),
+                          rgb / 12.92)
+
+        # Convert to XYZ
+        B, C, H, W = rgb.shape
+        rgb_flat = rgb.view(B, C, -1)
+        xyz = torch.einsum('ij,bjk->bik', self.rgb_to_xyz, rgb_flat)
+        xyz = xyz.view(B, 3, H, W)
+
+        # Normalize by D65 white point
+        xyz[:, 0] /= 0.95047
+        xyz[:, 2] /= 1.08883
+
+        # Convert to LAB
+        f = torch.where(xyz > 0.008856,
+                        torch.pow(xyz, 1 / 3),
+                        7.787 * xyz + 16 / 116)
+
+        L = 116 * f[:, 1:2] - 16
+        a = 500 * (f[:, 0:1] - f[:, 1:2])
+        b = 200 * (f[:, 1:2] - f[:, 2:3])
+
+        return torch.cat([L, a, b], dim=1)
+
+    def lab_to_rgb(self, lab: torch.Tensor) -> torch.Tensor:
+        """Convert CIE LAB to RGB color space."""
+        L, a, b = lab[:, 0:1], lab[:, 1:2], lab[:, 2:3]
+
+        # Convert to XYZ
+        fy = (L + 16) / 116
+        fx = a / 500 + fy
+        fz = fy - b / 200
+
+        x_val = torch.where(fx > 0.206897, torch.pow(fx, 3), (fx - 16 / 116) / 7.787)
+        y_val = torch.where(fy > 0.206897, torch.pow(fy, 3), (fy - 16 / 116) / 7.787)
+        z_val = torch.where(fz > 0.206897, torch.pow(fz, 3), (fz - 16 / 116) / 7.787)
+
+        xyz = torch.cat([x_val, y_val, z_val], dim=1)
+
+        # Denormalize
+        xyz[:, 0] *= 0.95047
+        xyz[:, 2] *= 1.08883
+
+        # Convert to RGB
+        B, C, H, W = xyz.shape
+        xyz_flat = xyz.view(B, C, -1)
+        rgb = torch.einsum('ij,bjk->bik', self.xyz_to_rgb, xyz_flat)
+        rgb = rgb.view(B, 3, H, W)
+
+        # Apply sRGB gamma
+        rgb = torch.where(rgb > 0.0031308,
+                          1.055 * torch.pow(rgb, 1 / 2.4) - 0.055,
+                          12.92 * rgb)
+
+        return torch.clamp(rgb, 0, 1)
+
+    def preserve_color_ratios(self, original: torch.Tensor, tonemapped: torch.Tensor) -> torch.Tensor:
+        """Preserve color ratios from original in tonemapped image."""
+        # Convert both to LAB
+        orig_lab = self.rgb_to_lab(original)
+        tone_lab = self.rgb_to_lab(tonemapped)
+
+        # Preserve original color channels, use tonemapped luminance
+        preserved_lab = torch.cat([tone_lab[:, 0:1], orig_lab[:, 1:3]], dim=1)
+
+        # Scale color channels based on luminance change
+        lum_ratio = torch.clamp(tone_lab[:, 0:1] / (orig_lab[:, 0:1] + 1e-6), 0.2, 5.0)
+        preserved_lab[:, 1:3] *= lum_ratio
+
+        # Convert back to RGB
+        return self.lab_to_rgb(preserved_lab)
+
+
+class AdvancedToneMapper:
+    """Advanced tone mapping with multiple algorithms and automatic selection."""
+
+    def __init__(self, device, metadata: Optional[HDRMetadata] = None):
+        self.device = device
+        self.metadata = metadata or HDRMetadata()
+        self.color_preserver = PerceptualColorPreserver(device)
+
+        # Pre-compute tone mapping LUTs for efficiency
+        self._build_luts()
+
+    def _build_luts(self):
+        """Build lookup tables for various tone mapping curves."""
+        lut_size = 4096
+        x = torch.linspace(0, 20, lut_size, device=self.device)
+
+        # Build LUTs for different operators
+        self.hable_lut = self._hable_curve(x)
+        self.aces_lut = self._aces_curve(x)
+        self.reinhard_lut = self._reinhard_curve(x, L_white=4.0)
+
+    def _hable_curve(self, x):
+        """Hable tone mapping curve."""
+        A, B, C, D, E, F = 0.15, 0.50, 0.10, 0.20, 0.02, 0.30
+        return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F
+
+    def _aces_curve(self, x):
+        """ACES RRT+ODT tone mapping curve."""
+        a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
+        return torch.clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0, 1)
+
+    def _reinhard_curve(self, x, L_white=4.0):
+        """Extended Reinhard tone mapping curve."""
+        return x * (1.0 + x / (L_white * L_white)) / (1.0 + x)
+
+    def _apply_lut(self, image: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
+        """Apply tone mapping LUT to image."""
+        # Normalize image values to LUT range
+        img_max = image.max()
+        if img_max > 0:
+            normalized = image / img_max * (len(lut) - 1)
+            indices = torch.clamp(normalized.long(), 0, len(lut) - 1)
+
+            # Apply LUT
+            B, C, H, W = image.shape
+            flat = indices.view(-1)
+            mapped_flat = lut[flat]
+            mapped = mapped_flat.view(B, C, H, W) * img_max
+
+            return mapped
+        return image
+
+    def analyze_image_statistics(self, image: torch.Tensor) -> Dict:
+        """Comprehensive HDR image analysis for optimal tone mapping selection."""
+        luminance = 0.2126 * image[:, 0] + 0.7152 * image[:, 1] + 0.0722 * image[:, 2]
+
+        # Basic statistics
+        stats = {
+            'min_luminance': luminance.min().item(),
+            'max_luminance': luminance.max().item(),
+            'mean_luminance': luminance.mean().item(),
+            'std_luminance': luminance.std().item(),
+            'median_luminance': luminance.median().item(),
+            'dynamic_range': (luminance.max() / (luminance.min() + 1e-8)).item(),
+            'key': torch.exp(torch.log(luminance + 1e-8).mean()).item(),
+        }
+
+        # Enhanced histogram analysis
+        hist, bins = torch.histogram(torch.log10(luminance.cpu() + 1e-8), bins=256)
+        hist_norm = hist.float() / hist.sum()
+
+        # Zone analysis (Ansel Adams Zone System inspired)
+        zones = torch.split(hist_norm, 32)  # 8 zones
+        zone_weights = torch.tensor([zone.sum().item() for zone in zones])
+
+        stats['shadow_detail'] = zone_weights[:2].sum().item()  # Zones 0-I
+        stats['midtone_detail'] = zone_weights[3:5].sum().item()  # Zones III-IV
+        stats['highlight_detail'] = zone_weights[6:].sum().item()  # Zones VI-VII
+
+        # Local contrast analysis
+        kernel = torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]],
+                              dtype=torch.float32, device=image.device).view(1, 1, 3, 3)
+        contrast = F.conv2d(luminance.unsqueeze(1), kernel, padding=1)
+        stats['local_contrast'] = contrast.abs().mean().item()
+        stats['contrast_variance'] = contrast.std().item()
+
+        # Color saturation analysis
+        rgb_max = image.max(dim=1)[0]
+        rgb_min = image.min(dim=1)[0]
+        saturation = (rgb_max - rgb_min) / (rgb_max + 1e-8)
+        stats['mean_saturation'] = saturation.mean().item()
+        stats['saturation_variance'] = saturation.std().item()
+
+        # Specular highlight detection
+        highlight_threshold = stats['mean_luminance'] + 2 * stats['std_luminance']
+        stats['specular_ratio'] = (luminance > highlight_threshold).float().mean().item()
+
+        # Scene classification
+        stats['is_high_key'] = stats['mean_luminance'] > 0.6 and stats['shadow_detail'] < 0.1
+        stats['is_low_key'] = stats['mean_luminance'] < 0.3 and stats['highlight_detail'] < 0.1
+        stats['has_extreme_highlights'] = stats['specular_ratio'] > 0.05
+        stats['needs_shadow_recovery'] = stats['shadow_detail'] > 0.3 and stats['min_luminance'] < 0.01
+
+        # Perceptual metrics
+        stats['contrast_score'] = stats['local_contrast'] / (stats['contrast_variance'] + 1e-8)
+        stats['detail_score'] = (stats['shadow_detail'] + stats['midtone_detail'] + stats['highlight_detail']) / 3
+
+        return stats
+
+    def select_optimal_tonemap(self, stats: Dict) -> str:
+        """Intelligent tone mapping selection based on comprehensive image analysis."""
+        dr = stats['dynamic_range']
+
+        # Decision tree with weighted scoring
+        scores = {
+            'perceptual': 0,
+            'mantiuk06': 0,
+            'drago03': 0,
+            'hable': 0,
+            'aces': 0,
+            'reinhard': 0,
+            'adaptive': 0
+        }
+
+        # Dynamic range scoring
+        if dr > 10000:
+            scores['perceptual'] += 30
+            scores['mantiuk06'] += 25
+        elif dr > 1000:
+            scores['mantiuk06'] += 30
+            scores['drago03'] += 20
+        elif dr > 100:
+            scores['drago03'] += 25
+            scores['adaptive'] += 20
+        else:
+            scores['hable'] += 20
+            scores['reinhard'] += 15
+
+        # Scene type scoring
+        if stats['is_high_key']:
+            scores['reinhard'] += 15
+            scores['aces'] += 10
+        elif stats['is_low_key']:
+            scores['drago03'] += 20
+            scores['perceptual'] += 15
+
+        # Detail preservation scoring
+        if stats['needs_shadow_recovery']:
+            scores['drago03'] += 25
+            scores['adaptive'] += 20
+
+        if stats['has_extreme_highlights']:
+            scores['perceptual'] += 20
+            scores['aces'] += 15
+
+        # Local contrast scoring
+        if stats['contrast_score'] > 1.0:
+            scores['perceptual'] += 15
+            scores['mantiuk06'] += 10
+        else:
+            scores['hable'] += 10
+
+        # Color saturation scoring
+        if stats['mean_saturation'] > 0.5:
+            scores['aces'] += 15  # ACES preserves colors well
+            scores['hable'] += 10
+        elif stats['mean_saturation'] < 0.2:
+            scores['mantiuk06'] += 10  # Better for low saturation
+
+        # Metadata influence
+        if self.metadata.has_metadata:
+            if self.metadata.max_luminance > 4000:
+                scores['perceptual'] += 20
+            elif self.metadata.max_luminance > 1000:
+                scores['mantiuk06'] += 15
+
+        # Select highest scoring method
+        best_method = max(scores, key=scores.get)
+
+        # Log decision
+        logging.info(f"Tone mapping scores: {scores}")
+        logging.info(f"Selected: {best_method} (score: {scores[best_method]})")
+        logging.info(f"Key metrics - DR: {dr:.1f}, Shadow: {stats['shadow_detail']:.2f}, "
+                     f"Highlight: {stats['highlight_detail']:.2f}, Contrast: {stats['contrast_score']:.2f}")
+
+        return best_method
+
+    def tone_map_perceptual(self, image: torch.Tensor) -> torch.Tensor:
+        """Perceptual tone mapping preserving local contrast and color."""
+        # Preserve original for better color mapping
+        original = image.clone()
+
+        # Work on luminance only to preserve colors
+        luminance = 0.2126 * image[:, 0] + 0.7152 * image[:, 1] + 0.0722 * image[:, 2]
+
+        # Global tone mapping on luminance
+        key_value = torch.exp(torch.log(luminance + 1e-8).mean())
+        scaled_lum = luminance / key_value * 0.18
+
+        # Reinhard tone mapping on luminance
+        L_white = 2.0  # Reduced from implicit higher value
+        tonemapped_lum = scaled_lum * (1.0 + scaled_lum / (L_white * L_white)) / (1.0 + scaled_lum)
+
+        # Apply tone mapping ratio to preserve colors
+        ratio = tonemapped_lum / (luminance + 1e-8)
+        ratio = torch.clamp(ratio, 0, 2)  # Limit ratio to prevent oversaturation
+
+        # Apply ratio to each channel
+        result = original * ratio.unsqueeze(1)
+
+        # Soft clip to prevent hard clipping
+        result = torch.where(result > 0.9,
+                             0.9 + 0.1 * torch.tanh((result - 0.9) * 2),
+                             result)
+
+        return torch.clamp(result, 0, 1)
+
+    def tone_map_mantiuk06(self, image: torch.Tensor) -> torch.Tensor:
+        """Mantiuk06 tone mapping operator."""
+        # Convert to log domain
+        epsilon = 1e-6
+        log_img = torch.log10(image + epsilon)
+
+        # Compute contrast
+        kernel = torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]],
+                              dtype=torch.float32, device=self.device).view(1, 1, 3, 3)
+
+        contrasts = []
+        for c in range(3):
+            contrast = F.conv2d(log_img[:, c:c + 1], kernel, padding=1)
+            contrasts.append(contrast)
+        contrast = torch.cat(contrasts, dim=1)
+
+        # Compress contrast
+        compressed_contrast = torch.tanh(contrast * 0.5) * 2
+
+        # Reconstruct
+        compressed_log = log_img + (compressed_contrast - contrast) * 0.8
+
+        # Back to linear
+        compressed = torch.pow(10, compressed_log)
+
+        # Final mapping
+        return compressed / (1 + compressed)
+
+    def tone_map_drago03(self, image: torch.Tensor) -> torch.Tensor:
+        """Drago03 logarithmic tone mapping."""
+        # Parameters
+        bias = 0.85
+
+        # Compute world adaptation luminance
+        luminance = 0.2126 * image[:, 0] + 0.7152 * image[:, 1] + 0.0722 * image[:, 2]
+        Lwa = torch.exp(torch.log(luminance + 1e-8).mean())
+
+        # Maximum luminance
+        Lwmax = luminance.max()
+
+        # Bias function
+        b = torch.log(torch.tensor(bias, device=image.device)) / torch.log(torch.tensor(0.5, device=image.device))
+
+        # Tone mapping
+        Ld = (torch.log(luminance / Lwa + 1) / torch.log(Lwmax / Lwa + 1)) ** (torch.log(b) / torch.log(torch.tensor(0.5, device=image.device)))
+
+        # Apply to color channels
+        scale = Ld / (luminance + 1e-8)
+        result = image * scale.unsqueeze(1)
+
+        return torch.clamp(result, 0, 1)
+
+    def apply_tone_mapping(self, image: torch.Tensor, method: Optional[str] = None) -> torch.Tensor:
+        """Apply tone mapping with automatic method selection if not specified."""
+        # Analyze image if method not specified
+        if method is None:
+            stats = self.analyze_image_statistics(image)
+            method = self.select_optimal_tonemap(stats)
+            logging.info(f"Auto-selected tone mapping method: {method}")
+
+        # Store original for color preservation
+        original = image.clone()
+
+        # Apply selected tone mapping
+        if method == 'perceptual':
+            tonemapped = self.tone_map_perceptual(image)
+        elif method == 'mantiuk06':
+            tonemapped = self.tone_map_mantiuk06(image)
+        elif method == 'drago03':
+            tonemapped = self.tone_map_drago03(image)
+        elif method == 'adaptive':
+            # Combine multiple operators based on image regions
+            stats = self.analyze_image_statistics(image)
+            if stats['has_bright_highlights']:
+                highlights = self.tone_map_perceptual(image)
+            else:
+                highlights = self._apply_lut(image, self.aces_lut)
+
+            if stats['has_deep_shadows']:
+                shadows = self.tone_map_drago03(image)
+            else:
+                shadows = self._apply_lut(image, self.hable_lut)
+
+            # Blend based on luminance
+            luminance = 0.2126 * image[:, 0] + 0.7152 * image[:, 1] + 0.0722 * image[:, 2]
+            blend_mask = torch.sigmoid((luminance - 0.5) * 10)
+            tonemapped = shadows * (1 - blend_mask.unsqueeze(1)) + highlights * blend_mask.unsqueeze(1)
+        elif method == 'hable':
+            tonemapped = self._hable_operator(image)
+        elif method == 'aces':
+            tonemapped = self._aces_operator(image)
+        elif method == 'reinhard':
+            tonemapped = self._reinhard_operator(image)
+        else:
+            # Fallback to simple Reinhard
+            tonemapped = image / (1 + image)
+
+        # Skip color preservation for now to avoid color issues
+        # tonemapped = self.color_preserver.preserve_color_ratios(original, tonemapped)
+
+        # Avoid clipping with soft compression
+        tonemapped = self.soft_clip(tonemapped)
+
+        return tonemapped
+
+    def _hable_operator(self, x):
+        """Direct Hable operator without LUT."""
+        A, B, C, D, E, F = 0.15, 0.50, 0.10, 0.20, 0.02, 0.30
+        W = 11.2
+
+        def hable(v):
+            return ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F)) - E / F
+
+        # Reduce exposure to prevent oversaturation
+        curr = hable(x * 1.0)  # Changed from 2.0
+        white_scale = hable(torch.tensor(W, device=x.device, dtype=x.dtype))
+        return curr / white_scale
+
+    def _aces_operator(self, x):
+        """Direct ACES operator without LUT."""
+        a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
+        return torch.clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0, 1)
+
+    def _reinhard_operator(self, x):
+        """Direct Reinhard operator without LUT."""
+        L_white = 4.0
+        return x * (1.0 + x / (L_white * L_white)) / (1.0 + x)
+
+    def soft_clip(self, image: torch.Tensor, threshold: float = 0.95) -> torch.Tensor:
+        """Soft clipping to avoid hard cutoffs at 0 and 1."""
+        # Highlights
+        over_mask = image > threshold
+        if over_mask.any():
+            over_values = image[over_mask]
+            compressed = threshold + (1 - threshold) * torch.tanh((over_values - threshold) / (1 - threshold))
+            image[over_mask] = compressed
+
+        # Shadows
+        under_mask = image < (1 - threshold)
+        if under_mask.any():
+            under_values = image[under_mask]
+            compressed = (1 - threshold) * torch.tanh(under_values / (1 - threshold))
+            image[under_mask] = compressed
+
+        return image
 
 
 class DeviceManager:
@@ -412,19 +924,10 @@ class OptimizedJXRLoader:
     def __init__(self, device):
         self.device = device
         self.hdr_peak_luminance = 10000.0
-        self.selected_tone_map = "adaptive"
         self.selected_pre_gamma = 1.0
         self.selected_auto_exposure = 1.0
-        self.ACES_INPUT_MAT = torch.tensor([
-            [0.59719, 0.35458, 0.04823],
-            [0.07600, 0.90834, 0.01566],
-            [0.02840, 0.13383, 0.83777]
-        ])
-        self.ACES_OUTPUT_MAT = torch.tensor([
-            [1.60475, -0.53108, -0.07367],
-            [-0.10208, 1.10813, -0.00605],
-            [-0.00327, -0.07276, 1.07602]
-        ])
+        self.metadata = HDRMetadata()
+        self.tone_mapper = None
 
     def _apply_gamma_correction(self, image: np.ndarray, gamma: float) -> np.ndarray:
         """
@@ -445,42 +948,86 @@ class OptimizedJXRLoader:
             with open(file_path, 'rb') as f:
                 jxr_data = f.read()
 
-            image = imagecodecs.jpegxr_decode(jxr_data)
+            # Extract metadata
+            self.metadata.extract_from_jxr(jxr_data)
+
+            # Decode JXR with simplified approach
+            try:
+                logging.debug(f"Attempting to decode JXR file: {file_path}")
+
+                # Use the most basic decode approach
+                image = imagecodecs.jpegxr_decode(jxr_data)
+
+                # Ensure we have a numpy array
+                if not isinstance(image, np.ndarray):
+                    raise ValueError(f"Unexpected decode result type: {type(image)}")
+
+                logging.debug(f"Successfully decoded image with shape: {image.shape}")
+                logging.debug(f"Image dtype: {image.dtype}")
+
+            except Exception as decode_error:
+                logging.error(f"Image decode failed: {decode_error}")
+                logging.error(f"Error type: {type(decode_error).__name__}")
+                import traceback
+                tb = traceback.format_exc()
+                logging.error(f"Full traceback:\n{tb}")
+
+                # Check if it's the unpacking error
+                if "too many values to unpack" in str(decode_error):
+                    logging.error("This appears to be an imagecodecs version compatibility issue")
+                    logging.error("Please check your imagecodecs installation")
+
+                raise ValueError(f"Failed to decode JXR: {decode_error}")
+
             if image is None:
                 raise ValueError("Failed to decode JXR image")
             image = image.astype(np.float32)
+
+            # Update peak luminance from metadata if available
+            if self.metadata.has_metadata and self.metadata.max_luminance > 0 and not np.isnan(self.metadata.max_luminance):
+                self.hdr_peak_luminance = self.metadata.max_luminance
 
             if is_preview:
                 # Use simpler parameters for preview
                 pre_gamma = 1.0
                 auto_exposure = 1.0
-                tone_map = 'uncharted2'
             else:
                 pre_gamma = 1.0 + (self.selected_pre_gamma - 1.0) / 3.0
                 auto_exposure = 1.0 + (self.selected_auto_exposure - 1.0) / 3.0
-                tone_map = self.selected_tone_map
 
             # Apply gamma correction
             if pre_gamma != 1.0:
                 gamma = 1.0 / pre_gamma
                 image = self._apply_gamma_correction(image, gamma)
 
-            # Apply auto-exposure
+            # Apply auto-exposure with better control
             if auto_exposure != 1.0:
-                mean_luminance = np.mean(image)
-                exposure_factor = auto_exposure
-                if mean_luminance > 0:
-                    exposure_factor *= (0.18 / mean_luminance)
-                image *= exposure_factor
+                # Calculate percentile-based exposure instead of mean
+                luminance_values = 0.2126 * image[:, :, 0] + 0.7152 * image[:, :, 1] + 0.0722 * image[:, :, 2]
+                # Use 75th percentile for more stable exposure
+                target_luminance = np.percentile(luminance_values[luminance_values > 0], 75)
+
+                if target_luminance > 0:
+                    # Target middle gray (0.18)
+                    exposure_factor = 0.18 / target_luminance
+                    # Limit exposure adjustment
+                    exposure_factor = np.clip(exposure_factor * auto_exposure, 0.5, 2.0)
+                    image *= exposure_factor
 
             # Scale image to display range
             display_peak = 1000.0
+            if self.metadata.has_metadata and self.metadata.white_point > 0 and not np.isnan(self.metadata.white_point):
+                display_peak = self.metadata.white_point
             image = image * (display_peak / self.hdr_peak_luminance)
 
             # Handle grayscale or RGBA
             if image.ndim == 2:
                 image = np.stack([image] * 3, axis=-1)
-            elif image.shape[2] == 4:
+            elif image.ndim == 3 and image.shape[2] == 4:
+                # Remove alpha channel
+                image = image[:, :, :3]
+            elif image.ndim == 3 and image.shape[2] > 4:
+                # Handle unusual channel counts
                 image = image[:, :, :3]
 
             # Replace NaNs and inf
@@ -490,118 +1037,28 @@ class OptimizedJXRLoader:
             tensor = torch.from_numpy(image).float().permute(2, 0, 1).contiguous().unsqueeze(0)
             tensor = tensor.to(self.device, non_blocking=True)
 
+            # Create tone mapper with metadata
+            if self.tone_mapper is None:
+                self.tone_mapper = AdvancedToneMapper(self.device, self.metadata)
+
             # Apply tone mapping
-            if tone_map == 'hable' or is_preview:
-                tensor = self._tone_map_hable(tensor)
-            elif tone_map == 'reinhard':
-                tensor = self._tone_map_reinhard(tensor)
-            elif tone_map == 'filmic':
-                tensor = self._tone_map_filmic(tensor)
-            elif tone_map == 'aces':
-                tensor = self._tone_map_aces(tensor)
-            elif tone_map == 'uncharted2':
-                tensor = self._tone_map_uncharted2(tensor)
-            elif tone_map == 'adaptive':
-                tensor = self._tone_map_adaptive(tensor)
+            if is_preview:
+                # Simpler tone mapping for preview
+                tensor = self.tone_mapper.apply_tone_mapping(tensor, method='hable')
+            else:
+                # Use automatic tone mapping selection for best fidelity
+                tensor = self.tone_mapper.apply_tone_mapping(tensor, method=None)
 
             # Convert linear RGB to sRGB
             tensor = self.linear_to_srgb(tensor)
-            return tensor, None, {}
+
+            return tensor, None, self.metadata.to_dict()
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
             logging.error(f"Failed to load HDR image: {e}")
+            logging.error(f"Full traceback:\n{tb}")
             return None, str(e), {}
-
-    def _tone_map_hable(self, x):
-        """Applies Hable's tone mapping."""
-        A, B, C, D, E, F_ = 0.22, 0.30, 0.10, 0.20, 0.01, 0.30
-        W = 11.2
-
-        def evaluate(v):
-            num = (v * (A * v + C * B) + D * E)
-            den = (v * (A * v + B) + D * F_)
-            return num / (den + 1e-6) - E / F_
-
-        nom = evaluate(x)
-        denom = evaluate(torch.tensor(W, device=x.device, dtype=x.dtype))
-        return nom / (denom + 1e-6)
-
-    def _tone_map_reinhard(self, x, L_white=4.0):
-        """Applies Reinhard's tone mapping."""
-        L = 0.2126 * x[:, 0] + 0.7152 * x[:, 1] + 0.0722 * x[:, 2]
-        L_avg = torch.mean(L)
-        L = L / (L_avg + 1e-6)
-        L_scaled = (L * (1.0 + L / (L_white * L_white))) / (1.0 + L)
-        ratio = torch.where(L > 1e-8, L_scaled / (L + 1e-6), torch.ones_like(L))
-        return torch.stack([x[:, i] * ratio for i in range(3)], dim=1)
-
-    def _tone_map_aces(self, x):
-        """Applies ACES tone mapping with improved numerical stability."""
-        if self.ACES_INPUT_MAT.device != x.device or self.ACES_INPUT_MAT.dtype != x.dtype:
-            self.ACES_INPUT_MAT = self.ACES_INPUT_MAT.to(x.device, dtype=x.dtype)
-            self.ACES_OUTPUT_MAT = self.ACES_OUTPUT_MAT.to(x.device, dtype=x.dtype)
-
-        batch, channels, height, width = x.shape
-        x_reshaped = x.view(batch, channels, -1)
-
-        # Clamp input for safety
-        x_reshaped = torch.clamp(x_reshaped, min=0.0, max=65504.0)
-
-        # Apply ACES input transform
-        x_transformed = torch.einsum('ij,bjk->bik', self.ACES_INPUT_MAT, x_reshaped)
-        x_transformed = torch.clamp(x_transformed, min=0.0)
-
-        # RRT and ODT fit
-        a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
-        numerator = x_transformed * (a * x_transformed + b)
-        denominator = x_transformed * (c * x_transformed + d) + e
-        denominator = torch.clamp(denominator, min=1e-8)
-        x_tonemapped = numerator / denominator
-
-        # Output transform
-        x_output = torch.einsum('ij,bjk->bik', self.ACES_OUTPUT_MAT, x_tonemapped)
-        x_output = torch.clamp(x_output, min=0.0, max=1.0)
-
-        return x_output.view(batch, channels, height, width).contiguous()
-
-    def _tone_map_filmic(self, x):
-        """Applies a filmic tone mapping curve."""
-        x = torch.max(torch.zeros_like(x), x)
-        A, B, C, D, E, F_ = 0.22, 0.30, 0.10, 0.20, 0.01, 0.30
-
-        def filmic_curve(v):
-            return ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F_)) - E / F_
-
-        return filmic_curve(x)
-
-    def _tone_map_uncharted2(self, x):
-        """Applies Uncharted2 tone mapping."""
-        A, B, C, D, E, F_ = 0.15, 0.50, 0.10, 0.20, 0.02, 0.30
-
-        def uncharted2_tonemap(v):
-            return ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F_)) - E / F_
-
-        exposure_bias = 2.0
-        curr = uncharted2_tonemap(x * exposure_bias)
-        W = 11.2
-        white_scale = uncharted2_tonemap(torch.tensor(W, device=x.device, dtype=x.dtype))
-        return curr / white_scale
-
-    def _tone_map_adaptive(self, x):
-        """
-        Automatically selects a tone mapping operator based on the image's dynamic range.
-        """
-        L = 0.2126 * x[:, 0] + 0.7152 * x[:, 1] + 0.0722 * x[:, 2]
-        avg_luminance = torch.mean(L)
-        max_luminance = torch.max(L)
-        dynamic_range = max_luminance / (avg_luminance + 1e-6)
-        if dynamic_range > 100:
-            return self._tone_map_aces(x)
-        elif dynamic_range > 10:
-            return self._tone_map_hable(x)
-        elif avg_luminance < 0.1:
-            return self._tone_map_uncharted2(x)
-        else:
-            return self._tone_map_reinhard(x)
 
     def linear_to_srgb(self, linear_rgb):
         """Converts linear RGB to sRGB."""
@@ -792,11 +1249,9 @@ class HDRColorProcessor:
                 for model in [self.color_net.vgg, self.color_net.resnet, self.color_net.densenet]:
                     model.to(device=self.device, dtype=desired_dtype)
 
-                # Move ACES matrices to new device/dtype
-                self.jxr_loader.ACES_INPUT_MAT = self.jxr_loader.ACES_INPUT_MAT.to(device=self.device,
-                                                                                   dtype=desired_dtype)
-                self.jxr_loader.ACES_OUTPUT_MAT = self.jxr_loader.ACES_OUTPUT_MAT.to(device=self.device,
-                                                                                     dtype=desired_dtype)
+                # Recreate tone mapper on new device
+                self.jxr_loader.tone_mapper = AdvancedToneMapper(self.device, self.jxr_loader.metadata)
+
             except Exception as e:
                 logging.error(f"Failed to switch device or precision: {e}")
                 return False
@@ -808,10 +1263,6 @@ class HDRColorProcessor:
                 logging.debug(f"Model Parameter - {name}: dtype={param.dtype}, device={param.device}")
             for name, buffer in self.color_net.named_buffers():
                 logging.debug(f"Model Buffer - {name}: dtype={buffer.dtype}, device={buffer.device}")
-            logging.debug(
-                f"ACES_INPUT_MAT dtype: {self.jxr_loader.ACES_INPUT_MAT.dtype}, device: {self.jxr_loader.ACES_INPUT_MAT.device}")
-            logging.debug(
-                f"ACES_OUTPUT_MAT dtype: {self.jxr_loader.ACES_OUTPUT_MAT.dtype}, device: {self.jxr_loader.ACES_OUTPUT_MAT.device}")
 
             return True
         else:
@@ -827,10 +1278,8 @@ def validate_files(input_file: str, output_file: str) -> None:
         raise ValueError("Output file path not specified")
 
 
-def validate_parameters(tone_map: str, pre_gamma: str, auto_exposure: str) -> None:
-    """Validates the tone map, pre-gamma, and auto-exposure parameters."""
-    if tone_map not in SUPPORTED_TONE_MAPS:
-        raise ValueError(f"Unsupported tone map: {tone_map}")
+def validate_parameters(pre_gamma: str, auto_exposure: str) -> None:
+    """Validates the pre-gamma and auto-exposure parameters."""
     try:
         float(pre_gamma)
         float(auto_exposure)
@@ -1090,15 +1539,14 @@ class App(TKMT.ThemedTKinterFrame):
                 self.use_fp16_var.set(False)
 
     def _setup_parameters(self, parent_frame):
-        """Sets up parameter input fields for tone mapping, gamma, and exposure."""
+        """Sets up parameter input fields for gamma and exposure."""
         self.params_frame = ttk.LabelFrame(parent_frame, text="Parameters", padding=(10, 10))
         self.params_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+
+        # Auto-selected tone map display
         ttk.Label(self.params_frame, text="Tone Map:").grid(row=0, column=0, sticky="e", padx=(0, 5), pady=5)
-        self.tonemap_var = tk.StringVar(value=DEFAULT_TONE_MAP)
-        tone_map_values = sorted(list(SUPPORTED_TONE_MAPS))
-        tone_map_dropdown = ttk.Combobox(self.params_frame, textvariable=self.tonemap_var, values=tone_map_values,
-                                         state='readonly')
-        tone_map_dropdown.grid(row=0, column=1, padx=(0, 5), pady=5)
+        self.tonemap_label = ttk.Label(self.params_frame, text="Auto-detect", foreground="#00AA00")
+        self.tonemap_label.grid(row=0, column=1, padx=(0, 5), pady=5, sticky="w")
 
         ttk.Label(self.params_frame, text="Gamma:").grid(row=1, column=0, sticky="e", padx=(0, 5), pady=5)
         self.pregamma_var = tk.StringVar(value=DEFAULT_PREGAMMA)
@@ -1318,6 +1766,12 @@ class App(TKMT.ThemedTKinterFrame):
                 if tensor is None:
                     raise RuntimeError("Failed to load JXR file.")
                 self.original_input_tensor = tensor.clone()  # Store original always
+
+                # Display metadata info if available
+                if metadata.get('has_metadata', False):
+                    logging.info(f"HDR Metadata: Max Luminance={metadata.get('max_luminance')}nits, "
+                                 f"White Point={metadata.get('white_point')}nits")
+
                 preview_tensor = self.jxr_loader.process_preview(
                     tensor,
                     self.preview_width,
@@ -1563,7 +2017,6 @@ class App(TKMT.ThemedTKinterFrame):
         """Converts a single JXR file to JPEG."""
         input_file = self.input_entry.get().strip()
         original_output_file = self.output_entry.get().strip()
-        tone_map = self.tonemap_var.get().strip()
         pre_gamma_str = self.pregamma_var.get().strip()
         auto_exposure_str = self.autoexposure_var.get().strip()
         use_enhancement = self.use_enhancement.get()
@@ -1574,7 +2027,7 @@ class App(TKMT.ThemedTKinterFrame):
 
         try:
             validate_files(input_file, original_output_file)
-            validate_parameters(tone_map, pre_gamma_str, auto_exposure_str)
+            validate_parameters(pre_gamma_str, auto_exposure_str)
         except (FileNotFoundError, ValueError) as e:
             messagebox.showerror("Error", str(e))
             self.status_label.config(text=str(e), foreground="red")
@@ -1582,11 +2035,10 @@ class App(TKMT.ThemedTKinterFrame):
 
         pre_gamma = float(pre_gamma_str)
         auto_exposure = float(auto_exposure_str)
-        self.jxr_loader.selected_tone_map = tone_map
         self.jxr_loader.selected_pre_gamma = pre_gamma
         self.jxr_loader.selected_auto_exposure = auto_exposure
 
-        self.status_label.config(text="Converting...", foreground="#CCCCCC")
+        self.status_label.config(text="Analyzing image...", foreground="#CCCCCC")
         self.progress['value'] = 0
         self.master.update_idletasks()
         self.convert_btn.config(state='disabled')
@@ -1597,6 +2049,16 @@ class App(TKMT.ThemedTKinterFrame):
                 tensor, error, metadata = self.jxr_loader.load_jxr(input_file)
                 if tensor is None:
                     raise RuntimeError("Failed to load JXR file.")
+
+                # Auto-detect best tone mapping
+                stats = self.jxr_loader.tone_mapper.analyze_image_statistics(tensor)
+                selected_method = self.jxr_loader.tone_mapper.select_optimal_tonemap(stats)
+
+                # Update UI with selected method
+                self.master.after(0, lambda: self.tonemap_label.config(text=f"{selected_method.title()} (auto)",
+                                                                       foreground="#00FF00"))
+                self.master.after(0, lambda: self.status_label.config(
+                    text=f"Converting with {selected_method} tone mapping...", foreground="#CCCCCC"))
 
                 # Use the original tensor for processing
                 result = self.color_processor.process_image(
@@ -1723,7 +2185,7 @@ if __name__ == "__main__":
     try:
         app = App("park", "dark")
         root = app.master
-        root.title("NVIDIA HDR Converter")
+        root.title("NVIDIA HDR Converter - Enhanced Edition")
         root.minsize(1760, 840)
         window_width = 1760
         window_height = 840
