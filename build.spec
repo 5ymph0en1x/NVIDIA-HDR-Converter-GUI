@@ -2,11 +2,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import sys
+import warnings
+import torch
 import imagecodecs
 import napari.plugins
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
+torch_lib_path = os.path.join(os.path.dirname(torch.__file__), 'lib')
+torch_path = os.path.dirname(torch.__file__)
+warnings.filterwarnings("ignore", category=FutureWarning)
 block_cipher = None
 print(dir(imagecodecs))
 napari.plugins.plugin_manager.discover()
@@ -16,7 +22,9 @@ additional_dlls = [
     # DLL Intel MKL
     ("C:\\Users\\*****\\anaconda3\\pkgs\\mkl-2024.2.2-h66d3029_15\\Library\\bin\\mkl_intel_thread.2.dll", "."),
     ("C:\\Users\\*****\\anaconda3\\pkgs\\mkl-2024.2.2-h66d3029_15\\Library\\bin\\mkl_core.2.dll", "."),
-    ("C:\\Users\\*****\\anaconda3\\pkgs\\mkl-2024.2.2-h66d3029_15\\Library\\bin\\mkl_def.2.dll", ".")
+    ("C:\\Users\\*****\\anaconda3\\pkgs\\mkl-2024.2.2-h66d3029_15\\Library\\bin\\mkl_def.2.dll", "."),
+    (os.path.join(torch_lib_path, "*.dll"), "torch/lib"),
+    (os.path.join(torch_path, "*.pyd"), "torch/")
 ]
 
 # Collect all TKinterModernThemes data files
@@ -32,24 +40,22 @@ hidden_imports = (
     ["imagecodecs._shared"] + [x.__name__ for x in napari.plugins.plugin_manager.plugins.values()] +
     collect_submodules('TKinterModernThemes') +
     collect_submodules('torch') +
-    collect_submodules('torchvision') + 
+    collect_submodules('torchvision') +
     [
         'tensorboard',                        # Manually add missing hidden imports
         'tzdata',
         'scipy.special._cdflib',
-        # Add any other hidden imports that are missing
     ]
 )
 
-# Optionally exclude unnecessary torch.distributed modules if not used
+# Optionally exclude unnecessary torch modules if they are not used
 excludes = [
-    'torch.distributed._shard.checkpoint',
-    'torch.distributed._sharded_tensor',
-    # Add other torch.distributed modules to exclude
+    'torch._inductor.kernel',  # Causing ImportError
+    'scipy',  # If unused
 ]
 
 a = Analysis(
-    ['NHC.py'],  # Replace with your main script
+    ['app.py'],  # Replace with your main script
     pathex=[os.path.abspath('.')],
     binaries=additional_dlls,  # Include additional DLLs
     datas=datas,
@@ -73,7 +79,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='NVIDIA_HDR_Converter',
+    name='NVIDIA HDR Converter',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -95,6 +101,8 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
+    one_file=True,
+    splash="./splash.jpg",
     upx_exclude=[],
     name='NVIDIA HDR Converter',
 )
