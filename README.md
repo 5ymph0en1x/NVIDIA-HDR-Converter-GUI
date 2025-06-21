@@ -85,7 +85,7 @@ TKinterModernThemes==1.10.4
 
 3. **Run the application:**
    ```bash
-   python app.py
+   python NHC.py
    ```
 
 ## Usage
