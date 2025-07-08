@@ -6,8 +6,13 @@ import io
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
+import _tkinter
 from PIL import Image, ImageTk, ImageDraw
-import TKinterModernThemes as TKMT
+try:
+    import TKinterModernThemes as TKMT
+except ImportError:
+    # Fallback if TKMT isn't available
+    TKMT = None
 import threading
 import torch
 import torch.nn as nn
@@ -435,32 +440,71 @@ class AdvancedToneMapper:
         return torch.clamp(result, 0, 1)
 
     def tone_map_mantiuk06(self, image: torch.Tensor) -> torch.Tensor:
-        """Mantiuk06 tone mapping operator."""
-        # Convert to log domain
+        """Proper Mantiuk06 tone mapping based on contrast perception."""
         epsilon = 1e-6
-        log_img = torch.log10(image + epsilon)
-
-        # Compute contrast
-        kernel = torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]],
-                              dtype=torch.float32, device=self.device).view(1, 1, 3, 3)
-
-        contrasts = []
-        for c in range(3):
-            contrast = F.conv2d(log_img[:, c:c + 1], kernel, padding=1)
-            contrasts.append(contrast)
-        contrast = torch.cat(contrasts, dim=1)
-
-        # Compress contrast
-        compressed_contrast = torch.tanh(contrast * 0.5) * 2
-
-        # Reconstruct
-        compressed_log = log_img + (compressed_contrast - contrast) * 0.8
-
-        # Back to linear
-        compressed = torch.pow(10, compressed_log)
-
-        # Final mapping
-        return compressed / (1 + compressed)
+        
+        # Convert to XYZ luminance for proper tone mapping
+        luminance = 0.2126 * image[:, 0] + 0.7152 * image[:, 1] + 0.0722 * image[:, 2]
+        luminance = torch.clamp(luminance, epsilon, None)
+        
+        # Calculate log-average luminance
+        log_avg_lum = torch.exp(torch.log(luminance + epsilon).mean())
+        
+        # Scale luminance 
+        key = 0.18  # Middle grey key value
+        scaled_lum = (key / log_avg_lum) * luminance
+        
+        # Mantiuk's contrast processing
+        # Convert to log domain for contrast processing
+        log_lum = torch.log(scaled_lum + epsilon)
+        
+        # Calculate local adaptation using Gaussian blur approximation
+        # Use separable Gaussian for efficiency
+        kernel_size = 7
+        sigma = 2.0
+        x = torch.arange(kernel_size, dtype=image.dtype, device=image.device) - kernel_size // 2
+        gaussian_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        gaussian_1d = gaussian_1d / gaussian_1d.sum()
+        gaussian_1d = gaussian_1d.view(1, 1, 1, kernel_size)
+        
+        # Apply Gaussian blur
+        log_lum_expanded = log_lum.unsqueeze(1)
+        blurred = F.conv2d(log_lum_expanded, gaussian_1d, padding=(0, kernel_size//2))
+        blurred = F.conv2d(blurred, gaussian_1d.transpose(-1, -2), padding=(kernel_size//2, 0))
+        local_adaptation = blurred.squeeze(1)
+        
+        # Contrast-based tone mapping
+        contrast_factor = 0.3  # Adjust contrast sensitivity
+        max_contrast = 100.0   # Maximum displayable contrast
+        
+        # Calculate local contrast
+        local_contrast = log_lum - local_adaptation
+        
+        # Compress contrast with smooth function
+        compressed_contrast = torch.tanh(local_contrast * contrast_factor) / contrast_factor
+        
+        # Reconstruct tone-mapped luminance
+        tone_mapped_log_lum = local_adaptation + compressed_contrast
+        tone_mapped_lum = torch.exp(tone_mapped_log_lum)
+        
+        # Apply gamma correction and normalization
+        max_lum = tone_mapped_lum.max()
+        if max_lum > 1.0:
+            tone_mapped_lum = tone_mapped_lum / max_lum
+            
+        # Preserve color ratios
+        lum_ratio = tone_mapped_lum / (luminance + epsilon)
+        lum_ratio = torch.clamp(lum_ratio, 0.1, 10.0)  # Prevent extreme ratios
+        
+        # Apply to all channels while preserving saturation
+        result = image * lum_ratio.unsqueeze(1)
+        
+        # Boost saturation slightly to compensate for tone mapping
+        saturation_boost = 1.1
+        mean_rgb = result.mean(dim=1, keepdim=True)
+        result = mean_rgb + (result - mean_rgb) * saturation_boost
+        
+        return torch.clamp(result, 0, 1)
 
     def tone_map_drago03(self, image: torch.Tensor) -> torch.Tensor:
         """Drago03 logarithmic tone mapping."""
@@ -1035,6 +1079,7 @@ class OptimizedJXRLoader:
 
             # Convert to torch Tensor
             tensor = torch.from_numpy(image).float().permute(2, 0, 1).contiguous().unsqueeze(0)
+            tensor = torch.clamp(tensor, min=0.0)
             tensor = tensor.to(self.device, non_blocking=True)
 
             # Create tone mapper with metadata
@@ -1047,7 +1092,10 @@ class OptimizedJXRLoader:
                 tensor = self.tone_mapper.apply_tone_mapping(tensor, method='hable')
             else:
                 # Use automatic tone mapping selection for best fidelity
-                tensor = self.tone_mapper.apply_tone_mapping(tensor, method=None)
+                stats = self.tone_mapper.analyze_image_statistics(tensor)
+                selected_method = self.tone_mapper.select_optimal_tonemap(stats)
+                logging.info(f"Auto-selected tone mapping method: {selected_method}")
+                tensor = self.tone_mapper.apply_tone_mapping(tensor, method=selected_method)
 
             # Convert linear RGB to sRGB
             tensor = self.linear_to_srgb(tensor)
@@ -1287,14 +1335,35 @@ def validate_parameters(pre_gamma: str, auto_exposure: str) -> None:
         raise ValueError("Pre-gamma and auto-exposure must be numeric")
 
 
-class App(TKMT.ThemedTKinterFrame):
+class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
     """
     Main application class for the NVIDIA HDR Converter GUI.
     Sets up the UI, configures user options, and handles file/folder batch conversions.
     """
 
     def __init__(self, theme="park", mode="dark"):
-        super().__init__("NVIDIA HDR Converter", theme, mode)
+        self.use_theme = False
+        
+        if TKMT:
+            try:
+                super().__init__("NVIDIA HDR Converter", theme, mode)
+                self.use_theme = True
+                self.root = self.master
+            except (_tkinter.TclError, Exception) as e:
+                # Fallback to basic tkinter if theme initialization fails
+                logging.warning(f"Theme initialization failed: {e}. Using basic tkinter.")
+                tk.Tk.__init__(self)
+                self.title("NVIDIA HDR Converter")
+                self.configure(bg='#2b2b2b')
+                self.root = self
+                self.master = self
+        else:
+            super().__init__()
+            self.title("NVIDIA HDR Converter")
+            self.configure(bg='#2b2b2b')
+            self.root = self
+            self.master = self
+        
         self.device_manager = DeviceManager()
         self.jxr_loader = OptimizedJXRLoader(self.device_manager.get_device())
         self.use_fp16_var = tk.BooleanVar(value=False)  # Variable for half precision toggle
@@ -1705,6 +1774,12 @@ class App(TKMT.ThemedTKinterFrame):
             if filename:
                 self.input_entry.delete(0, tk.END)
                 self.input_entry.insert(0, filename)
+
+                base_name, _ = os.path.splitext(filename)
+                output_filename = base_name + '.jpg'
+                self.output_entry.delete(0, tk.END)
+                self.output_entry.insert(0, output_filename)
+
                 self.status_label.config(text="Loading preview...", foreground="#CCCCCC")
                 self.master.update_idletasks()
                 self.create_preview_from_jxr(filename)
@@ -2050,15 +2125,11 @@ class App(TKMT.ThemedTKinterFrame):
                 if tensor is None:
                     raise RuntimeError("Failed to load JXR file.")
 
-                # Auto-detect best tone mapping
-                stats = self.jxr_loader.tone_mapper.analyze_image_statistics(tensor)
-                selected_method = self.jxr_loader.tone_mapper.select_optimal_tonemap(stats)
-
-                # Update UI with selected method
-                self.master.after(0, lambda: self.tonemap_label.config(text=f"{selected_method.title()} (auto)",
+                # Update UI with auto-detected method
+                self.master.after(0, lambda: self.tonemap_label.config(text="Auto-detected",
                                                                        foreground="#00FF00"))
                 self.master.after(0, lambda: self.status_label.config(
-                    text=f"Converting with {selected_method} tone mapping...", foreground="#CCCCCC"))
+                    text="Converting with auto-detected tone mapping...", foreground="#CCCCCC"))
 
                 # Use the original tensor for processing
                 result = self.color_processor.process_image(
@@ -2123,10 +2194,14 @@ class App(TKMT.ThemedTKinterFrame):
                         input_path = os.path.join(folder_path, jxr_file)
                         final_output = os.path.join(output_folder, f"{os.path.splitext(jxr_file)[0]}.jpg")
                         self.safe_update_ui(f"Processing: {jxr_file}", "#CCCCCC")
+                        logging.info(f"Processing file: {jxr_file}")
+                        
+                        # Load JXR with automatic tone mapping (each file gets individualized analysis)
                         tensor, error, metadata = self.jxr_loader.load_jxr(input_path)
                         if tensor is None:
                             raise RuntimeError(f"Failed to load {jxr_file}")
 
+                        # Use the same processing pipeline as single file mode
                         self.color_processor.process_image(
                             tensor.clone(),
                             final_output,
