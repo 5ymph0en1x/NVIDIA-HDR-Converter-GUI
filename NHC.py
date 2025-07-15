@@ -1893,6 +1893,47 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                 self.after_image_ref = None
             logging.error(f"Error loading preview: {str(e)}")
 
+    def show_preview_from_tensor(self, tensor: torch.Tensor, is_before: bool):
+        """Displays a preview image from a tensor."""
+        label = self.before_label if is_before else self.after_label
+        image_ref_attr = 'before_image_ref' if is_before else 'after_image_ref'
+
+        if getattr(self, image_ref_attr):
+            label.config(image="")
+            setattr(self, image_ref_attr, None)
+
+        try:
+            # Generate a preview-sized tensor
+            preview_tensor = self.jxr_loader.process_preview(
+                tensor,
+                self.preview_width,
+                self.preview_height
+            )
+            if preview_tensor is None:
+                raise RuntimeError("Failed to generate preview tensor")
+
+            img = self.jxr_loader.tensor_to_pil(preview_tensor)
+            if img is None:
+                raise RuntimeError("Failed to convert tensor to PIL image")
+
+            # Center the image in the canvas if it's smaller
+            orig_width, orig_height = img.size
+            if orig_width < self.preview_width or orig_height < self.preview_height:
+                bg = Image.new('RGB', (self.preview_width, self.preview_height), (46, 46, 46))
+                offset_x = (self.preview_width - orig_width) // 2
+                offset_y = (self.preview_height - orig_height) // 2
+                bg.paste(img, (offset_x, offset_y))
+                img = bg
+
+            img_tk = ImageTk.PhotoImage(img)
+            label.config(image=img_tk, text="")
+            setattr(self, image_ref_attr, img_tk)
+
+        except Exception as e:
+            label.config(image="", text=f"Preview Error: {str(e)}")
+            setattr(self, image_ref_attr, None)
+            logging.error(f"Error loading preview from tensor: {str(e)}")
+
     def show_color_spectrum(self, filepath: str, is_before: bool):
         """Generates and displays a color spectrum histogram from an image file."""
         label = self.before_hist_label if is_before else self.after_hist_label
@@ -2097,10 +2138,10 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                     self.color_processor.save_tensor_as_image(enhanced_tensor, f"{output_base_file}_tonemapped.tiff",
                                                               "TIFF")
 
-                if output_format == "JPEG" or output_format == "Both":
-                    self.master.after(0,
-                                      lambda: self.show_preview_from_file(f"{output_base_file}.jpg", is_before=False))
-                    self.master.after(0, lambda: self.show_color_spectrum(f"{output_base_file}.jpg", is_before=False))
+                # Generate "After" preview directly from the processed tensor
+                self.master.after(0, lambda: self.show_preview_from_tensor(enhanced_tensor.clone(), is_before=False))
+                self.master.after(0, lambda: self.show_color_spectrum_from_tensor(enhanced_tensor.clone(),
+                                                                                  is_before=False))
 
                 self.safe_update_ui("Conversion successful!", "#00FF00")
 
