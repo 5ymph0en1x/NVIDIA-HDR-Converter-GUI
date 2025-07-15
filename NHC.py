@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 import _tkinter
 from PIL import Image, ImageTk, ImageDraw
+
 try:
     import TKinterModernThemes as TKMT
 except ImportError:
@@ -25,6 +26,7 @@ import imagecodecs
 import struct
 from typing import Dict, Tuple, Optional, List
 import json
+import tifffile
 
 # Logging Configuration
 logging.basicConfig(
@@ -58,13 +60,13 @@ PRETRAINED_MODELS = {
 MODES = {
     'big': {
         'window_width': 2200,
-        'window_height': 850,
+        'window_height': 900,
         'preview_width': 720,
         'preview_height': 406,
     },
     'small': {
         'window_width': 1760,
-        'window_height': 840,
+        'window_height': 900,
         'preview_width': 512,
         'preview_height': 288,
     },
@@ -442,22 +444,22 @@ class AdvancedToneMapper:
     def tone_map_mantiuk06(self, image: torch.Tensor) -> torch.Tensor:
         """Proper Mantiuk06 tone mapping based on contrast perception."""
         epsilon = 1e-6
-        
+
         # Convert to XYZ luminance for proper tone mapping
         luminance = 0.2126 * image[:, 0] + 0.7152 * image[:, 1] + 0.0722 * image[:, 2]
         luminance = torch.clamp(luminance, epsilon, None)
-        
+
         # Calculate log-average luminance
         log_avg_lum = torch.exp(torch.log(luminance + epsilon).mean())
-        
-        # Scale luminance 
+
+        # Scale luminance
         key = 0.18  # Middle grey key value
         scaled_lum = (key / log_avg_lum) * luminance
-        
+
         # Mantiuk's contrast processing
         # Convert to log domain for contrast processing
         log_lum = torch.log(scaled_lum + epsilon)
-        
+
         # Calculate local adaptation using Gaussian blur approximation
         # Use separable Gaussian for efficiency
         kernel_size = 7
@@ -466,44 +468,44 @@ class AdvancedToneMapper:
         gaussian_1d = torch.exp(-0.5 * (x / sigma) ** 2)
         gaussian_1d = gaussian_1d / gaussian_1d.sum()
         gaussian_1d = gaussian_1d.view(1, 1, 1, kernel_size)
-        
+
         # Apply Gaussian blur
         log_lum_expanded = log_lum.unsqueeze(1)
-        blurred = F.conv2d(log_lum_expanded, gaussian_1d, padding=(0, kernel_size//2))
-        blurred = F.conv2d(blurred, gaussian_1d.transpose(-1, -2), padding=(kernel_size//2, 0))
+        blurred = F.conv2d(log_lum_expanded, gaussian_1d, padding=(0, kernel_size // 2))
+        blurred = F.conv2d(blurred, gaussian_1d.transpose(-1, -2), padding=(kernel_size // 2, 0))
         local_adaptation = blurred.squeeze(1)
-        
+
         # Contrast-based tone mapping
         contrast_factor = 0.3  # Adjust contrast sensitivity
-        max_contrast = 100.0   # Maximum displayable contrast
-        
+        max_contrast = 100.0  # Maximum displayable contrast
+
         # Calculate local contrast
         local_contrast = log_lum - local_adaptation
-        
+
         # Compress contrast with smooth function
         compressed_contrast = torch.tanh(local_contrast * contrast_factor) / contrast_factor
-        
+
         # Reconstruct tone-mapped luminance
         tone_mapped_log_lum = local_adaptation + compressed_contrast
         tone_mapped_lum = torch.exp(tone_mapped_log_lum)
-        
+
         # Apply gamma correction and normalization
         max_lum = tone_mapped_lum.max()
         if max_lum > 1.0:
             tone_mapped_lum = tone_mapped_lum / max_lum
-            
+
         # Preserve color ratios
         lum_ratio = tone_mapped_lum / (luminance + epsilon)
         lum_ratio = torch.clamp(lum_ratio, 0.1, 10.0)  # Prevent extreme ratios
-        
+
         # Apply to all channels while preserving saturation
         result = image * lum_ratio.unsqueeze(1)
-        
+
         # Boost saturation slightly to compensate for tone mapping
         saturation_boost = 1.1
         mean_rgb = result.mean(dim=1, keepdim=True)
         result = mean_rgb + (result - mean_rgb) * saturation_boost
-        
+
         return torch.clamp(result, 0, 1)
 
     def tone_map_drago03(self, image: torch.Tensor) -> torch.Tensor:
@@ -522,7 +524,8 @@ class AdvancedToneMapper:
         b = torch.log(torch.tensor(bias, device=image.device)) / torch.log(torch.tensor(0.5, device=image.device))
 
         # Tone mapping
-        Ld = (torch.log(luminance / Lwa + 1) / torch.log(Lwmax / Lwa + 1)) ** (torch.log(b) / torch.log(torch.tensor(0.5, device=image.device)))
+        Ld = (torch.log(luminance / Lwa + 1) / torch.log(Lwmax / Lwa + 1)) ** (
+                    torch.log(b) / torch.log(torch.tensor(0.5, device=image.device)))
 
         # Apply to color channels
         scale = Ld / (luminance + 1e-8)
@@ -551,12 +554,12 @@ class AdvancedToneMapper:
         elif method == 'adaptive':
             # Combine multiple operators based on image regions
             stats = self.analyze_image_statistics(image)
-            if stats['has_bright_highlights']:
+            if stats['has_extreme_highlights']:
                 highlights = self.tone_map_perceptual(image)
             else:
                 highlights = self._apply_lut(image, self.aces_lut)
 
-            if stats['has_deep_shadows']:
+            if stats['needs_shadow_recovery']:
                 shadows = self.tone_map_drago03(image)
             else:
                 shadows = self._apply_lut(image, self.hable_lut)
@@ -983,10 +986,10 @@ class OptimizedJXRLoader:
             result[pos_mask] = np.power(image[pos_mask], gamma)
         return result
 
-    def load_jxr(self, file_path: str, is_preview: bool = False):
+    def load_jxr(self, file_path: str):
         """
-        Loads and preprocesses a JXR image for tone mapping and optional preview.
-        Returns a torch Tensor on the configured device.
+        Loads and preprocesses a JXR image, returning a linear HDR tensor.
+        Tone mapping is NOT applied here.
         """
         try:
             with open(file_path, 'rb') as f:
@@ -995,32 +998,15 @@ class OptimizedJXRLoader:
             # Extract metadata
             self.metadata.extract_from_jxr(jxr_data)
 
-            # Decode JXR with simplified approach
+            # Decode JXR
             try:
                 logging.debug(f"Attempting to decode JXR file: {file_path}")
-
-                # Use the most basic decode approach
                 image = imagecodecs.jpegxr_decode(jxr_data)
-
-                # Ensure we have a numpy array
                 if not isinstance(image, np.ndarray):
                     raise ValueError(f"Unexpected decode result type: {type(image)}")
-
-                logging.debug(f"Successfully decoded image with shape: {image.shape}")
-                logging.debug(f"Image dtype: {image.dtype}")
-
+                logging.debug(f"Successfully decoded image with shape: {image.shape}, dtype: {image.dtype}")
             except Exception as decode_error:
-                logging.error(f"Image decode failed: {decode_error}")
-                logging.error(f"Error type: {type(decode_error).__name__}")
-                import traceback
-                tb = traceback.format_exc()
-                logging.error(f"Full traceback:\n{tb}")
-
-                # Check if it's the unpacking error
-                if "too many values to unpack" in str(decode_error):
-                    logging.error("This appears to be an imagecodecs version compatibility issue")
-                    logging.error("Please check your imagecodecs installation")
-
+                logging.error(f"Image decode failed: {decode_error}", exc_info=True)
                 raise ValueError(f"Failed to decode JXR: {decode_error}")
 
             if image is None:
@@ -1028,35 +1014,21 @@ class OptimizedJXRLoader:
             image = image.astype(np.float32)
 
             # Update peak luminance from metadata if available
-            if self.metadata.has_metadata and self.metadata.max_luminance > 0 and not np.isnan(self.metadata.max_luminance):
+            if self.metadata.has_metadata and self.metadata.max_luminance > 0 and not np.isnan(
+                    self.metadata.max_luminance):
                 self.hdr_peak_luminance = self.metadata.max_luminance
 
-            if is_preview:
-                # Use simpler parameters for preview
-                pre_gamma = 1.0
-                auto_exposure = 1.0
-            else:
-                pre_gamma = 1.0 + (self.selected_pre_gamma - 1.0) / 3.0
-                auto_exposure = 1.0 + (self.selected_auto_exposure - 1.0) / 3.0
+            pre_gamma = self.selected_pre_gamma
+            auto_exposure = self.selected_auto_exposure
 
             # Apply gamma correction
             if pre_gamma != 1.0:
                 gamma = 1.0 / pre_gamma
                 image = self._apply_gamma_correction(image, gamma)
 
-            # Apply auto-exposure with better control
+            # Apply exposure correction
             if auto_exposure != 1.0:
-                # Calculate percentile-based exposure instead of mean
-                luminance_values = 0.2126 * image[:, :, 0] + 0.7152 * image[:, :, 1] + 0.0722 * image[:, :, 2]
-                # Use 75th percentile for more stable exposure
-                target_luminance = np.percentile(luminance_values[luminance_values > 0], 75)
-
-                if target_luminance > 0:
-                    # Target middle gray (0.18)
-                    exposure_factor = 0.18 / target_luminance
-                    # Limit exposure adjustment
-                    exposure_factor = np.clip(exposure_factor * auto_exposure, 0.5, 2.0)
-                    image *= exposure_factor
+                image *= auto_exposure
 
             # Scale image to display range
             display_peak = 1000.0
@@ -1067,11 +1039,9 @@ class OptimizedJXRLoader:
             # Handle grayscale or RGBA
             if image.ndim == 2:
                 image = np.stack([image] * 3, axis=-1)
-            elif image.ndim == 3 and image.shape[2] == 4:
-                # Remove alpha channel
+            elif image.shape[2] == 4:
                 image = image[:, :, :3]
-            elif image.ndim == 3 and image.shape[2] > 4:
-                # Handle unusual channel counts
+            elif image.shape[2] > 4:
                 image = image[:, :, :3]
 
             # Replace NaNs and inf
@@ -1082,30 +1052,13 @@ class OptimizedJXRLoader:
             tensor = torch.clamp(tensor, min=0.0)
             tensor = tensor.to(self.device, non_blocking=True)
 
-            # Create tone mapper with metadata
+            # Create tone mapper with metadata for later use
             if self.tone_mapper is None:
                 self.tone_mapper = AdvancedToneMapper(self.device, self.metadata)
 
-            # Apply tone mapping
-            if is_preview:
-                # Simpler tone mapping for preview
-                tensor = self.tone_mapper.apply_tone_mapping(tensor, method='hable')
-            else:
-                # Use automatic tone mapping selection for best fidelity
-                stats = self.tone_mapper.analyze_image_statistics(tensor)
-                selected_method = self.tone_mapper.select_optimal_tonemap(stats)
-                logging.info(f"Auto-selected tone mapping method: {selected_method}")
-                tensor = self.tone_mapper.apply_tone_mapping(tensor, method=selected_method)
-
-            # Convert linear RGB to sRGB
-            tensor = self.linear_to_srgb(tensor)
-
             return tensor, None, self.metadata.to_dict()
         except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            logging.error(f"Failed to load HDR image: {e}")
-            logging.error(f"Full traceback:\n{tb}")
+            logging.error(f"Failed to load HDR image: {e}", exc_info=True)
             return None, str(e), {}
 
     def linear_to_srgb(self, linear_rgb):
@@ -1171,18 +1124,15 @@ class HDRColorProcessor:
         self.use_fp16 = use_fp16
         self.color_net = ColorCorrectionNet().eval().to(device)
 
-        # Convert model to half if GPU is available and FP16 is selected for memory saving
         if device.type == 'cuda' and self.use_fp16:
             self.color_net.half()
         elif device.type == 'cpu' and self.use_fp16:
-            # This can be optional; half precision is often slower on CPU, but we respect the user flag.
             try:
                 self.color_net.half()
             except Exception as e:
                 logging.error(f"Failed to convert model to FP16 on CPU: {e}")
-                self.use_fp16 = False  # Revert if CPU half-precision fails
+                self.use_fp16 = False
 
-        # Edge enhancement block
         self.edge_enhancement = EdgeEnhancementBlock().to(device)
         if device.type == 'cuda' and self.use_fp16:
             self.edge_enhancement.half()
@@ -1198,26 +1148,17 @@ class HDRColorProcessor:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
-    def process_image(self, original_tensor, output_path, color_strength=0.0, edge_strength=0.0, use_enhancement=True):
+    def process_image(self, original_tensor, color_strength=0.0, edge_strength=0.0, use_enhancement=True):
         """
-        Process an HDR image tensor with color and edge enhancements.
-
-        :param original_tensor: Input HDR image tensor
-        :param output_path: Path to save the processed image
-        :param color_strength: Strength of color enhancement (0-100)
-        :param edge_strength: Strength of edge enhancement (0-100)
-        :param use_enhancement: Whether to apply the AI-based color enhancement
-        :return: PIL.Image or None
+        Process an HDR image tensor with color and edge enhancements, returning the processed tensor.
         """
         try:
             tensor = original_tensor.to(self.device, dtype=torch.float16 if self.use_fp16 else torch.float32)
 
-            # Pad to avoid edge issues in convolution
             pad_size = 32
             padded_tensor = F.pad(tensor, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
 
             with torch.inference_mode():
-                # Color enhancement
                 if use_enhancement and color_strength > 0:
                     enhanced = self.color_net(padded_tensor)
                     normalized_strength = (color_strength / 100.0) * 1.5
@@ -1226,62 +1167,69 @@ class HDRColorProcessor:
                 else:
                     enhanced = padded_tensor
 
-                # Edge enhancement
                 if edge_strength > 0:
                     enhanced = self.edge_enhancement(enhanced, edge_strength=edge_strength)
 
-                # Remove padding
                 enhanced = enhanced[:, :, pad_size:-pad_size, pad_size:-pad_size]
 
-                # Convert back to float32 if needed
                 if self.device.type == 'cpu' or (self.device.type == 'cuda' and self.use_fp16):
                     enhanced = enhanced.float()
 
-                enhanced = enhanced.cpu()
-
-                # Convert to numpy for JPEG saving
-                array = enhanced.squeeze(0).permute(1, 2, 0).numpy()
-
-                # Cleanup
-                del enhanced, padded_tensor, tensor
-                if self.device.type == 'cuda':
-                    torch.cuda.empty_cache()
-
-                # Simple normalization for JPEG
-                array_max = array.max(axis=(0, 1), keepdims=True)
-                array_min = array.min(axis=(0, 1), keepdims=True)
-                array = (array - array_min) / (array_max - array_min + 1e-8) * 255.0
-                array = np.clip(array, 0, 255).astype(np.uint8)
-
-                # Save the result
-                result_image = Image.fromarray(array)
-                result_image.save(output_path, 'JPEG', quality=95, optimize=True)
-
-                # Final cleanup
-                gc.collect()
-                if self.device.type == 'cuda':
-                    torch.cuda.empty_cache()
-
-                return result_image
+                self.clear_gpu_memory()
+                return enhanced
 
         except Exception as e:
-            print(f"Processing failed: {str(e)}")
-            traceback.print_exc()
-            return None
+            logging.error(f"Processing failed: {str(e)}", exc_info=True)
+            return original_tensor
+
+    def save_tensor_as_image(self, tensor_to_save, output_path, output_format, is_hdr_data=False, quality=95):
+        """Saves a tensor as an image file (JPEG or TIFF)."""
+        try:
+            if tensor_to_save.is_cuda:
+                tensor_to_save = tensor_to_save.cpu()
+
+            tensor_to_save = tensor_to_save.detach()
+
+            if output_format == 'JPEG':
+                array = tensor_to_save.squeeze(0).permute(1, 2, 0).contiguous().numpy()
+                array = np.clip(array, 0.0, 1.0)
+                array = (array * 255).astype(np.uint8)
+                result_image = Image.fromarray(array)
+                result_image.save(output_path, 'JPEG', quality=quality, optimize=True)
+
+            elif output_format == 'TIFF':
+                array = tensor_to_save.squeeze(0).permute(1, 2, 0).contiguous().numpy()
+                array = np.ascontiguousarray(array, dtype=np.float32)
+
+                if is_hdr_data:
+                    min_val, max_val = array.min(), array.max()
+                    if max_val > min_val:
+                        array = (array - min_val) / (max_val - min_val)
+                else:
+                    array = np.clip(array, 0.0, 1.0)
+
+                array = (array * 65535).astype(np.uint16)
+
+                # Use tifffile.imwrite for robust TIFF saving.
+                tifffile.imwrite(output_path, array, photometric='rgb', compression='lzw')
+
+            else:
+                raise ValueError(f"Unsupported output format: {output_format}")
+
+            logging.info(f"Successfully saved image to {output_path}")
+
+        except Exception as e:
+            logging.error(f"Failed to save image to {output_path}: {e}", exc_info=True)
+            raise
 
     def switch_device(self, use_gpu, use_fp16=False):
         """
         Switches the processing device and updates model data types accordingly.
-        Corrected comment and logic below:
-
-        * We disable half precision if not using GPU, since CPU half-precision can be undesirable or slow.
         """
         new_device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
 
-        # Corrected approach: If not on CUDA, force FP16 = False to stay in float32
-        # because half precision on CPU is typically not beneficial.
         if new_device.type != 'cuda':
-            use_fp16 = False  # Override FP16 to False for CPU
+            use_fp16 = False
 
         if new_device != self.device or use_fp16 != self.use_fp16:
             self.clear_gpu_memory()
@@ -1291,13 +1239,11 @@ class HDRColorProcessor:
             desired_dtype = torch.float16 if (self.device.type == 'cuda' and self.use_fp16) else torch.float32
 
             try:
-                # Move model components to new device
                 self.color_net = self.color_net.to(device=self.device, dtype=desired_dtype)
                 self.edge_enhancement = self.edge_enhancement.to(device=self.device, dtype=desired_dtype)
                 for model in [self.color_net.vgg, self.color_net.resnet, self.color_net.densenet]:
                     model.to(device=self.device, dtype=desired_dtype)
 
-                # Recreate tone mapper on new device
                 self.jxr_loader.tone_mapper = AdvancedToneMapper(self.device, self.jxr_loader.metadata)
 
             except Exception as e:
@@ -1305,13 +1251,6 @@ class HDRColorProcessor:
                 return False
 
             logging.info(f"Switched to {self.device} with {'FP16' if self.use_fp16 else 'FP32'} precision")
-
-            # Verification Logging
-            for name, param in self.color_net.named_parameters():
-                logging.debug(f"Model Parameter - {name}: dtype={param.dtype}, device={param.device}")
-            for name, buffer in self.color_net.named_buffers():
-                logging.debug(f"Model Buffer - {name}: dtype={buffer.dtype}, device={buffer.device}")
-
             return True
         else:
             logging.info(f"Already on {self.device} with {'FP16' if self.use_fp16 else 'FP32'} precision")
@@ -1343,30 +1282,29 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
 
     def __init__(self, theme="park", mode="dark"):
         self.use_theme = False
-        
+
         if TKMT:
             try:
-                super().__init__("NVIDIA HDR Converter", theme, mode)
+                super().__init__("HDR Image Converter", theme, mode)
                 self.use_theme = True
                 self.root = self.master
             except (_tkinter.TclError, Exception) as e:
-                # Fallback to basic tkinter if theme initialization fails
                 logging.warning(f"Theme initialization failed: {e}. Using basic tkinter.")
                 tk.Tk.__init__(self)
-                self.title("NVIDIA HDR Converter")
+                self.title("HDR Image Converter")
                 self.configure(bg='#2b2b2b')
                 self.root = self
                 self.master = self
         else:
             super().__init__()
-            self.title("NVIDIA HDR Converter")
+            self.title("HDR Image Converter")
             self.configure(bg='#2b2b2b')
             self.root = self
             self.master = self
-        
+
         self.device_manager = DeviceManager()
         self.jxr_loader = OptimizedJXRLoader(self.device_manager.get_device())
-        self.use_fp16_var = tk.BooleanVar(value=False)  # Variable for half precision toggle
+        self.use_fp16_var = tk.BooleanVar(value=False)
         self.color_processor = HDRColorProcessor(
             self.device_manager.get_device(),
             self.jxr_loader,
@@ -1382,7 +1320,6 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         self.before_hist_ref = None
         self.after_hist_ref = None
 
-        # Main Frame Setup
         main_frame = ttk.Frame(self.master, padding=(10, 10))
         main_frame.grid(row=0, column=0, sticky="nsew")
         self.master.grid_rowconfigure(0, weight=1)
@@ -1390,11 +1327,9 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         main_frame.grid_rowconfigure(0, weight=1)
         main_frame.grid_columnconfigure(0, weight=1)
 
-        # Left Frame: Controls
         left_frame = ttk.Frame(main_frame, padding=(10, 10))
         left_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nw")
 
-        # Right Frame: Previews and Histograms
         right_frame = ttk.Frame(main_frame, padding=(10, 10))
         right_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nw")
 
@@ -1408,19 +1343,16 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         self._setup_progress_bar(left_frame)
         self._setup_status_label(left_frame)
 
-        # Mode Selection Variables
         self.mode_size_var = tk.StringVar(value='small')
         self.current_mode = 'small'
         self.preview_width = MODES[self.current_mode]['preview_width']
         self.preview_height = MODES[self.current_mode]['preview_height']
 
-        # Setup Previews and Histograms
         self._setup_previews(right_frame)
         self._setup_histograms(right_frame)
         self.update_mode_size()
         self.ui_lock = threading.Lock()
 
-        # Mode Switch Frame
         mode_switch_frame = ttk.Frame(main_frame, padding=(10, 10))
         mode_switch_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(mode_switch_frame, text="UI Mode:").grid(row=0, column=0, sticky="e", padx=(0, 5))
@@ -1431,21 +1363,19 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                                       command=self.update_mode_size)
         small_radio.grid(row=0, column=2, padx=5, pady=5, sticky="w")
 
-        # Center and Initialize Window
         self.center_window(MODES[self.current_mode]['window_width'], MODES[self.current_mode]['window_height'])
 
-        # Set initial state of AI Enhancement controls based on the device
         if self.device_manager.use_gpu:
             self.enhance_checkbox.config(state='normal')
             self.edge_scale.config(state='normal')
-            self.fp16_toggle.config(state='normal')  # Enable FP16 toggle
+            self.fp16_toggle.config(state='normal')
         else:
             self.enhance_checkbox.config(state='disabled')
             self.edge_scale.config(state='disabled')
             self.use_enhancement.set(False)
             self._update_enhancement_controls()
-            self.fp16_toggle.config(state='disabled')  # Disable FP16 toggle when GPU is not available
-            self.use_fp16_var.set(False)  # Reset FP16 toggle
+            self.fp16_toggle.config(state='disabled')
+            self.use_fp16_var.set(False)
 
         logging.info(f"Application initialized on {self.device_manager.device}")
 
@@ -1467,6 +1397,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         if mode == "single":
             self.file_frame.config(text="File Selection")
             self.input_label.config(text="Input JXR:")
+            self.output_label.config(text="Output Base Path:")
             self.output_label.grid()
             self.output_entry.grid()
             self.output_browse_button.grid()
@@ -1475,10 +1406,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         else:
             self.file_frame.config(text="Folder Selection")
             self.input_label.config(text="Input Folder:")
-            self.output_label.grid_remove()
-            self.output_entry.grid_remove()
-            self.output_browse_button.grid_remove()
-            self.output_entry.delete(0, tk.END)
+            self.output_label.config(text="Output Folder:")
             folder_path = self.input_entry.get().strip()
             if folder_path and os.path.isdir(folder_path):
                 jxr_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.jxr')]
@@ -1496,7 +1424,6 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                 self.status_label.config(text="Please select a folder containing JXR files.", foreground="#CCCCCC")
                 self.convert_btn.config(state='disabled')
 
-            # Clear previews and histograms
             self.before_label.config(image="", text="No Preview")
             self.before_image_ref = None
             self.after_label.config(image="", text="No Preview")
@@ -1508,21 +1435,36 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
 
     def _setup_file_selection(self, parent_frame):
         """Sets up file or folder selection widgets."""
-        self.file_frame = ttk.LabelFrame(parent_frame, text="File Selection", padding=(10, 10))
+        self.file_frame = ttk.LabelFrame(parent_frame, text="Input / Output", padding=(10, 10))
         self.file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        self.input_label = ttk.Label(self.file_frame, text="Input JXR:")
-        self.input_label.grid(row=0, column=0, sticky="e", padx=(0, 5), pady=5)
-        self.input_entry = ttk.Entry(self.file_frame, width=40)
-        self.input_entry.grid(row=0, column=1, padx=(0, 5), pady=5)
-        self.browse_button = ttk.Button(self.file_frame, text="Browse...", command=self.browse_input)
-        self.browse_button.grid(row=0, column=2, padx=(0, 5), pady=5)
 
-        self.output_label = ttk.Label(self.file_frame, text="Output JPG:")
-        self.output_label.grid(row=1, column=0, sticky="e", padx=(0, 5), pady=5)
-        self.output_entry = ttk.Entry(self.file_frame, width=40)
-        self.output_entry.grid(row=1, column=1, padx=(0, 5), pady=5)
+        # Input Path
+        self.input_label = ttk.Label(self.file_frame, text="Input JXR:")
+        self.input_label.grid(row=0, column=0, sticky="w", padx=(0, 5), pady=5)
+        self.input_entry = ttk.Entry(self.file_frame, width=50)
+        self.input_entry.grid(row=1, column=0, columnspan=2, padx=(0, 5), pady=2, sticky="ew")
+        self.browse_button = ttk.Button(self.file_frame, text="Browse...", command=self.browse_input)
+        self.browse_button.grid(row=1, column=2, padx=(0, 5), pady=2)
+
+        # Output Path
+        self.output_label = ttk.Label(self.file_frame, text="Output Base Path:")
+        self.output_label.grid(row=2, column=0, sticky="w", padx=(0, 5), pady=5)
+        self.output_entry = ttk.Entry(self.file_frame, width=50)
+        self.output_entry.grid(row=3, column=0, columnspan=2, padx=(0, 5), pady=2, sticky="ew")
         self.output_browse_button = ttk.Button(self.file_frame, text="Browse...", command=self.browse_output)
-        self.output_browse_button.grid(row=1, column=2, padx=(0, 5), pady=5)
+        self.output_browse_button.grid(row=3, column=2, padx=(0, 5), pady=2)
+
+        # Output Format
+        ttk.Label(self.file_frame, text="Output Format:").grid(row=4, column=0, sticky="w", padx=(0, 5), pady=(10, 5))
+        self.output_format_var = tk.StringVar(value="JPEG")
+        self.output_format_combo = ttk.Combobox(
+            self.file_frame,
+            textvariable=self.output_format_var,
+            values=["JPEG", "TIFF", "Both"],
+            state="readonly",
+            width=15
+        )
+        self.output_format_combo.grid(row=4, column=1, padx=(0, 5), pady=(10, 5), sticky="w")
 
     def _setup_device_selection(self, parent_frame):
         """Sets up device selection radio buttons (GPU or CPU) and precision toggle."""
@@ -1540,8 +1482,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                                     command=self.update_device)
         cpu_radio.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
-        # Add FP16/FP32 Toggle
-        self.fp16_toggle = ttk.Checkbutton(device_frame, text="Use Half-Precision",
+        self.fp16_toggle = ttk.Checkbutton(device_frame, text="Use Half-Precision (FP16)",
                                            variable=self.use_fp16_var,
                                            command=self.update_precision)
         self.fp16_toggle.grid(row=0, column=2, padx=20, pady=5, sticky="w")
@@ -1561,17 +1502,16 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             error_msg = f"Precision switching failed: {str(e)}"
             self.status_label.config(text=error_msg, foreground="red")
             logging.error(error_msg)
-            self.use_fp16_var.set(False)  # Reset toggle on failure
+            self.use_fp16_var.set(False)
 
     def update_device(self):
         """Handles the device switching logic based on user selection."""
         use_gpu = self.use_gpu_var.get()
         try:
-            # Retrieve the current precision setting
             if use_gpu and torch.cuda.is_available():
                 use_fp16 = self.use_fp16_var.get()
             else:
-                use_fp16 = False  # <-- CHANGED: Now False instead of True on CPU
+                use_fp16 = False
 
             success = self.color_processor.switch_device(use_gpu, use_fp16=use_fp16)
             if success:
@@ -1580,17 +1520,15 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                 self.status_label.config(text=f"Switched to {device_name} with {precision} precision",
                                          foreground="#CCCCCC")
             else:
-                # No change needed; inform the user
                 device_name = "GPU" if use_gpu and torch.cuda.is_available() else "CPU"
                 precision = "FP16" if use_fp16 else "FP32"
                 self.status_label.config(text=f"Already on {device_name} with {precision} precision",
                                          foreground="#CCCCCC")
 
-            # Enable or disable AI Enhancement and Precision controls based on the device
             if use_gpu and torch.cuda.is_available():
                 self.enhance_checkbox.config(state='normal')
                 self.edge_scale.config(state='normal')
-                self.fp16_toggle.config(state='normal')  # Enable FP16 toggle
+                self.fp16_toggle.config(state='normal')
             else:
                 self.enhance_checkbox.config(state='normal')
                 self.edge_scale.config(state='normal')
@@ -1602,17 +1540,15 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             error_msg = f"Device switching failed: {str(e)}"
             self.status_label.config(text=error_msg, foreground="red")
             logging.error(error_msg)
-            # Revert GUI selections if necessary
             self.use_gpu_var.set(not use_gpu)
             if not use_gpu:
                 self.use_fp16_var.set(False)
 
     def _setup_parameters(self, parent_frame):
         """Sets up parameter input fields for gamma and exposure."""
-        self.params_frame = ttk.LabelFrame(parent_frame, text="Parameters", padding=(10, 10))
+        self.params_frame = ttk.LabelFrame(parent_frame, text="Conversion Parameters", padding=(10, 10))
         self.params_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
 
-        # Auto-selected tone map display
         ttk.Label(self.params_frame, text="Tone Map:").grid(row=0, column=0, sticky="e", padx=(0, 5), pady=5)
         self.tonemap_label = ttk.Label(self.params_frame, text="Auto-detect", foreground="#00AA00")
         self.tonemap_label.grid(row=0, column=1, padx=(0, 5), pady=5, sticky="w")
@@ -1627,10 +1563,40 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         autoexposure_entry = ttk.Entry(self.params_frame, textvariable=self.autoexposure_var, width=15)
         autoexposure_entry.grid(row=2, column=1, padx=(0, 5), pady=5)
 
+    def _setup_color_controls(self, parent_frame):
+        """Sets up image enhancement controls (AI Enhancement and Edge Strength)."""
+        enhance_frame = ttk.LabelFrame(parent_frame, text="Image Enhancement", padding=(10, 10))
+        enhance_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        self.use_enhancement = tk.BooleanVar(value=True)
+
+        self.enhance_checkbox = ttk.Checkbutton(enhance_frame, text="Enable AI Enhancement",
+                                                variable=self.use_enhancement,
+                                                command=self._update_enhancement_controls)
+        self.enhance_checkbox.grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
+
+        enhance_frame.grid_columnconfigure(0, minsize=120)
+        enhance_frame.grid_columnconfigure(1, weight=1)
+        enhance_frame.grid_columnconfigure(2, minsize=50)
+
+        ttk.Label(enhance_frame, text="Strength:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
+        self.edge_strength = tk.DoubleVar(value=50.0)
+        self.edge_scale = ttk.Scale(enhance_frame, from_=0.0, to=100.0,
+                                    variable=self.edge_strength, orient="horizontal")
+        self.edge_scale.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
+        self.edge_label = ttk.Label(enhance_frame, text="50%", width=4, anchor="e")
+        self.edge_label.grid(row=1, column=2, sticky="e", pady=(10, 0))
+
+        def update_edge_label(*args):
+            value = self.edge_strength.get()
+            self.edge_label.config(text=f"{int(value)}%")
+
+        self.edge_strength.trace_add("write", update_edge_label)
+        self._update_enhancement_controls()
+
     def _setup_conversion_button(self, parent_frame):
         """Sets up the conversion button."""
         convert_frame = ttk.Frame(parent_frame, padding=(0, 0))
-        convert_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        convert_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         convert_frame.grid_columnconfigure(0, weight=1)
         self.convert_btn = ttk.Button(convert_frame, text="Convert", command=self.convert_image, style="Accent.TButton")
         self.convert_btn.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
@@ -1653,7 +1619,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
     def _setup_progress_bar(self, parent_frame):
         """Sets up the progress bar."""
         progress_frame = ttk.Frame(parent_frame, padding=(0, 0))
-        progress_frame.grid(row=5, column=0, sticky="ew", pady=(5, 10))
+        progress_frame.grid(row=6, column=0, sticky="ew", pady=(5, 10))
         progress_frame.grid_columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate")
         self.progress.grid(row=0, column=0, sticky="ew")
@@ -1661,7 +1627,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
     def _setup_status_label(self, parent_frame):
         """Sets up the status label to display messages."""
         self.status_label = ttk.Label(parent_frame, text="", foreground="#CCCCCC")
-        self.status_label.grid(row=6, column=0, sticky="w", pady=(0, 10))
+        self.status_label.grid(row=7, column=0, sticky="w", pady=(0, 10))
 
     def _setup_previews(self, parent_frame):
         """Sets up the preview image canvases."""
@@ -1720,13 +1686,19 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         if self.original_input_tensor is not None:
             self.before_hist_label.config(image="", text="")
             self.before_hist_ref = None
+
+            # Recreate preview from original linear tensor
+            tone_mapper = AdvancedToneMapper(self.device_manager.get_device(), self.jxr_loader.metadata)
+            tonemapped_tensor = tone_mapper.apply_tone_mapping(self.original_input_tensor, method='hable')
+            srgb_tensor = self.jxr_loader.linear_to_srgb(tonemapped_tensor)
+
             preview_tensor = self.jxr_loader.process_preview(
-                self.original_input_tensor,
+                srgb_tensor,
                 self.preview_width,
                 self.preview_height
             )
-            self._update_preview_ui(preview_tensor)
-            self.show_color_spectrum_from_tensor(self.original_input_tensor, is_before=True)
+            self._update_preview_ui(preview_tensor, srgb_tensor)
+            self.show_color_spectrum_from_tensor(srgb_tensor, is_before=True)
 
         if getattr(self, 'current_after_image_path', None):
             self.show_preview_from_file(self.current_after_image_path, is_before=False)
@@ -1776,9 +1748,8 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                 self.input_entry.insert(0, filename)
 
                 base_name, _ = os.path.splitext(filename)
-                output_filename = base_name + '.jpg'
                 self.output_entry.delete(0, tk.END)
-                self.output_entry.insert(0, output_filename)
+                self.output_entry.insert(0, base_name)
 
                 self.status_label.config(text="Loading preview...", foreground="#CCCCCC")
                 self.master.update_idletasks()
@@ -1788,6 +1759,8 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             if foldername:
                 self.input_entry.delete(0, tk.END)
                 self.input_entry.insert(0, foldername)
+                self.output_entry.delete(0, tk.END)
+                self.output_entry.insert(0, os.path.join(foldername, "Converted_Outputs"))
                 jxr_files = [f for f in os.listdir(foldername) if f.lower().endswith('.jxr')]
                 file_count = len(jxr_files)
                 if file_count == 0:
@@ -1800,7 +1773,6 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                     )
                     self.convert_btn.config(state='normal')
 
-                # Clear previews and histograms
                 self.before_label.config(image="", text="No Preview")
                 self.before_image_ref = None
                 self.after_label.config(image="", text="No Preview")
@@ -1812,14 +1784,20 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
 
     def browse_output(self):
         """Handles the output file browsing."""
-        filename = filedialog.asksaveasfilename(
-            title="Select Output JPG File",
-            defaultextension=".jpg",
-            filetypes=[("JPEG files", "*.jpg"), ("All files", "*.*")]
-        )
-        if filename:
-            self.output_entry.delete(0, tk.END)
-            self.output_entry.insert(0, filename)
+        mode = self.mode_var.get()
+        if mode == "single":
+            filename = filedialog.asksaveasfilename(
+                title="Select Output File Base Name",
+                filetypes=[("All files", "*.*")]
+            )
+            if filename:
+                self.output_entry.delete(0, tk.END)
+                self.output_entry.insert(0, filename)
+        else:
+            foldername = filedialog.askdirectory(title="Select Output Folder")
+            if foldername:
+                self.output_entry.delete(0, tk.END)
+                self.output_entry.insert(0, foldername)
 
     def create_preview_from_jxr(self, jxr_file: str):
         """Generates a preview from a selected JXR file."""
@@ -1837,28 +1815,32 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
 
         def process_jxr():
             try:
-                tensor, error, metadata = self.jxr_loader.load_jxr(jxr_file, is_preview=True)
-                if tensor is None:
+                linear_tensor, error, metadata = self.jxr_loader.load_jxr(jxr_file)
+                if linear_tensor is None:
                     raise RuntimeError("Failed to load JXR file.")
-                self.original_input_tensor = tensor.clone()  # Store original always
+                self.original_input_tensor = linear_tensor.clone()
 
-                # Display metadata info if available
                 if metadata.get('has_metadata', False):
                     logging.info(f"HDR Metadata: Max Luminance={metadata.get('max_luminance')}nits, "
                                  f"White Point={metadata.get('white_point')}nits")
 
+                # Apply tone mapping and sRGB for preview
+                tone_mapper = AdvancedToneMapper(self.device_manager.get_device(), self.jxr_loader.metadata)
+                tonemapped_tensor = tone_mapper.apply_tone_mapping(linear_tensor, method='hable')
+                srgb_tensor = self.jxr_loader.linear_to_srgb(tonemapped_tensor)
+
                 preview_tensor = self.jxr_loader.process_preview(
-                    tensor,
+                    srgb_tensor,
                     self.preview_width,
                     self.preview_height
                 )
                 if preview_tensor is None:
                     raise RuntimeError("Failed to generate preview")
 
-                self.master.after(0, lambda: self._update_preview_ui(preview_tensor))
+                self.master.after(0, lambda: self._update_preview_ui(preview_tensor, srgb_tensor))
             except Exception as e:
                 error_msg = str(e)
-                logging.error(f"Preview generation error: {error_msg}")
+                logging.error(f"Preview generation error: {error_msg}", exc_info=True)
                 self.master.after(0, lambda: self._handle_preview_error(error_msg))
 
         thread = threading.Thread(target=process_jxr, daemon=True)
@@ -2009,10 +1991,10 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         new_size = (int(original_width * ratio), int(original_height * ratio))
         return image.resize(new_size, Image.Resampling.LANCZOS)
 
-    def _update_preview_ui(self, tensor: torch.Tensor):
+    def _update_preview_ui(self, preview_tensor: torch.Tensor, full_res_srgb_tensor: torch.Tensor):
         """Updates the UI with the generated preview image."""
         try:
-            preview_image = self.jxr_loader.tensor_to_pil(tensor)
+            preview_image = self.jxr_loader.tensor_to_pil(preview_tensor)
             if preview_image is None:
                 raise RuntimeError("Failed to convert preview to image")
 
@@ -2037,7 +2019,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             preview_tk = ImageTk.PhotoImage(Image.open(buffer))
             self.before_label.config(image=preview_tk, text="")
             self.before_image_ref = preview_tk
-            self.show_color_spectrum_from_tensor(tensor, is_before=True)
+            self.show_color_spectrum_from_tensor(full_res_srgb_tensor, is_before=True)
             self.status_label.config(text="Preview loaded successfully", foreground="#00FF00")
 
         except Exception as e:
@@ -2048,38 +2030,6 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         state = 'normal' if self.use_enhancement.get() else 'disabled'
         self.edge_scale.configure(state=state)
 
-    def _setup_color_controls(self, parent_frame):
-        """Sets up image enhancement controls (AI Enhancement and Edge Strength)."""
-        enhance_frame = ttk.LabelFrame(self.params_frame, text="Image Enhancement", padding=(10, 10))
-        enhance_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        self.use_enhancement = tk.BooleanVar(value=True)
-
-        # Store reference to the Enhance Checkbox
-        self.enhance_checkbox = ttk.Checkbutton(enhance_frame, text="Enable AI Enhancement",
-                                                variable=self.use_enhancement,
-                                                command=self._update_enhancement_controls)
-        self.enhance_checkbox.grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky="w")
-
-        enhance_frame.grid_columnconfigure(0, minsize=120)
-        enhance_frame.grid_columnconfigure(1, weight=1)
-        enhance_frame.grid_columnconfigure(2, minsize=50)
-
-        # Edge Enhancement Controls
-        ttk.Label(enhance_frame, text="Strength:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
-        self.edge_strength = tk.DoubleVar(value=50.0)  # <-- Changed to 50.0
-        self.edge_scale = ttk.Scale(enhance_frame, from_=0.0, to=100.0,
-                                    variable=self.edge_strength, orient="horizontal")
-        self.edge_scale.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
-        self.edge_label = ttk.Label(enhance_frame, text="50%", width=4, anchor="e")  # Optional: Start label at 50%
-        self.edge_label.grid(row=1, column=2, sticky="e", pady=(10, 0))
-
-        def update_edge_label(*args):
-            value = self.edge_strength.get()
-            self.edge_label.config(text=f"{int(value)}%")
-
-        self.edge_strength.trace_add("write", update_edge_label)
-        self._update_enhancement_controls()
-
     def convert_image(self):
         """Initiates the image conversion process based on selected mode."""
         mode = self.mode_var.get()
@@ -2089,29 +2039,25 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             self._convert_folder()
 
     def _convert_single_file(self):
-        """Converts a single JXR file to JPEG."""
+        """Converts a single JXR file."""
         input_file = self.input_entry.get().strip()
-        original_output_file = self.output_entry.get().strip()
+        output_base_file = self.output_entry.get().strip()
         pre_gamma_str = self.pregamma_var.get().strip()
         auto_exposure_str = self.autoexposure_var.get().strip()
         use_enhancement = self.use_enhancement.get()
-
-        # Set color_strength to 100 if enhancement is enabled, else 0
         color_strength = 100.0 if use_enhancement else 0.0
         edge_strength = self.edge_strength.get() if use_enhancement else 0.0
 
         try:
-            validate_files(input_file, original_output_file)
+            validate_files(input_file, output_base_file)
             validate_parameters(pre_gamma_str, auto_exposure_str)
         except (FileNotFoundError, ValueError) as e:
             messagebox.showerror("Error", str(e))
             self.status_label.config(text=str(e), foreground="red")
             return
 
-        pre_gamma = float(pre_gamma_str)
-        auto_exposure = float(auto_exposure_str)
-        self.jxr_loader.selected_pre_gamma = pre_gamma
-        self.jxr_loader.selected_auto_exposure = auto_exposure
+        self.jxr_loader.selected_pre_gamma = float(pre_gamma_str)
+        self.jxr_loader.selected_auto_exposure = float(auto_exposure_str)
 
         self.status_label.config(text="Analyzing image...", foreground="#CCCCCC")
         self.progress['value'] = 0
@@ -2120,35 +2066,47 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
 
         def process_task():
             try:
-                # Always reload original tensor to avoid cumulative effects
-                tensor, error, metadata = self.jxr_loader.load_jxr(input_file)
-                if tensor is None:
+                linear_tensor, _, metadata = self.jxr_loader.load_jxr(input_file)
+                if linear_tensor is None:
                     raise RuntimeError("Failed to load JXR file.")
 
-                # Update UI with auto-detected method
-                self.master.after(0, lambda: self.tonemap_label.config(text="Auto-detected",
-                                                                       foreground="#00FF00"))
+                tone_mapper = AdvancedToneMapper(self.device_manager.get_device(), self.jxr_loader.metadata)
+                auto_method = tone_mapper.select_optimal_tonemap(tone_mapper.analyze_image_statistics(linear_tensor))
+                self.master.after(0, lambda: self.tonemap_label.config(text=auto_method, foreground="#00FF00"))
                 self.master.after(0, lambda: self.status_label.config(
-                    text="Converting with auto-detected tone mapping...", foreground="#CCCCCC"))
+                    text=f"Converting with {auto_method} tone mapping...", foreground="#CCCCCC"))
 
-                # Use the original tensor for processing
-                result = self.color_processor.process_image(
-                    tensor.clone(),
-                    original_output_file,
+                tonemapped_tensor = tone_mapper.apply_tone_mapping(linear_tensor.clone(), method=auto_method)
+                srgb_tonemapped_tensor = self.jxr_loader.linear_to_srgb(tonemapped_tensor)
+
+                enhanced_tensor = self.color_processor.process_image(
+                    srgb_tonemapped_tensor.clone(),
                     color_strength=color_strength,
                     edge_strength=edge_strength,
                     use_enhancement=use_enhancement
                 )
 
-                if result:
-                    self.master.after(0, lambda: self.show_color_spectrum(original_output_file, is_before=False))
-                    self.safe_update_ui("Conversion successful!", "#00FF00")
-                    self.master.after(0, lambda: self.show_preview_from_file(original_output_file, is_before=False))
-                else:
-                    raise RuntimeError("Image processing failed to produce output")
+                output_format = self.output_format_var.get()
+
+                if output_format in ("JPEG", "Both"):
+                    self.color_processor.save_tensor_as_image(enhanced_tensor, f"{output_base_file}.jpg", "JPEG")
+
+                if output_format in ("TIFF", "Both"):
+                    self.color_processor.save_tensor_as_image(linear_tensor, f"{output_base_file}_raw.tiff", "TIFF",
+                                                              is_hdr_data=True)
+                    self.color_processor.save_tensor_as_image(enhanced_tensor, f"{output_base_file}_tonemapped.tiff",
+                                                              "TIFF")
+
+                if output_format == "JPEG" or output_format == "Both":
+                    self.master.after(0,
+                                      lambda: self.show_preview_from_file(f"{output_base_file}.jpg", is_before=False))
+                    self.master.after(0, lambda: self.show_color_spectrum(f"{output_base_file}.jpg", is_before=False))
+
+                self.safe_update_ui("Conversion successful!", "#00FF00")
+
             except Exception as e:
                 error_msg = str(e)
-                logging.error(f"Conversion failed with error: {error_msg}")
+                logging.error(f"Conversion failed with error: {error_msg}", exc_info=True)
                 self.safe_update_ui(f"Conversion failed: {error_msg}", "red")
                 messagebox.showerror("Error", error_msg)
             finally:
@@ -2157,10 +2115,18 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         threading.Thread(target=process_task, daemon=True).start()
 
     def _convert_folder(self):
-        """Converts all JXR files in a selected folder to JPEG."""
+        """Converts all JXR files in a selected folder."""
         folder_path = self.input_entry.get().strip()
+        output_folder = self.output_entry.get().strip()
+
         if not folder_path or not os.path.isdir(folder_path):
-            error_msg = "Please select a valid folder."
+            error_msg = "Please select a valid input folder."
+            messagebox.showerror("Error", error_msg)
+            self.status_label.config(text=error_msg, foreground="red")
+            return
+
+        if not output_folder:
+            error_msg = "Please select a valid output folder."
             messagebox.showerror("Error", error_msg)
             self.status_label.config(text=error_msg, foreground="red")
             return
@@ -2172,12 +2138,25 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             self.status_label.config(text=error_msg, foreground="red")
             return
 
-        output_folder = os.path.join(folder_path, "Converted_JPGs")
         os.makedirs(output_folder, exist_ok=True)
+
+        pre_gamma_str = self.pregamma_var.get().strip()
+        auto_exposure_str = self.autoexposure_var.get().strip()
+
+        try:
+            validate_parameters(pre_gamma_str, auto_exposure_str)
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            self.status_label.config(text=str(e), foreground="red")
+            return
+
+        self.jxr_loader.selected_pre_gamma = float(pre_gamma_str)
+        self.jxr_loader.selected_auto_exposure = float(auto_exposure_str)
 
         use_enhancement = self.use_enhancement.get()
         color_strength = 100.0 if use_enhancement else 0.0
         edge_strength = self.edge_strength.get() if use_enhancement else 0.0
+        output_format_choice = self.output_format_var.get()
 
         self.status_label.config(text=f"Converting {len(jxr_files)} files...", foreground="#CCCCCC")
         self.progress['maximum'] = len(jxr_files)
@@ -2192,43 +2171,58 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                 for jxr_file in jxr_files:
                     try:
                         input_path = os.path.join(folder_path, jxr_file)
-                        final_output = os.path.join(output_folder, f"{os.path.splitext(jxr_file)[0]}.jpg")
+                        output_base_name = os.path.join(output_folder, os.path.splitext(jxr_file)[0])
                         self.safe_update_ui(f"Processing: {jxr_file}", "#CCCCCC")
                         logging.info(f"Processing file: {jxr_file}")
-                        
-                        # Load JXR with automatic tone mapping (each file gets individualized analysis)
-                        tensor, error, metadata = self.jxr_loader.load_jxr(input_path)
-                        if tensor is None:
+
+                        linear_tensor, _, metadata = self.jxr_loader.load_jxr(input_path)
+                        if linear_tensor is None:
                             raise RuntimeError(f"Failed to load {jxr_file}")
 
-                        # Use the same processing pipeline as single file mode
-                        self.color_processor.process_image(
-                            tensor.clone(),
-                            final_output,
+                        tone_mapper = AdvancedToneMapper(self.device_manager.get_device(), self.jxr_loader.metadata)
+                        auto_method = tone_mapper.select_optimal_tonemap(
+                            tone_mapper.analyze_image_statistics(linear_tensor))
+
+                        tonemapped_tensor = tone_mapper.apply_tone_mapping(linear_tensor.clone(), method=auto_method)
+                        srgb_tonemapped_tensor = self.jxr_loader.linear_to_srgb(tonemapped_tensor)
+
+                        enhanced_tensor = self.color_processor.process_image(
+                            srgb_tonemapped_tensor.clone(),
                             color_strength=color_strength,
                             edge_strength=edge_strength,
                             use_enhancement=use_enhancement
                         )
+
+                        if output_format_choice in ("JPEG", "Both"):
+                            self.color_processor.save_tensor_as_image(enhanced_tensor, f"{output_base_name}.jpg",
+                                                                      "JPEG")
+
+                        if output_format_choice in ("TIFF", "Both"):
+                            self.color_processor.save_tensor_as_image(linear_tensor, f"{output_base_name}_raw.tiff",
+                                                                      "TIFF", is_hdr_data=True)
+                            self.color_processor.save_tensor_as_image(enhanced_tensor,
+                                                                      f"{output_base_name}_tonemapped.tiff", "TIFF")
+
                         successful_conversions += 1
+                    except Exception as e:
+                        logging.error(f"Failed to process {jxr_file}: {e}", exc_info=True)
+                        failed_conversions += 1
+                        failed_files.append(jxr_file)
+                    finally:
                         self.safe_increment_progress()
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                    except Exception as e:
-                        logging.error(f"Failed to process {jxr_file}: {e}")
-                        failed_conversions += 1
-                        failed_files.append(jxr_file)
-                        self.safe_increment_progress()
 
                 if failed_conversions == 0:
                     self.safe_update_ui(
-                        f"Batch conversion completed! All {successful_conversions} files processed successfully.",
+                        f"Batch conversion completed! All {successful_conversions} files processed.",
                         "#00FF00"
                     )
                 else:
-                    error_msg = (f"Batch conversion completed with errors.\n"
-                                 f"Successful: {successful_conversions}, Failed: {failed_conversions}\n"
-                                 f"Failed files: {', '.join(failed_files)}")
+                    error_msg = (
+                        f"Batch completed with errors. Success: {successful_conversions}, Failed: {failed_conversions}\n"
+                        f"Failed files: {', '.join(failed_files)}")
                     self.safe_update_ui(error_msg, "orange" if successful_conversions > 0 else "red")
                     logging.error(error_msg)
             except Exception as e:
@@ -2260,10 +2254,10 @@ if __name__ == "__main__":
     try:
         app = App("park", "dark")
         root = app.master
-        root.title("NVIDIA HDR Converter - Enhanced Edition")
-        root.minsize(1760, 840)
+        root.title("HDR Image Converter - Enhanced Edition")
+        root.minsize(1760, 900)
         window_width = 1760
-        window_height = 840
+        window_height = 900
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         center_x = int((screen_width - window_width) / 2)
