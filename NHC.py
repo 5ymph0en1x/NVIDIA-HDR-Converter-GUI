@@ -60,13 +60,13 @@ PRETRAINED_MODELS = {
 MODES = {
     'big': {
         'window_width': 2200,
-        'window_height': 900,
+        'window_height': 976,
         'preview_width': 720,
         'preview_height': 406,
     },
     'small': {
         'window_width': 1760,
-        'window_height': 900,
+        'window_height': 976,
         'preview_width': 512,
         'preview_height': 288,
     },
@@ -400,6 +400,16 @@ class AdvancedToneMapper:
             elif self.metadata.max_luminance > 1000:
                 scores['mantiuk06'] += 15
 
+        is_high_contrast_scene = stats['needs_shadow_recovery'] and stats['has_extreme_highlights']
+
+        if is_high_contrast_scene:
+            logging.info("High-contrast scene detected. Prioritizing local tone mapping operators.")
+            # In this case, we give a massive bonus to local operators that can handle this conflict.
+            # 'adaptive' is designed for this, and 'mantiuk06' is excellent for local contrast.
+            scores['adaptive'] += 50  # Decisive bonus
+            scores['mantiuk06'] += 40  # Strong preference
+            scores['perceptual'] -= 20  # Penalty for global operators in this scenario
+
         # Select highest scoring method
         best_method = max(scores, key=scores.get)
 
@@ -608,6 +618,34 @@ class AdvancedToneMapper:
         """Direct Reinhard operator without LUT."""
         L_white = 4.0
         return x * (1.0 + x / (L_white * L_white)) / (1.0 + x)
+
+    def apply_dithering(self, image: torch.Tensor, strength: float = 1.0 / 255.0) -> torch.Tensor:
+        """
+        Applies ordered dithering (Bayer matrix) to prevent banding.
+        Dithering must be the last operation before quantization.
+        """
+        # 8x8 Bayer matrix normalized between -0.5 and 0.5
+        bayer_matrix_8x8 = torch.tensor([
+            [0, 32, 8, 40, 2, 34, 10, 42],
+            [48, 16, 56, 24, 50, 18, 58, 26],
+            [12, 44, 4, 36, 14, 46, 6, 38],
+            [60, 28, 52, 20, 62, 30, 54, 22],
+            [3, 35, 11, 43, 1, 33, 9, 41],
+            [51, 19, 59, 27, 49, 17, 57, 25],
+            [15, 47, 7, 39, 13, 45, 5, 37],
+            [63, 31, 55, 23, 61, 29, 53, 21]
+        ], dtype=image.dtype, device=image.device)
+
+        bayer_matrix = (bayer_matrix_8x8 / 64.0) - 0.5
+
+        # Repeat the matrix across the entire image
+        B, C, H, W = image.shape
+        dither_matrix = bayer_matrix.repeat(H // 8 + 1, W // 8 + 1)[:H, :W].unsqueeze(0).unsqueeze(0)
+
+        # Add dithering noise weighted by strength
+        dithered_image = image + dither_matrix * strength
+
+        return torch.clamp(dithered_image, 0.0, 1.0)
 
     def soft_clip(self, image: torch.Tensor, threshold: float = 0.95) -> torch.Tensor:
         """Soft clipping to avoid hard cutoffs at 0 and 1."""
@@ -1183,40 +1221,63 @@ class HDRColorProcessor:
             return original_tensor
 
     def save_tensor_as_image(self, tensor_to_save, output_path, output_format, is_hdr_data=False, quality=95):
-        """Saves a tensor as an image file (JPEG or TIFF)."""
+        """
+        Saves a tensor as an image file (JPEG or TIFF).
+        Applies adaptive ordered dithering before quantization for LDR formats
+        to prevent banding.
+        """
         try:
             if tensor_to_save.is_cuda:
                 tensor_to_save = tensor_to_save.cpu()
 
             tensor_to_save = tensor_to_save.detach()
 
+            # --- Start of dithering logic ---
+            # Apply dithering only to LDR (non-HDR) images that will be quantized.
+            if not is_hdr_data:
+                dither_strength = 0.0
+                if output_format == 'JPEG':
+                    # Dithering intensity is adjusted for 8-bit target.
+                    dither_strength = 1.0 / 255.0
+                elif output_format == 'TIFF':
+                    # Dithering intensity is adjusted for 16-bit target.
+                    dither_strength = 1.0 / 65535.0
+
+                # If an intensity has been defined, apply dithering.
+                if dither_strength > 0 and self.jxr_loader.tone_mapper is not None:
+                    logging.info(
+                        f"Applying dithering for {output_format} format with intensity {dither_strength:.6f}")
+                    tensor_to_save = self.jxr_loader.tone_mapper.apply_dithering(tensor_to_save,
+                                                                                 strength=dither_strength)
+            # --- End of dithering logic ---
+
             if output_format == 'JPEG':
+                # Convert tensor (potentially dithered) to NumPy array.
                 array = tensor_to_save.squeeze(0).permute(1, 2, 0).contiguous().numpy()
                 array = np.clip(array, 0.0, 1.0)
+                # 8-bit quantization. This is where banding would occur without dithering.
                 array = (array * 255).astype(np.uint8)
                 result_image = Image.fromarray(array)
                 result_image.save(output_path, 'JPEG', quality=quality, optimize=True)
 
             elif output_format == 'TIFF':
+                # Convert tensor (potentially dithered) to NumPy array.
                 array = tensor_to_save.squeeze(0).permute(1, 2, 0).contiguous().numpy()
-                array = np.ascontiguousarray(array, dtype=np.float32)
 
                 if is_hdr_data:
-                    min_val, max_val = array.min(), array.max()
-                    if max_val > min_val:
-                        array = (array - min_val) / (max_val - min_val)
+                    # Save raw HDR data as float32, without dithering or quantization.
+                    array = np.ascontiguousarray(array, dtype=np.float32)
+                    tifffile.imwrite(output_path, array, photometric='rgb', compression='lzw')
                 else:
+                    # For LDR data, 16-bit quantization.
                     array = np.clip(array, 0.0, 1.0)
-
-                array = (array * 65535).astype(np.uint16)
-
-                # Use tifffile.imwrite for robust TIFF saving.
-                tifffile.imwrite(output_path, array, photometric='rgb', compression='lzw')
+                    array = (array * 65535).astype(np.uint16)
+                    tifffile.imwrite(output_path, array, photometric='rgb', compression='lzw')
 
             else:
                 raise ValueError(f"Unsupported output format: {output_format}")
 
-            logging.info(f"Successfully saved image to {output_path}")
+            logging.info(f"Image saved successfully: {output_path}")
 
         except Exception as e:
             logging.error(f"Failed to save image to {output_path}: {e}", exc_info=True)
@@ -1314,6 +1375,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
         self.current_before_image_path = None
         self.current_after_image_path = None
         self.original_input_tensor = None
+        self.current_enhanced_tensor = None
 
         self.before_image_ref = None
         self.after_image_ref = None
@@ -1465,6 +1527,32 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             width=15
         )
         self.output_format_combo.grid(row=4, column=1, padx=(0, 5), pady=(10, 5), sticky="w")
+
+        # Tone Mapping Selection
+        ttk.Label(self.file_frame, text="Tone Mapping:").grid(row=5, column=0, sticky="w", padx=(0, 5), pady=(10, 5))
+        self.tone_mapping_var = tk.StringVar(value="Auto-detect")
+        self.tone_mapping_combo = ttk.Combobox(
+            self.file_frame,
+            textvariable=self.tone_mapping_var,
+            values=["Auto-detect", "Hable", "ACES", "Reinhard", "Mantiuk06", "Drago03", "Perceptual", "Adaptive"],
+            state="readonly",
+            width=15
+        )
+        self.tone_mapping_combo.grid(row=5, column=1, padx=(0, 5), pady=(10, 5), sticky="w")
+
+    def get_selected_tone_mapping_method(self):
+        """Convert display name to internal tone mapping method name."""
+        display_to_internal = {
+            "Auto-detect": None,  # None triggers auto-selection
+            "Hable": "hable",
+            "ACES": "aces", 
+            "Reinhard": "reinhard",
+            "Mantiuk06": "mantiuk06",
+            "Drago03": "drago03",
+            "Perceptual": "perceptual",
+            "Adaptive": "adaptive"
+        }
+        return display_to_internal.get(self.tone_mapping_var.get(), None)
 
     def _setup_device_selection(self, parent_frame):
         """Sets up device selection radio buttons (GPU or CPU) and precision toggle."""
@@ -1700,7 +1788,11 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
             self._update_preview_ui(preview_tensor, srgb_tensor)
             self.show_color_spectrum_from_tensor(srgb_tensor, is_before=True)
 
-        if getattr(self, 'current_after_image_path', None):
+        # Regenerate after image from tensor if available, otherwise use file
+        if getattr(self, 'current_enhanced_tensor', None) is not None:
+            self.show_preview_from_tensor(self.current_enhanced_tensor, is_before=False)
+            self.show_color_spectrum_from_tensor(self.current_enhanced_tensor, is_before=False)
+        elif getattr(self, 'current_after_image_path', None):
             self.show_preview_from_file(self.current_after_image_path, is_before=False)
             self.show_color_spectrum(self.current_after_image_path, is_before=False)
 
@@ -1877,7 +1969,19 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
 
         try:
             img = Image.open(filepath).convert('RGB')
+            logging.info(f"Loading preview from {filepath}, is_before={is_before}, original size: {img.size}")
             img = self._resize_image(img, self.preview_width, self.preview_height)
+            logging.info(f"After resize: {img.size}, target: {self.preview_width}x{self.preview_height}")
+            
+            # Apply the same centering logic as _update_preview_ui for consistency
+            if img.size[0] < self.preview_width or img.size[1] < self.preview_height:
+                bg = Image.new('RGB', (self.preview_width, self.preview_height), (46, 46, 46))
+                offset_x = (self.preview_width - img.size[0]) // 2
+                offset_y = (self.preview_height - img.size[1]) // 2
+                bg.paste(img, (offset_x, offset_y))
+                img = bg
+                logging.info(f"Centered on background: {img.size}")
+            
             img_tk = ImageTk.PhotoImage(img)
             label.config(image=img_tk, text="")
             if is_before:
@@ -2112,12 +2216,22 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                     raise RuntimeError("Failed to load JXR file.")
 
                 tone_mapper = AdvancedToneMapper(self.device_manager.get_device(), self.jxr_loader.metadata)
-                auto_method = tone_mapper.select_optimal_tonemap(tone_mapper.analyze_image_statistics(linear_tensor))
-                self.master.after(0, lambda: self.tonemap_label.config(text=auto_method, foreground="#00FF00"))
+                
+                # Get user-selected tone mapping method or auto-detect
+                selected_method = self.get_selected_tone_mapping_method()
+                if selected_method is None:  # Auto-detect
+                    auto_method = tone_mapper.select_optimal_tonemap(tone_mapper.analyze_image_statistics(linear_tensor))
+                    final_method = auto_method
+                    method_display = f"{auto_method} (auto)"
+                else:  # Manual selection
+                    final_method = selected_method
+                    method_display = f"{selected_method} (manual)"
+                
+                self.master.after(0, lambda: self.tonemap_label.config(text=method_display, foreground="#00FF00"))
                 self.master.after(0, lambda: self.status_label.config(
-                    text=f"Converting with {auto_method} tone mapping...", foreground="#CCCCCC"))
+                    text=f"Converting with {final_method} tone mapping...", foreground="#CCCCCC"))
 
-                tonemapped_tensor = tone_mapper.apply_tone_mapping(linear_tensor.clone(), method=auto_method)
+                tonemapped_tensor = tone_mapper.apply_tone_mapping(linear_tensor.clone(), method=final_method)
                 srgb_tonemapped_tensor = self.jxr_loader.linear_to_srgb(tonemapped_tensor)
 
                 enhanced_tensor = self.color_processor.process_image(
@@ -2136,8 +2250,11 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                     self.color_processor.save_tensor_as_image(linear_tensor, f"{output_base_file}_raw.tiff", "TIFF",
                                                               is_hdr_data=True)
                     self.color_processor.save_tensor_as_image(enhanced_tensor, f"{output_base_file}_tonemapped.tiff",
-                                                              "TIFF")
+                                                              "TIFF", is_hdr_data=False)
 
+                # Store the processed tensor for mode switching
+                self.current_enhanced_tensor = enhanced_tensor.clone()
+                
                 # Generate "After" preview directly from the processed tensor
                 self.master.after(0, lambda: self.show_preview_from_tensor(enhanced_tensor.clone(), is_before=False))
                 self.master.after(0, lambda: self.show_color_spectrum_from_tensor(enhanced_tensor.clone(),
@@ -2221,10 +2338,17 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                             raise RuntimeError(f"Failed to load {jxr_file}")
 
                         tone_mapper = AdvancedToneMapper(self.device_manager.get_device(), self.jxr_loader.metadata)
-                        auto_method = tone_mapper.select_optimal_tonemap(
-                            tone_mapper.analyze_image_statistics(linear_tensor))
+                        
+                        # Get user-selected tone mapping method or auto-detect
+                        selected_method = self.get_selected_tone_mapping_method()
+                        if selected_method is None:  # Auto-detect
+                            auto_method = tone_mapper.select_optimal_tonemap(
+                                tone_mapper.analyze_image_statistics(linear_tensor))
+                            final_method = auto_method
+                        else:  # Manual selection
+                            final_method = selected_method
 
-                        tonemapped_tensor = tone_mapper.apply_tone_mapping(linear_tensor.clone(), method=auto_method)
+                        tonemapped_tensor = tone_mapper.apply_tone_mapping(linear_tensor.clone(), method=final_method)
                         srgb_tonemapped_tensor = self.jxr_loader.linear_to_srgb(tonemapped_tensor)
 
                         enhanced_tensor = self.color_processor.process_image(
@@ -2242,7 +2366,7 @@ class App(TKMT.ThemedTKinterFrame if TKMT else tk.Tk):
                             self.color_processor.save_tensor_as_image(linear_tensor, f"{output_base_name}_raw.tiff",
                                                                       "TIFF", is_hdr_data=True)
                             self.color_processor.save_tensor_as_image(enhanced_tensor,
-                                                                      f"{output_base_name}_tonemapped.tiff", "TIFF")
+                                                                      f"{output_base_name}_tonemapped.tiff", "TIFF", is_hdr_data=False)
 
                         successful_conversions += 1
                     except Exception as e:
@@ -2296,9 +2420,9 @@ if __name__ == "__main__":
         app = App("park", "dark")
         root = app.master
         root.title("HDR Image Converter - Enhanced Edition")
-        root.minsize(1760, 900)
+        root.minsize(1760, 976)
         window_width = 1760
-        window_height = 900
+        window_height = 976
         screen_width = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         center_x = int((screen_width - window_width) / 2)
