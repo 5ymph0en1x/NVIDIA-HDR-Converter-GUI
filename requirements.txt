@@ -1,7 +1,8 @@
-torch==2.5.1
-torchvision==0.16.1
-Pillow==10.2.0
-numpy==1.26.4
-matplotlib==3.9.3
-imagecodecs==2024.9.22
-TKinterModernThemes==1.10.4
+torch>=2.5.1
+torchvision>=0.16.1
+Pillow>=10.2.0
+numpy>=1.26.4
+matplotlib>=3.9.3
+imagecodecs>=2024.9.22
+TKinterModernThemes>=1.10.4
+tifffile
