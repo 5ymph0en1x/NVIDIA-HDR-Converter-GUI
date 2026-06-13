@@ -54,7 +54,7 @@ Convert NVIDIA HDR screenshots (JXR format) to JPEG with advanced AI enhancement
 
 ### System Requirements
 - **Python 3.8+**
-- **NVIDIA GPU** (recommended) with CUDA support
+- **NVIDIA GPU** (recommended) with CUDA support now available in exe
 - **4GB+ RAM** (8GB+ recommended for large images)
 
 ### Python Dependencies
