@@ -141,6 +141,75 @@ def test_a_video_gets_a_provisional_preview_then_the_exact_one(window, video):
     assert window.time_label.text().endswith("/ 0:00")
 
 
+def test_a_video_is_sharpened_only_when_the_switch_is_on(window, video):
+    """Sharpness and AI colour stay off a video unless asked for: what the preview shows is
+    what the conversion will write."""
+    assert window.panel.video_enhance.isChecked() is False
+    window.add_paths([str(video)])
+    assert wait(lambda: window._facts is not None and window._facts["final"], 120)
+    plain = after_bytes(window)
+    window.panel.sharpness.setValue(100)
+    settle(0.6)
+    assert window.options.sharpness == 100.0
+    assert wait(lambda: window._facts["final"], 120) and after_bytes(window) == plain, \
+        "the sharpness of captures does not touch a video"
+    window.panel.video_enhance.click()
+    assert window.options.video_enhance is True
+    assert wait(lambda: after_bytes(window) != plain, 120), "switched on, the preview is sharpened"
+    assert wait(lambda: window._facts["final"], 120)
+    window.panel.video_enhance.click()
+    assert wait(lambda: window._facts["final"] and after_bytes(window) == plain, 120)
+
+
+def test_the_frame_rate_is_chosen_in_the_panel_and_keeps_the_analysis(window, video):
+    box = window.panel.video_fps
+    assert [box.itemText(i) for i in range(box.count())] == ["Original", "120 fps", "60 fps", "30 fps"]
+    assert box.currentText() == "Original"
+    window.add_paths([str(video)])
+    assert wait(lambda: window._facts is not None and window._facts["final"], 120)
+    analysis = window.backend.analysis
+    box.setCurrentText("30 fps")
+    assert window.options.video_fps == 30
+    settle(0.6)
+    assert window.backend.analysis is analysis and window._facts["final"], "no new analysis for a frame rate"
+    stages = []
+    window.backend.item_progress.connect(lambda index, stage, done, total: stages.append(stage))
+    window.bar.convert.click()
+    assert wait(lambda: idle(window), 180)
+    assert window.queue.items[0].state == "done" and set(stages) == {"render"}
+    written = len(clips.describe(video.with_name("clip_SDR.mp4"))["pts_s"])
+    assert 0 < written < 24, "fewer frames than the recording has"
+
+
+def test_motion_blur_is_offered_at_a_lower_frame_rate_and_shown_by_the_preview(window, video):
+    from hdr_blaster.video.job import exposure_of, frames_to_keep
+
+    panel = window.panel
+    assert not panel.video_blur.isEnabled() and not panel.video_blur.isChecked()
+    window.add_paths([str(video)])
+    assert wait(lambda: window._facts is not None and window._facts["final"], 120)
+    panel.video_fps.setCurrentText("30 fps")
+    assert panel.video_blur.isEnabled()
+    analysis = window.backend.analysis
+    keep = frames_to_keep(analysis.times, 30.0, analysis.info.average_rate)
+    cuts = set(analysis.cuts)
+    first = next(i for i in range(3, len(keep)) if keep[i] and exposure_of(keep, cuts, i)[1] > 1)
+    # put the timeline on that picture: a frame it is made of
+    window.timeline.setValue(int(1000 * analysis.times[first] / window._facts["duration_s"]) + 1)
+    assert wait(lambda: analysis.index_of(window.backend._source.pts) in (first, first + 1), 60)
+    settle(0.6)
+    assert wait(lambda: window._facts["final"], 120)
+    sharp = after_bytes(window)
+    panel.video_blur.click()
+    assert window.options.video_blur is True
+    assert wait(lambda: window._facts["final"] and after_bytes(window) != sharp, 120), "the preview blurs too"
+    assert window.backend.analysis is analysis, "no new analysis for it"
+    panel.video_fps.setCurrentText("Original")
+    assert not panel.video_blur.isEnabled()
+    assert wait(lambda: window._facts["final"] and after_bytes(window) == sharp, 120), \
+        "at the original rate nothing is added up, whatever the switch says"
+
+
 def test_converting_a_video_reuses_the_analysis(window, video):
     window.add_paths([str(video)])
     assert wait(lambda: window._facts is not None and window._facts.get("final"), 120)
@@ -242,6 +311,69 @@ def test_the_advanced_panel_slides_in_without_covering_the_picture_or_the_button
     settle(0.4)
     assert not window.panel.isVisible()
     assert window.viewer.picture_rect().width() == pytest.approx(full_width, abs=1)
+
+
+@needs_capture
+def test_a_click_in_the_advanced_panel_never_moves_the_divider(window, capture):
+    """The panel lives in the picture area. A click on its ground, on a label or beside a
+    control went through to the picture and threw the divider to the right edge."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QLabel
+
+    window.add_paths([str(capture)])
+    assert wait(lambda: window.viewer.has_picture())
+    window.advanced_button.click()
+    settle(0.4)
+    window.viewer.set_split(0.4)
+    panel = window.panel
+    labels = {label.text(): label for label in panel.findChildren(QLabel)}
+    targets = {"the panel's ground": (panel, QPoint(panel.width() // 2, 10)),
+               "a control's name": (labels["Exposure"], labels["Exposure"].rect().center()),
+               "a section's name": (labels["Output"], labels["Output"].rect().center()),
+               "a slider's value": (panel.exposure_value, panel.exposure_value.rect().center())}
+    for what, (widget, point) in targets.items():
+        QTest.mouseClick(widget, Qt.LeftButton, Qt.NoModifier, point)
+        QTest.mouseDClick(widget, Qt.LeftButton, Qt.NoModifier, point)
+        assert window.viewer.split == 0.4, f"a click on {what} moved the divider"
+        assert not window.viewer._dragging, f"a click on {what} started a drag of the divider"
+    # the picture itself still answers
+    rect = window.viewer.picture_rect()
+    QTest.mouseClick(window.viewer, Qt.LeftButton, Qt.NoModifier,
+                     QPoint(round(rect.left() + rect.width() * 0.25), round(rect.center().y())))
+    assert window.viewer.split == pytest.approx(0.25, abs=0.01)
+
+
+def test_the_chosen_look_is_a_pill_that_follows_the_choice(window):
+    from PySide6.QtCore import QRectF
+
+    looks = window.bar.looks
+    settle(0.3)
+    assert looks._choice._shown == QRectF(looks.buttons["Faithful"].geometry())
+    looks.buttons["Golden"].click()
+    settle(0.4)                                             # the pill glides, then rests on the choice
+    assert looks._choice._shown == QRectF(looks.buttons["Golden"].geometry())
+    window.panel.operator.setCurrentText("Hable")           # an operator replaces the looks: no pill
+    settle(0.2)
+    assert looks.look() is None and looks._choice._shown is None
+
+
+def test_a_switch_answers_on_its_whole_row_and_a_click_leaves_no_focus_ring(window):
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QAbstractButton
+
+    window.toggle_advanced(True)
+    settle(0.4)
+    switch = window.panel.show_histogram
+    assert not switch.isChecked()
+    QTest.mouseClick(switch, Qt.LeftButton, Qt.NoModifier, QPoint(switch.width() - 6, switch.height() // 2))
+    assert switch.isChecked() and window.options.show_histogram, "the switch itself"
+    QTest.mouseClick(switch, Qt.LeftButton, Qt.NoModifier, QPoint(4, switch.height() // 2))
+    assert not switch.isChecked(), "its name"
+    # A button shows its focus ring to the keyboard only: a click must not leave one behind.
+    for button in window.findChildren(QAbstractButton):
+        assert button.focusPolicy() == Qt.TabFocus, f"'{button.text() or button.accessibleName()}' keeps the focus after a click"
 
 
 def test_settings_are_remembered_between_sessions(qapp, tmp_path):

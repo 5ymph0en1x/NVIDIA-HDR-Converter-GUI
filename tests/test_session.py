@@ -28,6 +28,21 @@ def test_defaults_are_the_applications_usual_settings():
     assert (video.quality, video.out_height, video.pre_gamma, video.exposure) == ("high", None, 1.0, 1.0)
 
 
+def test_a_video_takes_sharpness_and_ai_colour_only_when_asked():
+    """Without them nothing is measured on a video's pictures: its analysis is about twice
+    as fast. A capture always takes them."""
+    chosen = Options(sharpness=40.0, ai_color=30.0)
+    capture, video = chosen.render_settings(), chosen.video_settings().render
+    assert (capture.edge_strength, capture.color_strength) == (40.0, 30.0)
+    assert (video.edge_strength, video.color_strength) == (0.0, 0.0)
+    assert chosen.render_settings("video") == video and video.method == capture.method
+    asked = Options(sharpness=40.0, ai_color=30.0, video_enhance=True)
+    assert asked.video_settings().render == asked.render_settings()
+    assert asked.picture_key() != chosen.picture_key(), "the preview of a video changes with it"
+    assert Options.from_dict(asked.to_dict()).video_enhance is True
+    assert Options.from_dict({"video_enhance": "maybe"}).video_enhance is False
+
+
 def test_the_four_looks_map_to_engine_operators():
     assert session.LOOKS == {"Faithful": "faithful", "Natural": "natural", "Punchy": "punchy",
                              "Golden": "golden"}
@@ -61,6 +76,31 @@ def test_output_description_is_plain_english():
     assert session.describe_output("image", Options(image_format="Both")) == "JPEG and TIFF, next to the source"
     assert session.describe_output("video", Options(video_height=1080, destination="D:/exports")) == \
         "MP4, high quality, 1080p, exports"
+    assert session.describe_output("video", Options(video_fps=60)) == \
+        "MP4, high quality, original size, 60 fps at most, next to the source"
+
+
+def test_the_frame_rate_of_a_video_is_original_120_60_or_30():
+    assert session.VIDEO_FRAME_RATES == (0, 120, 60, 30)
+    assert Options().video_settings().frame_rate is None, "every frame, unless asked otherwise"
+    assert Options(video_fps=60).video_settings().frame_rate == 60.0
+    assert Options.from_dict({"video_fps": "30"}).video_fps == 30
+    assert Options.from_dict({"video_fps": 45}).video_fps == 0
+    assert Options(video_fps=30).picture_key() == Options().picture_key(), "the pictures are the same ones"
+    assert Options(video_fps=30).video_settings().render == Options().video_settings().render
+
+
+def test_motion_blur_goes_with_a_lower_frame_rate():
+    assert Options().video_settings().motion_blur is False
+    assert Options(video_fps=30, video_blur=True).video_settings().motion_blur is True
+    assert Options(video_blur=True).video_settings().motion_blur is False, "nothing to add up at the original rate"
+    blurred = Options(video_fps=30, video_blur=True)
+    assert blurred.picture_key() != Options(video_fps=30).picture_key(), "the pictures change"
+    assert blurred.picture_key() != Options(video_fps=60, video_blur=True).picture_key()
+    assert Options(video_blur=True).picture_key() == Options().picture_key()
+    assert session.describe_output("video", blurred) == \
+        "MP4, high quality, original size, 30 fps at most, motion blur, next to the source"
+    assert Options.from_dict(blurred.to_dict()) == blurred
 
 
 # ---------------------------------------------------------------------- queue

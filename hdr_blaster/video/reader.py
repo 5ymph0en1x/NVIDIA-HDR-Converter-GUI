@@ -1,4 +1,10 @@
-"""Reading HDR10 video with PyAV: what the file is, and its frames as GPU planes."""
+"""Reading HDR10 video with PyAV: what the file is, and its frames as GPU planes.
+
+Frames are decoded by the graphics card when it can (NVDEC: several times faster than the
+processor on AV1 and HEVC) and by the processor otherwise. Both give the same code values:
+decoding these formats is exact by specification, and the tests compare the two.
+"""
+import logging
 import os
 from dataclasses import dataclass
 from fractions import Fraction
@@ -23,6 +29,11 @@ _PRIMARIES_NAMES = {1: "BT.709", 2: "unspecified", 5: "BT.601", 6: "BT.601", 9: 
 
 class UnsupportedVideo(Exception):
     """The file cannot be converted. The message is written for the user."""
+
+
+class HardwareDecodingFailed(Exception):
+    """The graphics card stopped decoding part of the way through a file. The format is
+    marked as one it does not decode: reading the file again uses the processor."""
 
 
 @dataclass(frozen=True)
@@ -52,9 +63,9 @@ class Frame:
     index: int
     pts: int                      # in VideoInfo.time_base units
     time_s: float
-    y: torch.Tensor               # (H, W) integer code values, on the requested device
-    u: torch.Tensor               # (H/2, W/2)
-    v: torch.Tensor
+    y: Optional[torch.Tensor]     # (H, W) integer code values, on the requested device
+    u: Optional[torch.Tensor]     # (H/2, W/2)
+    v: Optional[torch.Tensor]     # all three None for a frame that was decoded but not asked for
 
 
 def probe(path) -> VideoInfo:
@@ -125,6 +136,113 @@ def check_supported(info: VideoInfo) -> None:
         raise UnsupportedVideo(f"{name} has odd dimensions ({info.width}x{info.height}).")
 
 
+# FFmpeg's NVDEC decoders, by the name of the decoder a stream opens with by default.
+_NVDEC = {"av1": "av1_cuvid", "libdav1d": "av1_cuvid", "libaom-av1": "av1_cuvid", "hevc": "hevc_cuvid"}
+_SOFTWARE_THREADS = 32             # FFmpeg's own default leaves a third of the speed unused
+_hardware_checked = {}             # (decoder, width, height, pixel format) -> does NVDEC decode it?
+
+
+def _open_hardware(stream):
+    """An opened NVDEC decoder for this stream, fed with its packets by hand; None when
+    FFmpeg has none for the format."""
+    source = stream.codec_context
+    name = _NVDEC.get(source.name)
+    if name is None or name not in av.codecs_available:
+        return None
+    decoder = av.CodecContext.create(name, "r")
+    if source.extradata:
+        decoder.extradata = source.extradata
+    decoder.width, decoder.height, decoder.pix_fmt = source.width, source.height, source.pix_fmt
+    decoder.open()
+    return decoder
+
+
+def _kind(stream) -> tuple:
+    source = stream.codec_context
+    return source.name, source.width, source.height, source.pix_fmt
+
+
+def _first_frame(path, hardware: bool):
+    """(timestamp, y, u, v) of the first frame shown, in main memory; None when the
+    graphics card has no decoder for the format."""
+    with av.open(path) as container:
+        stream = container.streams.video[0]
+        decoder = _open_hardware(stream) if hardware else None
+        if hardware and decoder is None:
+            return None
+        for packet in container.demux(stream):
+            for frame in (decoder.decode(packet) if hardware else packet.decode()):
+                return (frame.pts,) + tuple(_Planes(frame.height, frame.width, "cpu")(frame))
+    raise ValueError("no frame")
+
+
+def hardware_decoding(path) -> bool:
+    """True when the graphics card decodes this file, and decodes it as the processor does.
+
+    Tried for real, once per kind of stream: the first frame is decoded both ways and must
+    come out with the same timestamp and the same code values. No NVIDIA card, an old
+    driver, a format the card does not know or reads differently all end here, and the
+    processor decodes instead."""
+    path = os.fspath(path)
+    with av.open(path) as container:
+        key = _kind(container.streams.video[0])
+    if key not in _hardware_checked:
+        try:
+            fast = _first_frame(path, hardware=True)
+            usable = fast is not None
+            if usable:
+                plain = _first_frame(path, hardware=False)
+                usable = fast[0] == plain[0] and fast[0] is not None and all(
+                    a.shape == b.shape and torch.equal(a, b) for a, b in zip(fast[1:], plain[1:]))
+                if not usable:
+                    logging.warning(f"NVDEC does not decode {key[0]} {key[1]}x{key[2]} as the processor does; "
+                                    "decoding on the processor")
+        except Exception as exc:
+            usable = False
+            logging.info(f"NVDEC not available for {key[0]}, decoding on the processor: {exc}")
+        _hardware_checked[key] = usable
+    return _hardware_checked[key]
+
+
+class _Planes:
+    """Decoded frames -> integer code values on the device, through one reusable buffer
+    (page-locked for a GPU, so that the upload is a single fast copy)."""
+
+    def __init__(self, height: int, width: int, device):
+        self.height, self.width, self.device = height, width, torch.device(device)
+        self._buffer = torch.empty(height * width * 3 // 2, dtype=torch.int16)
+        if self.device.type == "cuda":
+            self._buffer = self._buffer.pin_memory()
+        self._view = self._buffer.numpy()
+
+    def __call__(self, frame):
+        height, width = self.height, self.width
+        half = (height // 2, width // 2)
+        name = frame.format.name
+        if name == "yuv420p10le":
+            shapes = ((height, width), half, half)
+        elif name == "p010le":                       # NVDEC: the two chroma planes interleaved
+            shapes = ((height, width), (height // 2, width))
+        else:
+            raise UnsupportedVideo(f"the decoder returned frames in {name}; only 10-bit 4:2:0 is supported.")
+        offset = 0
+        for plane, (rows, columns) in zip(frame.planes, shapes):
+            stored = np.frombuffer(plane, dtype=np.int16).reshape(rows, plane.line_size // 2)
+            self._view[offset:offset + rows * columns].reshape(rows, columns)[:] = stored[:, :columns]
+            offset += rows * columns
+        # A GPU gets its own copy by the upload; in main memory the buffer is reused for the
+        # next frame, so this one must leave it.
+        data = self._buffer.to(self.device) if self.device.type == "cuda" else self._buffer.clone()
+        luma, chroma = height * width, half[0] * half[1]
+        if name == "p010le":
+            # Ten bits at the top of sixteen. Through 32 bits, because the 16 are unsigned.
+            data = ((data.to(torch.int32) & 0xFFFF) >> 6).to(torch.int16)
+            both = data[luma:].view(half[0], half[1], 2)
+            return data[:luma].view(height, width), both[..., 0], both[..., 1]
+        return (data[:luma].view(height, width),
+                data[luma:luma + chroma].view(half), data[luma + chroma:].view(half))
+
+
 def planes_from_frame(frame, device):
     """(y, u, v) integer planes of a decoded 4:2:0 frame, on ``device``."""
     height, width = frame.height, frame.width
@@ -138,28 +256,60 @@ def planes_from_frame(frame, device):
             planes[luma + chroma:luma + 2 * chroma].view(height // 2, width // 2))
 
 
-def read_frames(path, device, on_packet: Optional[Callable] = None) -> Iterator[Frame]:
+def read_frames(path, device, on_packet: Optional[Callable] = None,
+                hardware: Optional[bool] = None,
+                wanted: Optional[Callable[[int], bool]] = None) -> Iterator[Frame]:
     """Decode every video frame in display order, planes moved to ``device``.
+
+    ``wanted(index)`` false: the frame is still decoded (the next ones depend on it) and
+    still comes out, in its place, but without its planes, which are not moved anywhere.
 
     Packets of the audio streams are handed to ``on_packet`` as they are read, so
     that a writer can copy them next to the frames, in step with the video.
+
+    ``hardware``: decode on the graphics card (NVDEC). By default it is used whenever the
+    frames go to a GPU and the card decodes the file; ``False`` keeps the processor.
     """
-    with av.open(os.fspath(path)) as container:
+    path = os.fspath(path)
+    if hardware is None:
+        hardware = torch.device(device).type == "cuda" and hardware_decoding(path)
+    with av.open(path) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
+        decoder = _open_hardware(stream) if hardware else None
+        if hardware and decoder is None:
+            raise UnsupportedVideo(f"{os.path.basename(path)} cannot be decoded by the graphics card.")
+        if decoder is None:
+            stream.thread_type = "AUTO"
+            stream.codec_context.thread_count = min(os.cpu_count() or 1, _SOFTWARE_THREADS)
+        logging.info(f"Decoding {os.path.basename(path)} with "
+                     f"{'the graphics card (NVDEC)' if decoder is not None else 'the processor'}")
         time_base = stream.time_base
-        wanted = [stream] + (list(container.streams.audio) if on_packet else [])
-        index = 0
-        for packet in container.demux(*wanted):
+        streams = [stream] + (list(container.streams.audio) if on_packet else [])
+        index, planes = 0, None
+        for packet in container.demux(*streams):
             if packet.stream.type != "video":
                 if packet.dts is not None:
                     on_packet(packet)
                 continue
-            for frame in packet.decode():
+            try:
+                frames = packet.decode() if decoder is None else decoder.decode(packet)
+            except av.EOFError:                      # the decoder was already emptied
+                break
+            except av.FFmpegError as exc:
+                if decoder is None:
+                    raise
+                _hardware_checked[_kind(stream)] = False
+                raise HardwareDecodingFailed(
+                    f"the graphics card stopped decoding {os.path.basename(path)} at frame {index}: {exc}") from exc
+            for frame in frames:
                 if frame.pts is None:
-                    raise UnsupportedVideo(
-                        f"{os.path.basename(os.fspath(path))} has frames without timestamps.")
-                y, u, v = planes_from_frame(frame, device)
+                    raise UnsupportedVideo(f"{os.path.basename(path)} has frames without timestamps.")
+                if wanted is not None and not wanted(index):
+                    y = u = v = None
+                else:
+                    if planes is None:
+                        planes = _Planes(frame.height, frame.width, device)
+                    y, u, v = planes(frame)
                 yield Frame(index=index, pts=frame.pts, time_s=float(frame.pts * time_base), y=y, u=u, v=v)
                 index += 1
 
@@ -168,20 +318,31 @@ def grab_frame(path, time_s: float, device) -> Frame:
     """The first frame shown at ``time_s`` or after it (the last frame when the time is past
     the end). Seeks to the previous key frame and decodes forward. ``index`` is -1: the
     position in the file is not known from a seek; match ``pts`` against an analysis."""
+    return grab_frames(path, time_s, 1, device)[0]
+
+
+def grab_frames(path, time_s: float, count: int, device) -> list:
+    """Like :func:`grab_frame`, with the frames that follow: ``count`` of them in all, fewer
+    when the file ends first."""
     with av.open(os.fspath(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         time_base = stream.time_base
         target = max(float(time_s), 0.0)
         container.seek(int(target / time_base), stream=stream, backward=True, any_frame=False)
-        chosen = None
+        found, last = [], None
         for frame in container.decode(stream):
             if frame.pts is None:
                 continue
-            chosen = frame
-            if float(frame.pts * time_base) >= target - 1e-6:
-                break
-        if chosen is None:
+            last = frame
+            if found or float(frame.pts * time_base) >= target - 1e-6:
+                found.append(frame)
+                if len(found) >= max(1, int(count)):
+                    break
+        if last is None:
             raise UnsupportedVideo(f"{os.path.basename(os.fspath(path))} has no frame to show.")
-        y, u, v = planes_from_frame(chosen, device)
-        return Frame(index=-1, pts=chosen.pts, time_s=float(chosen.pts * time_base), y=y, u=u, v=v)
+        out = []
+        for frame in found or [last]:
+            y, u, v = planes_from_frame(frame, device)
+            out.append(Frame(index=-1, pts=frame.pts, time_s=float(frame.pts * time_base), y=y, u=u, v=v))
+        return out

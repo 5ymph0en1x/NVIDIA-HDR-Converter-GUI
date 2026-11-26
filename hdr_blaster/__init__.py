@@ -5,7 +5,7 @@ Importing the package has no side effect. Entry points (the GUI, the CLI) call
 """
 import logging
 
-__version__ = "3.0.0"
+__version__ = "3.0.2"
 
 _configured = False
 

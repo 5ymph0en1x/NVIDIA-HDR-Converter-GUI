@@ -1,6 +1,6 @@
 # NVIDIA HDR Converter GUI — HDR Blaster
 
-**Version 3.0.0**
+**Version 3.0.2**
 
 Convert NVIDIA HDR captures to SDR: JXR screenshots to JPEG or TIFF, and HDR10 recordings to
 H.264 video, in one window. Version 3 of *NVIDIA HDR Converter GUI* is a new application,
@@ -9,6 +9,24 @@ called HDR Blaster; `NHC.py` still starts it.
 <p align="center">
   <img width="1024" src="docs/screenshot.png">
 </p>
+
+## What's new in 3.0.2
+
+- **Videos convert about three times faster, and write the same pictures.** They are
+  decoded by the graphics card (NVDEC), and decoding, rendering and encoding run side by
+  side. A one-minute 1440p recording at 120 frames per second took 5.9 minutes; it takes about 1.8.
+- **Frame rate**: Original, 120, 60 or 30 frames per second. Frames are dropped, never
+  invented: the ones that stay are the very ones the full conversion writes, with their own
+  timestamps. The same recording takes 1.2 minutes at 60 and 1 minute at 30.
+- **Motion blur at a lower frame rate**, if you ask for it: each frame written holds the
+  light of the frames it replaces, added up in the scene's linear light as a longer exposure
+  adds it. Motion is smoother and softer, and nothing is invented. (Textures blur as a camera
+  blurs them; a sharp edge that crosses the picture fast shows as two or four stepped copies
+  rather than one streak: the recording holds no picture between two of its frames.)
+- **Videos are no longer sharpened unless asked** (*Sharpness and AI colour on videos*, in
+  Advanced): nothing is then measured on their pictures, and they are analysed twice as fast.
+- From 3.0.1: refined controls (pills, a segmented choice of looks, switches), and a click
+  in the Advanced panel no longer moves the divider.
 
 ## What's new in 3.0.0
 
@@ -31,6 +49,8 @@ called HDR Blaster; `NHC.py` still starts it.
 ### Core functionality
 - **JXR captures** (HDR screenshots) to JPEG and/or TIFF
 - **HDR10 recordings** to H.264 SDR video, never heavier than the source
+- **Video on the graphics card from end to end**: decoded by NVDEC, rendered, encoded by
+  NVENC, the three side by side. Without an NVIDIA card the processor decodes and encodes
 - **Looks and operators** that keep what the game decided (see *Renderings*)
 - **Batch processing**: several files or a folder, in a queue
 - **The HDR source shown in real HDR.** On a display with HDR switched on, the picture area
@@ -86,6 +106,11 @@ above the shadows.
 - **The source view is the original**: Exposure and Gamma shape the result only
 - **Queue** for several captures and recordings, progress and cancel on the one button
 - **Exact video preview** once the recording has been analysed in the background
+- **Frame rate of a video**: Original, 120, 60 or 30 frames per second, in Advanced, with
+  motion blur made of the dropped frames if you switch it on
+- **Videos are neither sharpened nor AI-coloured unless asked**: nothing is then measured on
+  their pictures and the analysis is about twice as fast. *Sharpness and AI colour on videos*,
+  in Advanced, applies both to videos as to captures
 - **Nothing is ever overwritten**: results are written as `<name>_SDR`, numbered if needed
 
 ## Requirements
@@ -158,7 +183,7 @@ AI colour, formats, video quality and size, destination folder, GPU or CPU) is i
 
 ```bash
 python NHC.py --convert capture.jxr [--method punchy] [--format JPEG|TIFF|Both]
-python NHC.py --convert-video recording.mp4 [--method punchy] [--quality high|balanced|compact] [--height 1080]
+python NHC.py --convert-video recording.mp4 [--method punchy] [--quality high|balanced|compact] [--height 1080] [--fps 60] [--blur]
 python NHC.py --version
 ```
 
@@ -167,14 +192,20 @@ an operator) and write `<name>_SDR` next to the source, never over an existing f
 
 Videos: HDR10 (PQ, BT.2020, 10-bit) recordings are converted to H.264 SDR with the
 source's own timestamps and its audio copied untouched. The result is never heavier
-than the source.
+than the source. A video takes no sharpening and no AI colour unless `--edge` or `--color`
+ask for them (the analysis then renders every frame, and takes about twice as long).
+`--fps` writes at most that many frames per second: for each tick of that clock the nearest
+frame of the recording is kept, with its own timestamp; the others are left out, or, with
+`--blur`, their light is added to the frame that replaces them (never across two shots).
 
 ## Technical architecture
 
 ### Processing pipeline
 1. **Decoding**: a JXR capture (floating-point scRGB) or a frame of an HDR10 recording
 2. **Rendering** with the chosen look or operator (**Faithful** by default); a video is
-   analysed first, so that its measured parameters are steady within each shot
+   analysed first, so that its measured parameters are steady within each shot. Decoding,
+   computing and encoding run side by side; the fast path writes the very pictures of the
+   plain one (`reference=True` in `hdr_blaster/video/job.py`), which the tests compare
 3. **AI colour retouch** (optional) via the image-adaptive 3D LUT
 4. **Edge enhancement** (optional)
 5. **sRGB conversion**, dithering, and JPEG/TIFF or H.264 encoding
@@ -230,10 +261,11 @@ that reads back what the HDR surface presents.
 - **Windows**: built and tested on Windows with an NVIDIA GPU; the CPU path works but is slow
 - **Real HDR display of the source** needs Windows with HDR switched on for the screen the
   window is on; elsewhere the source is shown cut at the window's white
-- **Video speed**: about 20 frames per second at 1440p on an RTX 4090
+- **Video speed**: a one-minute 1440p recording at 120 frames per second (7,142 frames) converts in about 1.8 minutes on an RTX 4090 (analysis 190 frames per second, rendering and
+  encoding 110), 2.4 minutes with sharpening, 1.2 minutes at 60 frames per second and 1 minute at 30
 
 ## Troubleshooting
-- **CUDA out of memory**: tick *Half precision* or untick the GPU in the Advanced panel
+- **CUDA out of memory**: switch on *Half precision*, or switch off *Use the graphics card*, in the Advanced panel
 - **A capture is refused**: only floating-point JXR captures (HDR screenshots) are accepted
 - **A video is refused**: only HDR10 (PQ, BT.2020) recordings are accepted
 

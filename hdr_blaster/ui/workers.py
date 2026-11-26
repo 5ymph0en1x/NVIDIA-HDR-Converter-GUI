@@ -22,7 +22,7 @@ from PySide6.QtCore import QCoreApplication, QObject, Signal, Slot
 from .. import preview
 from ..display import sdr_white_nits
 from ..session import Engines, Item, Options, convert_item
-from ..video.job import Cancelled, analyse_video
+from ..video.job import Cancelled, analyse_video, exposure_of, frames_to_keep
 from ..video.reader import UnsupportedVideo
 
 
@@ -46,6 +46,8 @@ class Backend(QObject):
         self.closing = False
         self._source = None
         self._source_key = None
+        self._light = None                 # motion blur: the light of the frames a picture stands for
+        self._light_key = None
         self.analysis = None
         self._pending = deque()
         self._busy = False
@@ -75,13 +77,25 @@ class Backend(QObject):
                 self._source_key = key
             self._source.pre_gamma, self._source.exposure = chosen.pre_gamma, chosen.exposure
             preview.fit(self._source, box=(int(box[0]), int(box[1])))
-            source, params, final = self._source, None, kind == "image"
+            source, params, final, light = self._source, None, kind == "image", None
             analysis = self.analysis
-            if kind == "video" and analysis is not None and analysis.src == path \
-                    and analysis.matches(chosen.video_settings()):
-                params = analysis.params[analysis.index_of(source.pts)]
+            video = chosen.video_settings() if kind == "video" else None
+            if video is not None and analysis is not None and analysis.src == path and analysis.matches(video):
+                index = analysis.index_of(source.pts)
+                keep = frames_to_keep(analysis.times, video.frame_rate, analysis.info.average_rate)
+                if video.motion_blur and not all(keep):
+                    # The file will show, at this moment, the picture of the kept frame before
+                    # it, made of the light of the frames that picture stands for.
+                    index, count = exposure_of(keep, set(analysis.cuts), index)
+                    key = (path, index, count, device.type)
+                    if key != self._light_key:
+                        self._light = preview.blended_light(path, analysis.times[index], count, device,
+                                                            analysis.info)
+                        self._light_key = key
+                    light = self._light
+                params = analysis.params[index]
                 final = True
-            after = preview.render_preview(engine, source, chosen.render_settings(), params)
+            after = preview.render_preview(engine, source, chosen.render_settings(kind), params, light=light)
             facts = {"kind": kind, "path": path, "width": source.width, "height": source.height,
                      "time_s": source.time_s, "duration_s": source.duration_s, "final": final,
                      "method": source.method if final else None,

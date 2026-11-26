@@ -43,7 +43,8 @@ def tonemap_srgb(tone_mapper, loader, linear: torch.Tensor, method: str,
 
 
 def render(tone_mapper, loader, processor, linear: torch.Tensor, settings: RenderSettings,
-           params: Optional[RenderParams] = None) -> Tuple[torch.Tensor, RenderParams]:
+           params: Optional[RenderParams] = None, release_cache: bool = True
+           ) -> Tuple[torch.Tensor, RenderParams]:
     """Full conversion of one image. Returns ``(sRGB tensor, parameters used)``.
 
     Without ``params`` the image is measured as it is rendered (a photo): the
@@ -66,8 +67,25 @@ def render(tone_mapper, loader, processor, linear: torch.Tensor, settings: Rende
         use_enhancement=settings.use_enhancement,
         params=params,
         keep_levels=tone_mapper.keeps_scene_levels(params.method),
+        release_cache=release_cache,
     )
     return enhanced, params
+
+
+def measure(tone_mapper, loader, processor, linear: torch.Tensor, settings: RenderSettings,
+            release_cache: bool = True) -> RenderParams:
+    """What :func:`render` would measure on this image, value for value, without making the
+    picture when nothing is measured on the picture.
+
+    That is the case of a look or a classical operator with neither sharpening nor AI
+    colour: all it measures is the scene's peak. Everything else is rendered in full, as
+    before. ``settings.method`` must be chosen already (a video's is)."""
+    if settings.method is not None and not processor.measures(
+            settings.color_strength, settings.edge_strength, settings.use_enhancement):
+        params = RenderParams(method=canonical(settings.method))
+        if tone_mapper.measure_only(linear, params.method, params, settings.white_nits):
+            return params
+    return render(tone_mapper, loader, processor, linear, settings, release_cache=release_cache)[1]
 
 
 def analyze(tone_mapper, loader, processor, linear: torch.Tensor,

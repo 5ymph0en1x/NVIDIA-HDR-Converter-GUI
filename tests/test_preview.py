@@ -77,9 +77,9 @@ def test_one_analysis_serves_several_encodes_without_measuring_again(clip, devic
     analysis = analyse_video(path, settings(), device, engine=video_engine)
     calls, real = [], job.render
 
-    def spy(tone_mapper, loader, processor, linear, render_settings, params=None):
+    def spy(tone_mapper, loader, processor, linear, render_settings, params=None, **kwargs):
         calls.append(params is not None and params.frozen)
-        return real(tone_mapper, loader, processor, linear, render_settings, params=params)
+        return real(tone_mapper, loader, processor, linear, render_settings, params=params, **kwargs)
 
     monkeypatch.setattr(job, "render", spy)
     render_video(analysis, tmp_path / "high.mp4", settings(quality="high"), device, engine=video_engine)
@@ -387,3 +387,41 @@ def test_for_display_reduces_light_as_light_adds_up(device):
     assert preview.for_display(checker, (64, 64)) is checker
     large = preview.for_display(checker, (96, 96))
     assert large.shape == (1, 3, 96, 96) and float(large.min()) >= 0.0 and float(large.max()) <= 1.0
+
+
+def test_the_preview_of_a_blurred_video_is_the_picture_the_conversion_writes(clip, device, video_engine,
+                                                                            tmp_path, monkeypatch):
+    """With motion blur the result is made of several frames. The preview adds up the same
+    light the same way: what it shows is, value for value, what the file will hold."""
+    from hdr_blaster.video.job import exposure_of, frames_to_keep
+
+    path, _ = clip
+    chosen = VideoSettings(render=RenderSettings(method="faithful", white_nits=300.0),
+                           frame_rate=15.0, motion_blur=True)
+    analysis = analyse_video(path, chosen, device, engine=video_engine)
+    written, real = [], job.render
+
+    def spy(tone_mapper, loader, processor, linear, render_settings, params=None, **kwargs):
+        out = real(tone_mapper, loader, processor, linear, render_settings, params=params, **kwargs)
+        if params is not None and params.frozen:
+            written.append(out[0].clone())
+        return out
+
+    monkeypatch.setattr(job, "render", spy)
+    render_video(analysis, tmp_path / "blur.mp4", chosen, device, engine=video_engine)
+    monkeypatch.setattr(job, "render", real)
+
+    keep = frames_to_keep(analysis.times, 15.0, analysis.info.average_rate)
+    kept = [i for i, k in enumerate(keep) if k]
+    cuts = set(analysis.cuts)
+    n = next(n for n, i in enumerate(kept) if n > 1 and exposure_of(keep, cuts, i)[1] > 1)
+    first, count = exposure_of(keep, cuts, kept[n])
+    # the timeline stands on the last frame this picture replaces
+    source = preview.load_video_frame(path, analysis.times[first + count - 1], device, max_side=4096,
+                                      white_nits=300.0)
+    assert exposure_of(keep, cuts, analysis.index_of(source.pts)) == (first, count)
+    light = preview.blended_light(path, analysis.times[first], count, device, analysis.info)
+    after = preview.render_preview(video_engine, source, chosen.render, analysis.params[first], light=light)
+    assert torch.equal(after, written[n])
+    alone = preview.render_preview(video_engine, source, chosen.render, analysis.params[first])
+    assert not torch.equal(alone, after), "the frame by itself is another picture"

@@ -70,7 +70,7 @@ def _cli_convert_video(argv) -> int:
     """Headless video conversion.
 
         NHC.py --convert-video INPUT.mp4 [--out OUTPUT.mp4] [--method punchy]
-               [--quality high|balanced|compact] [--height 1080] [--color 0] [--edge 25]
+               [--quality high|balanced|compact] [--height 1080] [--fps 60] [--blur] [--color 0] [--edge 0]
 
     Without --out the result is written next to the source as INPUT_SDR.mp4 (never
     overwriting). Returns an exit code: 0 done, 2 unsupported input, 1 other failure.
@@ -86,8 +86,13 @@ def _cli_convert_video(argv) -> int:
                         help="what SDR white stands for, in nits, for --method faithful (default: this screen's)")
     parser.add_argument("--quality", default="high", choices=["high", "balanced", "compact"])
     parser.add_argument("--height", type=int, default=None, help="scale down to this height, e.g. 1080")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="write at most this many frames per second, e.g. 60 (frames are dropped, never invented)")
+    parser.add_argument("--blur", action="store_true",
+                        help="with --fps: motion blur, each frame holding the light of the frames it replaces")
     parser.add_argument("--color", type=float, default=0.0, help="AI Color (3D LUT) strength 0-100")
-    parser.add_argument("--edge", type=float, default=25.0, help="Sharpness 0-100")
+    parser.add_argument("--edge", type=float, default=0.0,
+                        help="Sharpness 0-100 (default 0: with it or --color the analysis is about twice as long)")
     args = parser.parse_args(argv)
     configure_runtime()
 
@@ -100,7 +105,7 @@ def _cli_convert_video(argv) -> int:
         render=RenderSettings(method=None if args.method == "auto" else args.method,
                               color_strength=args.color, edge_strength=args.edge,
                               white_nits=args.white or _screen_white()),
-        quality=args.quality, out_height=args.height)
+        quality=args.quality, out_height=args.height, frame_rate=args.fps, motion_blur=args.blur)
     last = {"stage": None, "tenth": -1}
 
     def progress(stage, done, total):

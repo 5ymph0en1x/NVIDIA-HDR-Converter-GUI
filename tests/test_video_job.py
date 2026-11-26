@@ -3,6 +3,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import av
@@ -78,11 +79,13 @@ def test_every_frame_is_measured_once_then_replayed_frozen(clip, device, video_e
     calls = []
     real = job.render
 
-    def spy(tone_mapper, loader, processor, linear, render_settings, params=None):
+    def spy(tone_mapper, loader, processor, linear, render_settings, params=None, **kwargs):
         calls.append("replay" if params is not None and params.frozen else "record")
-        return real(tone_mapper, loader, processor, linear, render_settings, params=params)
+        return real(tone_mapper, loader, processor, linear, render_settings, params=params, **kwargs)
 
+    from hdr_blaster.engine import pipeline
     monkeypatch.setattr(job, "render", spy)
+    monkeypatch.setattr(pipeline, "render", spy)       # the analysis reaches it through measure()
     convert_video(clip, tmp_path / "out.mp4", settings(method="perceptual"), device, engine=video_engine)
     # one recording pass, then replays only (a second encode may replay them again)
     assert calls[:40] == ["record"] * 40
@@ -100,6 +103,62 @@ def test_downscaling_gives_even_dimensions(clip, device, video_engine, tmp_path)
     out = clips.describe(tmp_path / "small.mp4")
     assert (out["width"], out["height"]) == (160, 90) == (report.width, report.height)
     assert len(out["pts_s"]) == 40
+
+
+# ------------------------------------------------------- measuring without rendering
+
+ALL_METHODS = ["faithful", "natural", "punchy", "golden", "reinhard", "hable", "aces", "drago03",
+               "perceptual", "mantiuk06", "adaptive", "neural", "filmic", "agx_punchy"]
+
+
+@pytest.mark.parametrize("rendering", ALL_METHODS)
+@pytest.mark.parametrize("edge, colour", [(0.0, 0.0), (25.0, 0.0), (0.0, 40.0)])
+def test_measuring_alone_finds_exactly_what_a_full_render_measures(clip, device, video_engine, rendering, edge, colour):
+    """The light analysis must not be an approximation: same keys, same values, bit for bit."""
+    from hdr_blaster.engine.pipeline import measure, render
+    from hdr_blaster.video.colour import yuv_to_engine
+    from hdr_blaster.video.reader import read_frames
+
+    chosen = RenderSettings(method=rendering, edge_strength=edge, color_strength=colour, white_nits=300.0)
+    info = probe(clip)
+    engine = video_engine
+    with torch.inference_mode():
+        for frame in read_frames(clip, device):
+            if frame.index % 13:
+                continue
+            linear = yuv_to_engine(frame.y, frame.u, frame.v, info.fmt)
+            full = render(engine.tone_mapper, engine.loader, engine.processor, linear, chosen)[1]
+            light = measure(engine.tone_mapper, engine.loader, engine.processor, linear, chosen)
+            assert light.method == full.method and not light.frozen
+            assert sorted(light.stats) == sorted(full.stats)
+            for key, value in full.stats.items():
+                if torch.is_tensor(value):
+                    assert torch.equal(light.stats[key], value), f"{key} differs for {rendering}"
+                else:
+                    assert light.stats[key] == value, f"{key} differs for {rendering}"
+
+
+def test_without_sharpening_or_ai_colour_the_analysis_renders_nothing(clip, device, video_engine, monkeypatch):
+    from hdr_blaster.engine import pipeline
+    from hdr_blaster.video.job import analyse_video
+
+    rendered = []
+    real = pipeline.render
+    monkeypatch.setattr(pipeline, "render", lambda *a, **k: rendered.append(1) or real(*a, **k))
+    plain = VideoSettings(render=RenderSettings(method="punchy", edge_strength=0.0))
+    analysis = analyse_video(clip, plain, device, engine=video_engine)
+    assert rendered == [] and all(sorted(p.stats) == ["scene.peak"] for p in analysis.params)
+    sharp = VideoSettings(render=RenderSettings(method="punchy", edge_strength=25.0))
+    analyse_video(clip, sharp, device, engine=video_engine)
+    assert len(rendered) == 40, "with sharpening the edge maximum is measured on the rendered picture"
+
+
+def test_a_video_never_gives_the_gpu_memory_back_between_frames(clip, device, video_engine, tmp_path, monkeypatch):
+    """Emptying the cache after every frame cost about 7 ms per frame and per pass."""
+    flushed = []
+    monkeypatch.setattr(video_engine.processor, "clear_gpu_memory", lambda: flushed.append(1))
+    convert_video(clip, tmp_path / "out.mp4", settings(), device, engine=video_engine)
+    assert flushed == []
 
 
 # ------------------------------------------------------------------ stability
@@ -361,3 +420,363 @@ def test_a_faithful_video_shows_each_frame_at_the_scenes_luminance(clip, device,
     assert float((after - source.before).abs().amax(1)[below].max()) < 1.0 / 255
     report = convert_video(clip, tmp_path / "faithful.mp4", chosen, device, engine=video_engine)
     assert report.method == "faithful" and report.frames == 40
+
+
+# ------------------------------------------------ the fast way against the plain way
+
+def decoded(path):
+    """Every picture of a file as a player decodes it, with its timestamp."""
+    with av.open(str(path)) as container:
+        return [(frame.pts, frame.to_ndarray()) for frame in container.decode(video=0)]
+
+
+@pytest.mark.parametrize("rendering, edge, colour", [
+    ("faithful", 0.0, 0.0),        # the default for a video: analysed without rendering
+    ("punchy", 25.0, 0.0),         # sharpening: every frame rendered when analysed
+    ("golden", 0.0, 40.0),         # AI colour
+    ("neural", 0.0, 0.0),          # the learned rendering measures on the picture
+    (None, 0.0, 0.0),              # Auto-detect: one more pass
+])
+def test_the_fast_way_writes_the_pictures_of_the_plain_way(clip, device, video_engine, tmp_path,
+                                                          rendering, edge, colour):
+    """Decoding on the graphics card, the stages side by side, the analysis that does not
+    render: none of it may change one pixel. ``reference=True`` is the plain way."""
+    from hdr_blaster.video.job import analyse_video
+
+    chosen = VideoSettings(render=RenderSettings(method=rendering, edge_strength=edge,
+                                                 color_strength=colour, white_nits=300.0))
+    plain = analyse_video(clip, chosen, device, engine=video_engine, reference=True)
+    fast = analyse_video(clip, chosen, device, engine=video_engine)
+    assert (fast.method, fast.cuts, fast.pts, fast.times) == (plain.method, plain.cuts, plain.pts, plain.times)
+    for a, b in zip(fast.params, plain.params):
+        assert sorted(a.stats) == sorted(b.stats)
+        for key, value in b.stats.items():
+            same = torch.equal(a.stats[key], value) if torch.is_tensor(value) else a.stats[key] == value
+            assert same, f"{key} differs"
+
+    convert_video(clip, tmp_path / "plain.mp4", chosen, device, engine=video_engine, reference=True)
+    convert_video(clip, tmp_path / "fast.mp4", chosen, device, engine=video_engine)
+    one, other = decoded(tmp_path / "plain.mp4"), decoded(tmp_path / "fast.mp4")
+    assert len(one) == len(other) == 40
+    for (pts_a, picture_a), (pts_b, picture_b) in zip(one, other):
+        assert pts_a == pts_b and np.array_equal(picture_a, picture_b)
+    assert clips.describe(tmp_path / "fast.mp4")["audio_bytes"] == clips.describe(tmp_path / "plain.mp4")["audio_bytes"]
+
+
+def test_a_failure_while_reading_stops_the_conversion_and_leaves_nothing(clip, device, video_engine,
+                                                                        tmp_path, monkeypatch):
+    real = job.read_frames
+
+    def failing(path, device, on_packet=None, **kwargs):
+        for frame in real(path, device, on_packet=on_packet, **kwargs):
+            if on_packet is not None and frame.index == 17:
+                raise OSError("the disk went away")
+            yield frame
+
+    monkeypatch.setattr(job, "read_frames", failing)
+    with pytest.raises(OSError, match="the disk went away"):
+        convert_video(clip, tmp_path / "out.mp4", settings(), device, engine=video_engine)
+    assert list(tmp_path.iterdir()) == []
+    assert not [t for t in threading.enumerate() if t.name.startswith("hdr-blaster")]
+
+
+def test_a_failure_in_the_encoder_stops_the_conversion_and_leaves_nothing(clip, device, video_engine,
+                                                                         tmp_path, monkeypatch):
+    real = job.VideoWriter.encode
+
+    def failing(self, picture):
+        if self.frames_written == 11:
+            raise RuntimeError("the encoder gave up")
+        real(self, picture)
+
+    monkeypatch.setattr(job.VideoWriter, "encode", failing)
+    with pytest.raises(RuntimeError, match="the encoder gave up"):
+        convert_video(clip, tmp_path / "out.mp4", settings(), device, engine=video_engine)
+    assert list(tmp_path.iterdir()) == []
+    assert not [t for t in threading.enumerate() if t.name.startswith("hdr-blaster")]
+
+
+def test_cancelling_stops_the_threads_too(clip, device, video_engine, tmp_path):
+    seen = []
+    with pytest.raises(Cancelled):
+        convert_video(clip, tmp_path / "out.mp4", settings(), device, engine=video_engine,
+                      progress=lambda stage, done, total: seen.append(stage),
+                      cancelled=lambda: seen.count("render") >= 9)
+    assert list(tmp_path.iterdir()) == []
+    assert not [t for t in threading.enumerate() if t.name.startswith("hdr-blaster")]
+
+
+def test_a_video_is_neither_sharpened_nor_coloured_unless_asked():
+    assert (VideoSettings().render.edge_strength, VideoSettings().render.color_strength) == (0.0, 0.0)
+
+
+class _GivesUp:
+    """A hardware decoder that fails after a number of packets, like a card that is reset."""
+
+    def __init__(self, real, after):
+        self.real, self.left = real, after
+
+    def decode(self, packet):
+        self.left -= 1
+        if self.left < 0:
+            raise av.FFmpegError(5, "the device was lost")
+        return self.real.decode(packet)
+
+
+@pytest.mark.parametrize("stage", ["analyse", "render"])
+def test_if_the_card_stops_decoding_the_pass_starts_again_on_the_processor(clip, device, video_engine, tmp_path,
+                                                                          monkeypatch, caplog, stage):
+    import logging
+
+    from hdr_blaster.video import reader
+
+    if device.type != "cuda" or not reader.hardware_decoding(clip):
+        pytest.skip("no graphics card that decodes this clip")
+    convert_video(clip, tmp_path / "plain.mp4", settings(), device, engine=video_engine, reference=True)
+
+    real, opened = reader._open_hardware, []
+
+    def fragile(stream):
+        opened.append(1)
+        # the analysis is the first pass to open a decoder, the render the second
+        fails = len(opened) == (1 if stage == "analyse" else 2)
+        return _GivesUp(real(stream), 15) if fails else real(stream)
+
+    monkeypatch.setattr(reader, "_hardware_checked", dict(reader._hardware_checked))
+    monkeypatch.setattr(reader, "_open_hardware", fragile)
+    stages = []
+    with caplog.at_level(logging.WARNING):
+        report = convert_video(clip, tmp_path / "out.mp4", settings(), device, engine=video_engine,
+                               progress=lambda s, done, total: stages.append((s, done)))
+    assert "starting this pass again" in caplog.text
+    assert reader.hardware_decoding(clip) is False, "the format is remembered as one the card does not decode"
+    assert report.frames == 40 and stages[-1] == ("render", 40)
+    # (this short clip is encoded a second time anyway, to end lighter than its source)
+    assert stages.count((stage, 1)) == (2 if stage == "analyse" else 3), "the pass was started once more"
+    one, other = decoded(tmp_path / "plain.mp4"), decoded(tmp_path / "out.mp4")
+    assert len(one) == len(other) == 40
+    assert all(a[0] == b[0] and np.array_equal(a[1], b[1]) for a, b in zip(one, other))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.mp4", "plain.mp4"]
+
+
+def test_without_any_nvidia_card_the_fast_way_still_writes_the_same_pictures(clip, tmp_path, monkeypatch):
+    """Everything on the processor: decoding, rendering, x264. The stages still run side by
+    side, and still change nothing."""
+    from hdr_blaster.video import reader, writer
+
+    cpu = torch.device("cpu")
+    engine = make_engine(cpu)
+    asked = []
+    monkeypatch.setattr(reader, "hardware_decoding", lambda path: asked.append(path) or True)
+    monkeypatch.setattr(writer, "pick_encoder", lambda: "libx264")
+    chosen = VideoSettings(render=RenderSettings(method="faithful", white_nits=300.0))
+    plain = convert_video(clip, tmp_path / "plain.mp4", chosen, cpu, engine=engine, reference=True)
+    fast = convert_video(clip, tmp_path / "fast.mp4", chosen, cpu, engine=engine)
+    assert asked == [], "the graphics card is not asked to decode for a conversion on the processor"
+    assert plain.encoder == fast.encoder == "libx264"
+    one, other = decoded(tmp_path / "plain.mp4"), decoded(tmp_path / "fast.mp4")
+    assert len(one) == len(other) == 40
+    assert all(a[0] == b[0] and np.array_equal(a[1], b[1]) for a, b in zip(one, other))
+
+
+# ----------------------------------------------------------------- frame rate
+
+def test_a_regular_recording_gives_every_other_frame_at_half_its_rate():
+    from hdr_blaster.video.job import frames_to_keep
+
+    times = [i / 120 for i in range(240)]
+    assert frames_to_keep(times, None) == [True] * 240
+    assert frames_to_keep(times, 60, 120) == [i % 2 == 0 for i in range(240)]
+    assert frames_to_keep(times, 30, 120) == [i % 4 == 0 for i in range(240)]
+    assert frames_to_keep(times, 120, 120) == [True] * 240, "the source's own rate keeps everything"
+    assert frames_to_keep(times, 240, 120) == [True] * 240, "frames are never invented"
+    ntsc = [i * 1001 / 60000 for i in range(120)]
+    assert all(frames_to_keep(ntsc, 60, 60000 / 1001)), "59.94 asked for 60 loses nothing"
+    assert frames_to_keep(ntsc, 30, 60000 / 1001) == [i % 2 == 0 for i in range(120)]
+    assert frames_to_keep([], 60, 120) == [] and frames_to_keep([0.5], 30, 120) == [True]
+
+
+def test_an_irregular_recording_gives_the_frame_nearest_to_each_tick_and_never_more_than_asked():
+    from hdr_blaster.video.job import frames_to_keep
+
+    rng = np.random.default_rng(3)
+    times = (2.0 + np.cumsum(rng.uniform(0.004, 0.040, 2000))).tolist()      # 4 to 40 ms apart
+    for rate in (30.0, 20.0):                                              # the recording runs at 45 on average
+        keep = frames_to_keep(times, rate, 45.0)
+        assert keep[0], "the first frame is always written"
+        position = (np.array(times) - times[0]) * rate
+        tick = np.floor(position + 0.5).astype(int)
+        kept = np.flatnonzero(keep)
+        ticks = sorted(set(tick[tick <= position[-1]].tolist()))             # none after the last frame
+        assert tick[kept].tolist() == ticks, "one frame for every tick that has any, no other"
+        for index in kept:
+            rivals = np.flatnonzero(tick == tick[index])
+            assert abs(position[index] - tick[index]) <= np.abs(position[rivals] - tick[index]).min() + 1e-9
+        assert sum(keep) <= (times[-1] - times[0]) * rate + 1
+
+
+def test_a_capture_with_jittering_timestamps_keeps_an_even_cadence():
+    """An NVIDIA recording at 120 frames per second stamps its frames 5.7 to 10.3 ms apart.
+    Halved, it must still give every other frame: 8 ms then 25 ms between two frames would
+    stutter."""
+    from hdr_blaster.video.job import frames_to_keep
+
+    rng = np.random.default_rng(7)
+    times = (np.arange(1200) / 120.0 + rng.uniform(-0.0023, 0.0023, 1200)).tolist()
+    assert frames_to_keep(times, 60, 120) == [i % 2 == 0 for i in range(1200)]
+    assert frames_to_keep(times, 30, 120) == [i % 4 == 0 for i in range(1200)]
+
+
+def test_a_lower_frame_rate_writes_the_same_pictures_fewer_of_them(clip, device, video_engine, tmp_path, monkeypatch):
+    """The frames written at a lower rate are the very frames of the full conversion, with
+    their own timestamps: nothing is rendered differently, the others are left out."""
+    from hdr_blaster.video.job import frames_to_keep
+
+    handed, run = {}, ["full"]
+    real = job.VideoWriter.frame
+
+    def spy(self, pts, y, u, v):
+        marks = hashlib.sha256(b"".join(p.cpu().numpy().tobytes() for p in (y, u, v))).hexdigest()
+        handed.setdefault(run[0], {})[pts] = marks
+        return real(self, pts, y, u, v)
+
+    monkeypatch.setattr(job.VideoWriter, "frame", spy)
+    full = convert_video(clip, tmp_path / "full.mp4", settings(), device, engine=video_engine)
+    run[0] = "slow"
+    slow = convert_video(clip, tmp_path / "slow.mp4", settings(frame_rate=20.0), device, engine=video_engine)
+    run[0] = "plain"
+    convert_video(clip, tmp_path / "plain.mp4", settings(frame_rate=20.0), device, engine=video_engine, reference=True)
+
+    source = clips.describe(clip)
+    keep = frames_to_keep(source["pts_s"], 20.0, probe(clip).average_rate)
+    assert full.frames == 40 and slow.frames == sum(keep) and 10 < sum(keep) < 30
+    out = clips.describe(tmp_path / "slow.mp4")
+    assert out["pts_s"] == pytest.approx([t for t, k in zip(source["pts_s"], keep) if k], abs=1e-4)
+    assert len(handed["slow"]) == sum(keep)
+    assert handed["slow"] == {pts: handed["full"][pts] for pts in handed["slow"]}, "the same pictures"
+    assert handed["plain"] == handed["slow"], "and the plain way keeps the same ones"
+    assert out["audio_bytes"] == source["audio_bytes"], "the sound is whole"
+    assert slow.dst_bytes <= slow.src_bytes
+    # a rate the recording does not exceed changes nothing
+    same = convert_video(clip, tmp_path / "same.mp4", settings(frame_rate=120.0), device, engine=video_engine)
+    assert same.frames == 40
+
+
+def test_one_analysis_serves_every_frame_rate(clip, device, video_engine, tmp_path):
+    from hdr_blaster.video.job import analyse_video, analysis_key, render_video
+
+    assert analysis_key(settings(frame_rate=30.0)) == analysis_key(settings())
+    analysis = analyse_video(clip, settings(), device, engine=video_engine)
+    report = render_video(analysis, tmp_path / "slow.mp4", settings(frame_rate=20.0), device, engine=video_engine)
+    assert report.frames < 40 and len(clips.describe(tmp_path / "slow.mp4")["pts_s"]) == report.frames
+
+
+def test_command_line_takes_a_frame_rate(clip, tmp_path):
+    out = tmp_path / "cli.mp4"
+    done = subprocess.run(
+        [sys.executable, str(ROOT / "NHC.py"), "--convert-video", str(clip), "--out", str(out), "--fps", "20"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert 10 < len(clips.describe(out)["pts_s"]) < 30
+
+
+# ----------------------------------------------------------------- motion blur
+
+def test_a_pictures_light_comes_from_the_frames_it_replaces_never_from_another_shot():
+    from hdr_blaster.video.job import exposure_of
+
+    keep = [True, False, True, False, False, True, False, False, False]
+    assert exposure_of(keep, set(), 0) == (0, 2)
+    assert exposure_of(keep, set(), 1) == (0, 2), "a dropped frame is shown by the picture before it"
+    assert exposure_of(keep, set(), 2) == exposure_of(keep, set(), 4) == (2, 3)
+    assert exposure_of(keep, set(), 5) == (5, 4), "up to the end of the file"
+    assert exposure_of(keep, {4}, 2) == (2, 2), "the shot that begins at frame 4 keeps its light"
+    assert exposure_of(keep, {3}, 4) == (2, 1)
+    assert exposure_of(keep, {5}, 2) == (2, 3), "a cut on a kept frame changes nothing"
+    assert exposure_of([True] * 4, set(), 2) == (2, 1)
+
+
+def test_motion_blur_adds_up_the_scenes_light_and_renders_it_once(device, video_engine, tmp_path, monkeypatch):
+    """Each picture written is rendered from the average, in the scene's linear light, of the
+    kept frame and of the frames dropped after it, with the kept frame's parameters; the
+    light of the next shot is left out."""
+    from hdr_blaster.video.colour import scrgb_to_engine, yuv_to_scrgb
+    from hdr_blaster.video.job import analyse_video, exposure_of, frames_to_keep, render_video
+    from hdr_blaster.video.reader import read_frames
+
+    src = tmp_path / "cut.mp4"
+    clips.make_clip(src, frames=40, audio_streams=0, levels=[1.0] * 20 + [0.08] * 20)
+    info = probe(src)
+    analysis = analyse_video(src, settings(method="faithful"), device, engine=video_engine)
+    assert analysis.cuts == [0, 20]
+
+    def stopped_by_the_cut(rate):
+        keep = frames_to_keep(analysis.times, rate, info.average_rate)
+        return any(k and exposure_of(keep, set(), i) != exposure_of(keep, {20}, i) for i, k in enumerate(keep))
+
+    rate = next(r for r in (20.0, 15.0, 12.0, 10.0, 8.0) if stopped_by_the_cut(r))
+    keep = frames_to_keep(analysis.times, rate, info.average_rate)
+    kept = [i for i, k in enumerate(keep) if k]
+    rendered, real = [], job.render
+
+    def spy(tone_mapper, loader, processor, linear, render_settings, params=None, **kwargs):
+        if params is not None and params.frozen:
+            rendered.append((linear.clone(), params.stats["scene.peak"].clone()))
+        return real(tone_mapper, loader, processor, linear, render_settings, params=params, **kwargs)
+
+    monkeypatch.setattr(job, "render", spy)
+    chosen = settings(method="faithful", frame_rate=rate, motion_blur=True)
+    report = render_video(analysis, tmp_path / "blur.mp4", chosen, device, engine=video_engine)
+    assert report.frames == len(kept) and len(rendered) % len(kept) == 0, "one render per picture written"
+
+    with torch.inference_mode():
+        lights = [yuv_to_scrgb(f.y, f.u, f.v, info.fmt) for f in read_frames(src, device, hardware=False)]
+        blended = 0
+        for n, first in enumerate(kept):
+            count = exposure_of(keep, {20}, first)[1]
+            total = lights[first]
+            for extra in range(1, count):
+                total = total + lights[first + extra]
+            expected = scrgb_to_engine(total / count if count > 1 else total)
+            assert torch.equal(rendered[n][0], expected), f"picture {n} (frames {first} to {first + count - 1})"
+            assert torch.equal(rendered[n][1].cpu(), analysis.params[first].stats["scene.peak"].cpu())
+            blended += count > 1 and not torch.equal(expected, scrgb_to_engine(lights[first]))
+        assert blended > 3, "the test clip must really blend something"
+    out = clips.describe(tmp_path / "blur.mp4")
+    assert out["pts_s"] == pytest.approx([analysis.times[i] for i in kept], abs=1e-4), "timestamps are the kept frames'"
+
+
+def test_motion_blur_is_the_same_both_ways_and_does_nothing_at_the_original_rate(clip, device, video_engine,
+                                                                               tmp_path, monkeypatch):
+    handed, run = {}, ["blur"]
+    real = job.VideoWriter.frame
+
+    def spy(self, pts, y, u, v):
+        marks = hashlib.sha256(b"".join(p.cpu().numpy().tobytes() for p in (y, u, v))).hexdigest()
+        handed.setdefault(run[0], {})[pts] = marks
+        return real(self, pts, y, u, v)
+
+    monkeypatch.setattr(job.VideoWriter, "frame", spy)
+    blurred = settings(frame_rate=15.0, motion_blur=True)
+    convert_video(clip, tmp_path / "blur.mp4", blurred, device, engine=video_engine)
+    run[0] = "plain way"
+    convert_video(clip, tmp_path / "plain.mp4", blurred, device, engine=video_engine, reference=True)
+    run[0] = "sharp"
+    convert_video(clip, tmp_path / "sharp.mp4", settings(frame_rate=15.0), device, engine=video_engine)
+    run[0] = "full"
+    convert_video(clip, tmp_path / "full.mp4", settings(), device, engine=video_engine)
+    run[0] = "full, blur asked"
+    convert_video(clip, tmp_path / "full_blur.mp4", settings(motion_blur=True), device, engine=video_engine)
+    assert handed["plain way"] == handed["blur"], "the fast way and the plain way blur alike"
+    assert sorted(handed["blur"]) == sorted(handed["sharp"]), "the same frames are written, at the same times"
+    assert handed["blur"] != handed["sharp"], "with other pictures"
+    assert handed["full, blur asked"] == handed["full"], "at the recording's own rate there is nothing to add up"
+
+
+def test_command_line_takes_motion_blur(clip, tmp_path):
+    out = tmp_path / "cli.mp4"
+    done = subprocess.run(
+        [sys.executable, str(ROOT / "NHC.py"), "--convert-video", str(clip), "--out", str(out),
+         "--fps", "15", "--blur"], cwd=tmp_path, capture_output=True, text=True, timeout=600)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert 5 < len(clips.describe(out)["pts_s"]) < 25

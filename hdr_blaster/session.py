@@ -43,6 +43,7 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov")
 IMAGE_FORMATS = ("JPEG", "TIFF", "Both")
 VIDEO_QUALITIES = ("high", "balanced", "compact")
 VIDEO_HEIGHTS = (0, 1080, 720)                 # 0 keeps the size of the source
+VIDEO_FRAME_RATES = (0, 120, 60, 30)           # 0 keeps every frame of the source
 
 
 def reference_white() -> float:
@@ -62,6 +63,9 @@ class Options:
     image_format: str = "JPEG"
     video_quality: str = "high"
     video_height: int = 0
+    video_fps: int = 0                         # frames per second at most; 0 keeps them all
+    video_blur: bool = False                   # at a lower frame rate: motion blur from the dropped frames
+    video_enhance: bool = False                # Sharpness and AI colour on videos too
     destination: str = ""                      # "" writes next to the source
     use_gpu: bool = True
     use_fp16: bool = False
@@ -73,20 +77,30 @@ class Options:
         chosen = self.operator or LOOKS.get(self.look, LOOKS[DEFAULT_LOOK])
         return None if chosen == "auto" else chosen
 
-    def render_settings(self) -> RenderSettings:
-        return RenderSettings(method=self.method(), color_strength=self.ai_color,
-                              edge_strength=self.sharpness, use_enhancement=True,
+    def render_settings(self, kind: str = "image") -> RenderSettings:
+        """What to render a capture with, or (``kind="video"``) a frame of a recording.
+
+        A video takes neither Sharpness nor AI colour unless ``video_enhance`` is on:
+        nothing is then measured on its pictures, and its analysis does not have to
+        render them (about twice as fast)."""
+        enhance = kind != "video" or self.video_enhance
+        return RenderSettings(method=self.method(), color_strength=self.ai_color if enhance else 0.0,
+                              edge_strength=self.sharpness if enhance else 0.0, use_enhancement=True,
                               white_nits=reference_white())
 
     def video_settings(self) -> VideoSettings:
-        return VideoSettings(render=self.render_settings(), quality=self.video_quality,
+        return VideoSettings(render=self.render_settings("video"), quality=self.video_quality,
                              out_height=self.video_height or None,
+                             frame_rate=float(self.video_fps) if self.video_fps else None,
+                             motion_blur=bool(self.video_blur and self.video_fps),
                              pre_gamma=self.pre_gamma, exposure=self.exposure)
 
     def picture_key(self) -> tuple:
         """Changes exactly when the converted picture would change (not when only the file
         format, the quality or the destination do)."""
+        # (the frame rate alone changes no picture; with motion blur it decides whose light adds up)
         return (self.method(), self.pre_gamma, self.exposure, self.sharpness, self.ai_color,
+                self.video_enhance, self.video_fps if self.video_blur else 0,
                 self.use_gpu, self.use_fp16, reference_white())
 
     def to_dict(self) -> dict:
@@ -125,6 +139,8 @@ class Options:
             options.video_quality = "high"
         if options.video_height not in VIDEO_HEIGHTS:
             options.video_height = 0
+        if options.video_fps not in VIDEO_FRAME_RATES:
+            options.video_fps = 0
         return options
 
 
@@ -237,7 +253,9 @@ def describe_output(kind: str, options: Options) -> str:
     where = "next to the source" if not options.destination else os.path.basename(options.destination) or options.destination
     if kind == "video":
         size = "original size" if not options.video_height else f"{options.video_height}p"
-        return f"MP4, {options.video_quality} quality, {size}, {where}"
+        rate = f", {options.video_fps} fps at most" if options.video_fps else ""
+        rate += ", motion blur" if options.video_fps and options.video_blur else ""
+        return f"MP4, {options.video_quality} quality, {size}{rate}, {where}"
     what = {"JPEG": "JPEG", "TIFF": "TIFF", "Both": "JPEG and TIFF"}[options.image_format]
     return f"{what}, {where}"
 

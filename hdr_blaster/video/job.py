@@ -2,31 +2,43 @@
 
 Two full-resolution passes over the file:
 
-1. **analyse** - every frame is rendered once in recording mode; what the engine
-   measured on it is kept, the picture is thrown away. Shots are detected.
+1. **analyse** - every frame is measured as a rendering of it would measure it; what
+   was measured is kept. Shots are detected. The picture itself is only made when
+   something is measured on it (sharpening, AI colour, the learned and Adaptive
+   renderings); otherwise the scene's peak is all there is to measure.
 2. **render**  - the measurements are stabilised over time, then every frame is
-   rendered again with them (nothing is measured), encoded and written, with the
+   rendered with them (nothing is measured), encoded and written, with the
    source's own timestamps and its audio copied next to it.
 
 With the Auto-detect operator there is a short pass before those, to choose the
 single operator the whole file is rendered with.
+
+The stages of each pass run side by side (:mod:`.stages`): frames are decoded a few
+ahead, by the graphics card when it can, and encoded a few behind. Every function
+takes ``reference=True`` for the plain way instead (the processor decodes, one frame
+at a time from end to end, every frame rendered in full when analysed): slower, the
+same result, and what the tests hold the fast way against.
 """
+import contextlib
 import logging
+import math
 import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from bisect import bisect_left
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from ..engine.pipeline import RenderSettings, render, resolve_method
-from .colour import srgb_to_yuv420, yuv_to_engine
+from ..engine.pipeline import RenderSettings, measure, render, resolve_method
+from .colour import scrgb_to_engine, srgb_to_yuv420, yuv_to_engine, yuv_to_scrgb
 from ..engine.params import RenderParams
-from .reader import UnsupportedVideo, VideoInfo, check_supported, probe, read_frames
+from .reader import (HardwareDecodingFailed, UnsupportedVideo, VideoInfo, check_supported, probe,
+                     read_frames)
+from .stages import Ahead, Behind
 from .temporal import detect_cuts, frame_signature, stabilise
 from .writer import QUALITY, VideoWriter
 
@@ -45,10 +57,13 @@ class OutputTooLarge(Exception):
 
 @dataclass(frozen=True)
 class VideoSettings:
-    """What the user chose for a video. Defaults match the photo defaults."""
-    render: RenderSettings = field(default_factory=lambda: RenderSettings(edge_strength=25.0))
+    """What the user chose for a video. By default neither sharpening nor AI colour: a
+    video is then analysed without rendering its frames, about twice as fast."""
+    render: RenderSettings = field(default_factory=RenderSettings)
     quality: str = "high"
     out_height: Optional[int] = None      # e.g. 1080; None keeps the source size
+    frame_rate: Optional[float] = None    # e.g. 60; None keeps every frame of the source
+    motion_blur: bool = False             # at a lower frame rate: add up the light of the dropped frames
     pre_gamma: float = 1.0
     exposure: float = 1.0
     window_s: float = 1.0                 # time scale of the stabilisation; 0 = none (per-frame)
@@ -100,6 +115,45 @@ def output_size(info: VideoInfo, out_height: Optional[int]) -> tuple:
     height = max(2, int(out_height) // 2 * 2)
     width = max(2, int(round(info.width * height / info.height / 2.0)) * 2)
     return width, height
+
+
+def frames_to_keep(times: Sequence[float], frame_rate: Optional[float], source_rate=None) -> List[bool]:
+    """Which frames a conversion at ``frame_rate`` writes, one answer per frame.
+
+    Frames are dropped, never invented and never moved. An ideal clock ticks ``frame_rate``
+    times a second from the first frame to the last; for each tick the frame nearest to it
+    is kept, with the timestamp it has in the source, and a tick no frame is nearest to
+    gets none.
+    A 120 frames per second recording gives every other frame at 60 and every fourth at
+    30, also when its timestamps are not quite regular (those of a capture never are): the
+    cadence of what is left stays even. A rate the source does not exceed keeps everything.
+    """
+    if not frame_rate or not times or (source_rate and frame_rate >= float(source_rate) * 0.99):
+        return [True] * len(times)
+    start, nearest = times[0], {}                    # tick -> (distance to it, frame)
+    end = (times[-1] - start) * frame_rate + 1e-6    # the clock does not tick after the last frame
+    for index, t in enumerate(times):
+        position = (t - start) * frame_rate
+        tick = math.floor(position + 0.5)
+        distance = abs(position - tick)
+        if tick <= end and (tick not in nearest or distance < nearest[tick][0] - 1e-9):
+            nearest[tick] = (distance, index)        # (a tie goes to the earlier frame)
+    chosen = {index for _, index in nearest.values()}
+    return [index in chosen for index in range(len(times))]
+
+
+def exposure_of(keep: Sequence[bool], cuts, index: int) -> Tuple[int, int]:
+    """With motion blur, the frames whose light makes the picture that stands for frame
+    ``index``, as (first, how many): the kept frame at or before it, and the frames dropped
+    after that one, up to the next kept frame or the next shot. A picture never holds the
+    light of two shots."""
+    first = index
+    while first > 0 and not keep[first]:
+        first -= 1
+    count = 1
+    while first + count < len(keep) and not keep[first + count] and (first + count) not in cuts:
+        count += 1
+    return first, count
 
 
 def bit_rate_budget(info: VideoInfo, quality: str) -> int:
@@ -160,7 +214,7 @@ def _preflight(dst: str, info: VideoInfo, settings: VideoSettings, size: tuple) 
     folder = os.path.dirname(os.path.abspath(dst))
     if not os.path.isdir(folder):
         raise FileNotFoundError(f"the output folder does not exist: {folder}")
-    writer = VideoWriter(dst, info, quality=settings.quality, size=size)
+    writer = VideoWriter(dst, info, quality=settings.quality, size=size, frame_rate=settings.frame_rate)
     try:
         writer.start()
     except Exception as exc:
@@ -181,16 +235,35 @@ def _to_engine(frame, info: VideoInfo, settings: VideoSettings) -> torch.Tensor:
                          pre_gamma=settings.pre_gamma, exposure=settings.exposure)
 
 
-def _choose_method(src, info, settings, engine, device, progress, cancelled) -> str:
+def _frames(src, device, reference: bool, on_packet=None, wanted=None):
+    """The frames of ``src``, for a ``with`` block: decoded ahead in a thread of their own,
+    or (``reference``) by the processor, one at a time, in this thread."""
+    if reference:
+        return contextlib.closing(read_frames(src, device, on_packet=on_packet, hardware=False, wanted=wanted))
+    return Ahead(lambda: read_frames(src, device, on_packet=on_packet, wanted=wanted))
+
+
+def _decoding_again(run):
+    """Run one pass over the file. If the graphics card stops decoding part of the way, run
+    it once more from the start: the reader has taken note and uses the processor."""
+    try:
+        return run()
+    except HardwareDecodingFailed as exc:
+        logging.warning(f"{exc}; starting this pass again with the processor decoding")
+        return run()
+
+
+def _choose_method(src, info, settings, engine, device, progress, cancelled, reference=False) -> str:
     """One operator for the whole file: the one Auto-detect picks most often."""
     votes, next_sample = Counter(), 0.0
-    for frame in read_frames(src, device):
-        _check(cancelled)
-        if frame.time_s >= next_sample:
-            votes[resolve_method(engine.tone_mapper, _to_engine(frame, info, settings), None)] += 1
-            next_sample = frame.time_s + AUTO_SAMPLE_INTERVAL_S
-        if progress:
-            progress("method", frame.index + 1, info.frames)
+    with _frames(src, device, reference) as frames:
+        for frame in frames:
+            _check(cancelled)
+            if frame.time_s >= next_sample:
+                votes[resolve_method(engine.tone_mapper, _to_engine(frame, info, settings), None)] += 1
+                next_sample = frame.time_s + AUTO_SAMPLE_INTERVAL_S
+            if progress:
+                progress("method", frame.index + 1, info.frames)
     if not votes:
         raise ValueError("the video has no frame")
     method = votes.most_common(1)[0][0]
@@ -220,8 +293,8 @@ class VideoAnalysis:
 
 
 def analysis_key(settings: VideoSettings) -> tuple:
-    """What an analysis depends on. Quality and output size are not part of it: one
-    analysis serves any encode."""
+    """What an analysis depends on. Quality, output size and frame rate are not part of it:
+    one analysis serves any encode."""
     r = settings.render
     return (r.method, r.color_strength, r.edge_strength, r.use_enhancement, r.white_nits,
             settings.pre_gamma, settings.exposure, settings.window_s)
@@ -241,7 +314,7 @@ def _check_destination(src: str, dst: str, info: VideoInfo, settings: VideoSetti
 def analyse_video(src, settings: VideoSettings, device,
                   progress: Optional[Callable[[str, int, int], None]] = None,
                   cancelled: Optional[Callable[[], bool]] = None,
-                  engine=None, info: Optional[VideoInfo] = None) -> VideoAnalysis:
+                  engine=None, info: Optional[VideoInfo] = None, reference: bool = False) -> VideoAnalysis:
     """First pass: choose the operator (Auto-detect), measure every frame, find the shots,
     stabilise. Nothing is written. Raises :class:`Cancelled` when ``cancelled()`` turns true."""
     src = os.fspath(src)
@@ -252,20 +325,31 @@ def analyse_video(src, settings: VideoSettings, device,
     with torch.inference_mode():
         method = settings.render.method
         if method is None:
-            method = _choose_method(src, info, settings, engine, device, progress, cancelled)
+            method = _decoding_again(lambda: _choose_method(src, info, settings, engine, device,
+                                                            progress, cancelled, reference))
         render_settings = replace(settings.render, method=method)
 
-        recorded, times, pts, signatures = [], [], [], []
-        for frame in read_frames(src, device):
-            _check(cancelled)
-            linear = _to_engine(frame, info, settings)
-            _, params = render(engine.tone_mapper, engine.loader, engine.processor, linear, render_settings)
-            recorded.append(_off_gpu(params))
-            times.append(frame.time_s)
-            pts.append(frame.pts)
-            signatures.append(frame_signature(frame.y, info.fmt.bit_depth))
-            if progress:
-                progress("analyse", frame.index + 1, info.frames)
+        def measure_every_frame():
+            recorded, times, pts, signatures = [], [], [], []
+            with _frames(src, device, reference) as frames:
+                for frame in frames:
+                    _check(cancelled)
+                    linear = _to_engine(frame, info, settings)
+                    if reference:
+                        params = render(engine.tone_mapper, engine.loader, engine.processor, linear,
+                                        render_settings, release_cache=False)[1]
+                    else:
+                        params = measure(engine.tone_mapper, engine.loader, engine.processor, linear,
+                                         render_settings, release_cache=False)
+                    recorded.append(_off_gpu(params))
+                    times.append(frame.time_s)
+                    pts.append(frame.pts)
+                    signatures.append(frame_signature(frame.y, info.fmt.bit_depth))
+                    if progress:
+                        progress("analyse", frame.index + 1, info.frames)
+            return recorded, times, pts, signatures
+
+        recorded, times, pts, signatures = _decoding_again(measure_every_frame)
         if not recorded:
             raise ValueError("the video has no frame")
         cuts = detect_cuts(torch.stack(signatures))
@@ -278,11 +362,17 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
                  progress: Optional[Callable[[str, int, int], None]] = None,
                  cancelled: Optional[Callable[[], bool]] = None,
                  engine=None, _checked_size: Optional[tuple] = None,
-                 _started: Optional[float] = None) -> VideoReport:
+                 _started: Optional[float] = None, reference: bool = False) -> VideoReport:
     """Second pass: render every frame with the analysis' parameters, encode, write.
 
     The analysis must have been made with the same picture settings (``analysis.matches``);
-    quality and output size are free."""
+    quality, output size and frame rate are free. At a lower frame rate the frames written
+    are the very frames a conversion at the source's rate writes, fewer of them.
+
+    With ``motion_blur``, at a lower frame rate, each of them is rendered from the light of
+    all the frames it stands for, added up as a longer exposure adds it: the scene's linear
+    light is averaged (:func:`exposure_of` says over which frames), then rendered once with
+    the parameters of the frame that is kept."""
     src, dst = analysis.src, os.fspath(dst)
     started = _started if _started is not None else time.perf_counter()
     if not analysis.matches(settings):
@@ -291,33 +381,86 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
     size = _checked_size or _check_destination(src, dst, info, settings)
     engine = engine or make_engine(device)
     render_settings = replace(settings.render, method=analysis.method)
+    keep = frames_to_keep(analysis.times, settings.frame_rate, info.average_rate)
+    written = sum(keep)
+    blur = bool(settings.motion_blur) and written < len(keep)
+    cuts = set(analysis.cuts)
+
+    def kept(index: int) -> bool:
+        return index >= len(keep) or keep[index]      # a frame past the analysis is looked at: it is an error
+
+    def encode_every_frame(budget: int, average: bool) -> VideoWriter:
+        """One encode of the whole file. Returns its writer, closed; leaves no file on failure."""
+        writer = VideoWriter(dst, info, quality=settings.quality,
+                             size=None if size == (info.width, info.height) else size,
+                             max_bit_rate=budget, average=average, frame_rate=settings.frame_rate)
+        encoder = None
+        try:
+            # Dropped frames are only counted, unless their light is wanted.
+            with _frames(src, device, reference, on_packet=writer.copy_packet,
+                         wanted=None if blur or written == len(keep) else kept) as frames:
+                encoder = None if reference else Behind(writer.encode)
+
+                def write(index: int, pts: int, light: torch.Tensor) -> None:
+                    """Render the scene's light with the parameters of frame ``index``; encode."""
+                    linear = scrgb_to_engine(light, settings.pre_gamma, settings.exposure)
+                    srgb, _ = render(engine.tone_mapper, engine.loader, engine.processor, linear,
+                                     render_settings, params=_on_device(stable[index], device),
+                                     release_cache=False)
+                    if size != (info.width, info.height):
+                        srgb = F.interpolate(srgb, size=(size[1], size[0]), mode="bicubic",
+                                             align_corners=False, antialias=True).clamp(0.0, 1.0)
+                    picture = writer.frame(pts, *srgb_to_yuv420(srgb))
+                    if encoder is None:
+                        writer.encode(picture)
+                    else:
+                        encoder.put(picture)
+
+                def finish(exposure) -> None:
+                    index, pts, light, frames_in_it = exposure
+                    write(index, pts, light / frames_in_it if frames_in_it > 1 else light)
+
+                exposure, gathering = None, False     # motion blur: [frame, timestamp, light so far, frames in it]
+                for frame in frames:
+                    _check(cancelled)
+                    if frame.index >= len(stable):
+                        raise RuntimeError("the video changed since it was analysed")
+                    if keep[frame.index]:
+                        if exposure is not None:
+                            finish(exposure)           # the picture before this one has all its light
+                        light = yuv_to_scrgb(frame.y, frame.u, frame.v, info.fmt)
+                        if blur:
+                            exposure, gathering = [frame.index, frame.pts, light, 1], True
+                        else:
+                            exposure = None
+                            write(frame.index, frame.pts, light)
+                    elif gathering:
+                        if frame.index in cuts:
+                            gathering = False          # another shot begins: not this picture's light
+                        else:
+                            exposure[2] = exposure[2] + yuv_to_scrgb(frame.y, frame.u, frame.v, info.fmt)
+                            exposure[3] += 1
+                    if progress:
+                        progress("render", frame.index + 1, info.frames)
+                if exposure is not None:
+                    finish(exposure)
+                if encoder is not None:
+                    encoder, finishing = None, encoder
+                    finishing.close()              # waits for the last frames; raises what they raised
+            if writer.frames_written != written:
+                raise RuntimeError("the video changed since it was analysed")
+            writer.close()
+        except BaseException:
+            if encoder is not None:
+                encoder.abort()                    # before the file it writes to is taken away
+            writer.abort()
+            raise
+        return writer
 
     with torch.inference_mode():
         budget, average, writer = bit_rate_budget(info, settings.quality), False, None
         for attempt in range(SIZE_ATTEMPTS):
-            writer = VideoWriter(dst, info, quality=settings.quality,
-                                 size=None if size == (info.width, info.height) else size,
-                                 max_bit_rate=budget, average=average)
-            try:
-                for frame in read_frames(src, device, on_packet=writer.copy_packet):
-                    _check(cancelled)
-                    if frame.index >= len(stable):
-                        raise RuntimeError("the video changed since it was analysed")
-                    linear = _to_engine(frame, info, settings)
-                    srgb, _ = render(engine.tone_mapper, engine.loader, engine.processor, linear,
-                                     render_settings, params=_on_device(stable[frame.index], device))
-                    if size != (info.width, info.height):
-                        srgb = F.interpolate(srgb, size=(size[1], size[0]), mode="bicubic",
-                                             align_corners=False, antialias=True).clamp(0.0, 1.0)
-                    writer.write(frame.pts, *srgb_to_yuv420(srgb))
-                    if progress:
-                        progress("render", frame.index + 1, info.frames)
-                if writer.frames_written != len(stable):
-                    raise RuntimeError("the video changed since it was analysed")
-                writer.close()
-            except BaseException:
-                writer.abort()
-                raise
+            writer = _decoding_again(lambda: encode_every_frame(budget, average))
             produced = os.path.getsize(dst)
             if produced <= info.size_bytes:
                 break
@@ -336,7 +479,7 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
                 f"could not make the result lighter than the source ({info.size_bytes} bytes); "
                 "try a lower quality or a smaller output size")
 
-    return VideoReport(dst=dst, frames=len(stable), method=analysis.method, encoder=writer.encoder_name,
+    return VideoReport(dst=dst, frames=written, method=analysis.method, encoder=writer.encoder_name,
                        seconds=time.perf_counter() - started, src_bytes=info.size_bytes,
                        dst_bytes=os.path.getsize(dst), cuts=analysis.cuts, width=size[0], height=size[1])
 
@@ -344,7 +487,7 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
 def convert_video(src, dst, settings: VideoSettings, device,
                   progress: Optional[Callable[[str, int, int], None]] = None,
                   cancelled: Optional[Callable[[], bool]] = None,
-                  engine=None) -> VideoReport:
+                  engine=None, reference: bool = False) -> VideoReport:
     """Convert ``src`` (HDR10) to ``dst`` (SDR MP4): analyse, then render. The source is only read.
 
     ``progress(stage, done, total)`` is called for every frame of every pass
@@ -359,6 +502,6 @@ def convert_video(src, dst, settings: VideoSettings, device,
     check_supported(info)
     size = _check_destination(src, dst, info, settings)
     engine = engine or make_engine(device)
-    analysis = analyse_video(src, settings, device, progress, cancelled, engine, info=info)
+    analysis = analyse_video(src, settings, device, progress, cancelled, engine, info=info, reference=reference)
     return render_video(analysis, dst, settings, device, progress, cancelled, engine,
-                        _checked_size=size, _started=started)
+                        _checked_size=size, _started=started, reference=reference)

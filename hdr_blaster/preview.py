@@ -218,8 +218,23 @@ def load_video_frame(path, time_s: float, device, max_side: int = 1600, pre_gamm
                          pre_gamma=pre_gamma, exposure=exposure)
 
 
+def blended_light(path, time_s: float, count: int, device, info=None) -> torch.Tensor:
+    """The light of ``count`` frames in a row, from the one shown at ``time_s`` on, added up
+    as the conversion adds it for motion blur. In the engine's working space, as recorded:
+    hand it to :func:`render_preview` as ``light``."""
+    from .video.colour import scrgb_to_engine, yuv_to_scrgb
+    from .video.reader import grab_frames, probe
+
+    info = info or probe(path)
+    total, frames = None, grab_frames(path, time_s, count, device)
+    for frame in frames:
+        light = yuv_to_scrgb(frame.y, frame.u, frame.v, info.fmt)
+        total = light if total is None else total + light
+    return scrgb_to_engine(total / len(frames) if len(frames) > 1 else total)
+
+
 def render_preview(engine, source: PreviewSource, settings: RenderSettings,
-                   params: Optional[RenderParams] = None) -> torch.Tensor:
+                   params: Optional[RenderParams] = None, light: Optional[torch.Tensor] = None) -> torch.Tensor:
     """The 'after' picture, sRGB, at the size shown: (1, 3, *source.size).
 
     The picture is rendered at its REAL size, exactly as the conversion renders it (the
@@ -230,13 +245,16 @@ def render_preview(engine, source: PreviewSource, settings: RenderSettings,
     * A video frame with the frozen ``params`` of a finished analysis: the frame of the
       converted file.
     * A video frame without them is measured by itself: provisional.
+
+    ``light`` replaces the frame's own light in the result (motion blur: see
+    :func:`blended_light`); the source view keeps showing the frame itself.
     """
     # One white for both halves of the comparison: the one the source view is made with.
     settings = replace(settings, white_nits=source.white_nits)
     with torch.inference_mode():
         tm, loader, processor = engine.tone_mapper, engine.loader, engine.processor
         # Gamma and Exposure shape the result, as the conversion applies them while reading.
-        linear = adjust_scene(source.linear, source.pre_gamma, source.exposure)
+        linear = adjust_scene(source.linear if light is None else light, source.pre_gamma, source.exposure)
         if params is not None:
             from .video.job import _on_device
 

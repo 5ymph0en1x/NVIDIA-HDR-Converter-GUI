@@ -93,6 +93,24 @@ def yuv_to_engine(y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, fmt: FrameF
     controls, applied where the JXR loader applies them: on scRGB values, gamma
     first, before the x 0.1 display scale.
     """
+    return scrgb_to_engine(yuv_to_scrgb(y, u, v, fmt), pre_gamma, exposure)
+
+
+def scrgb_to_engine(scrgb: torch.Tensor, pre_gamma: float = 1.0, exposure: float = 1.0) -> torch.Tensor:
+    """The scene's light (:func:`yuv_to_scrgb`) with the user's controls, in the engine's
+    working space."""
+    if pre_gamma != 1.0:
+        scrgb = scrgb ** (1.0 / pre_gamma)
+    if exposure != 1.0:
+        scrgb = scrgb * exposure
+    return scrgb * ENGINE_SCALE
+
+
+def yuv_to_scrgb(y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, fmt: FrameFormat) -> torch.Tensor:
+    """HDR10 planes -> (1, 3, H, W) float32, the scene's light as recorded: linear BT.709
+    primaries, scRGB (1.0 = 80 nits), no negatives, before any control of the user.
+    Light adds up on this scale: the average of several frames is what a longer exposure
+    would have recorded."""
     if fmt.matrix != "bt2020nc":
         raise ValueError(f"unsupported colour matrix '{fmt.matrix}'")
     height, width = y.shape[-2:]
@@ -120,12 +138,7 @@ def yuv_to_engine(y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, fmt: FrameF
 
     m = torch.tensor(_BT2020_TO_BT709, dtype=torch.float32, device=y.device)
     scrgb = (m @ nits2020.reshape(1, 3, -1)).reshape(1, 3, height, width) / SCRGB_WHITE_NITS
-    scrgb = scrgb.clamp(min=0.0)                 # out-of-gamut colours, as the JXR loader clips them
-    if pre_gamma != 1.0:
-        scrgb = scrgb ** (1.0 / pre_gamma)
-    if exposure != 1.0:
-        scrgb = scrgb * exposure
-    return scrgb * ENGINE_SCALE
+    return scrgb.clamp(min=0.0)                  # out-of-gamut colours, as the JXR loader clips them
 
 
 def srgb_to_yuv420(srgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

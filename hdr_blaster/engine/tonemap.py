@@ -17,6 +17,10 @@ from .neural import _get_neural_tonemap
 from .params import measure as _measure
 
 
+# The renderings whose only measurement is the scene's peak, taken on the scene itself
+# (the looks measure it too, on the graded scene).
+_PEAK_ONLY = ("faithful", "reinhard", "hable", "aces", "drago03", "perceptual", "mantiuk06")
+
 # Kept under their first names for the callers that import them from here.
 _pq_encode, _pq_decode, faithful_curve = R.pq_encode, R.pq_decode, R.faithful_curve
 
@@ -253,6 +257,24 @@ class AdvancedToneMapper:
             mask = torch.sigmoid((R.brightest(x) - 0.5) * 10.0)
             return lower * (1.0 - mask) + lights * mask
         raise ValueError(f"unknown tone mapping method '{method}'")
+
+    def measure_only(self, image: torch.Tensor, method: str, params,
+                     white_nits: float = REFERENCE_WHITE_NITS) -> bool:
+        """Record on ``params`` what :meth:`apply_tone_mapping` would measure for ``method``,
+        without rendering the picture. Returns False, and records nothing, for the renderings
+        whose measurements need more than the scene (the learned one, Adaptive).
+
+        The scene's peak is all the others measure, on the very tensor they render from."""
+        method = R.canonical(method)
+        if method in R.LOOKS:
+            p = R.LOOKS[method]
+            scene = R.grade(self._relative(image, white_nits), p["contrast"], p["saturation"], p["warm"])
+        elif method in _PEAK_ONLY:
+            scene = self._relative(image, white_nits)
+        else:
+            return False
+        self._peak(scene, params)
+        return True
 
     def keeps_scene_levels(self, method: str) -> bool:
         """Kept for callers: every rendering now keeps the scene's levels, so sharpening

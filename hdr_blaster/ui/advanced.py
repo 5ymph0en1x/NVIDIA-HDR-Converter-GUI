@@ -7,11 +7,14 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton,
                                QScrollArea, QSlider, QVBoxLayout, QWidget)
 
-from ..session import IMAGE_FORMATS, OPERATORS, RANGES, VIDEO_HEIGHTS, VIDEO_QUALITIES, Options
+from .widgets import CloseButton, Combo, Switch
+from ..session import (IMAGE_FORMATS, OPERATORS, RANGES, VIDEO_FRAME_RATES, VIDEO_HEIGHTS, VIDEO_QUALITIES,
+                       Options)
 
 PANEL_WIDTH = 340
 QUALITY_NAMES = {"high": "High", "balanced": "Balanced", "compact": "Compact"}
 HEIGHT_NAMES = {0: "Original size", 1080: "1080p", 720: "720p"}
+RATE_NAMES = {0: "Original", 120: "120 fps", 60: "60 fps", 30: "30 fps"}
 FORMAT_NAMES = {"JPEG": "JPEG", "TIFF": "TIFF", "Both": "JPEG and TIFF"}
 
 
@@ -23,6 +26,9 @@ class AdvancedPanel(QWidget):
         super().__init__(parent)
         self.setObjectName("panel")
         self.setAttribute(Qt.WA_StyledBackground, True)
+        # The panel is a child of the picture area. A click that none of its controls takes
+        # (its ground, a label) stops here: it must not reach the picture and move the divider.
+        self.setAttribute(Qt.WA_NoMousePropagation, True)
         self.setFixedWidth(PANEL_WIDTH)
         self._options = Options()
         self._loading = False
@@ -38,9 +44,7 @@ class AdvancedPanel(QWidget):
         title.setFont(font)
         head.addWidget(title)
         head.addStretch(1)
-        close = QPushButton("Close")
-        close.setProperty("role", "ghost")
-        close.setCursor(Qt.PointingHandCursor)
+        close = CloseButton()
         close.clicked.connect(self.close_requested)
         head.addWidget(close)
         outer.addLayout(head)
@@ -51,8 +55,8 @@ class AdvancedPanel(QWidget):
         body = QWidget()
         grid = QGridLayout(body)
         grid.setContentsMargins(18, 4, 18, 18)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(10)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
         grid.setColumnStretch(1, 1)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
@@ -65,20 +69,34 @@ class AdvancedPanel(QWidget):
         self.gamma, self.gamma_value = self._slider("Gamma", *[round(v * 100) for v in RANGES["pre_gamma"]], 100)
         self.sharpness, self.sharpness_value = self._slider("Sharpness", 0, 100, 1)
         self.ai_color, self.ai_color_value = self._slider("AI colour", 0, 100, 1)
+        self.video_enhance = self._check("Sharpness and AI colour on videos")
+        self.video_enhance.setToolTip("Off, a video is converted without sharpening or AI colour, and analysed\n"
+                                      "about twice as fast. On, both apply to videos as they do to captures.")
 
         self._section("Output")
         self.image_format = self._combo("Captures", [FORMAT_NAMES[f] for f in IMAGE_FORMATS])
         self.video_quality = self._combo("Video quality", [QUALITY_NAMES[q] for q in VIDEO_QUALITIES])
         self.video_height = self._combo("Video size", [HEIGHT_NAMES[h] for h in VIDEO_HEIGHTS])
+        self.video_fps = self._combo("Frame rate", [RATE_NAMES[r] for r in VIDEO_FRAME_RATES])
+        self.video_fps.setToolTip("Frames are dropped, never invented: the ones that stay are the ones the\n"
+                                  "full conversion writes. A rate above the recording's keeps every frame.")
+        self.video_blur = self._check("Motion blur at a lower frame rate")
+        self.video_blur.setToolTip("Each frame written holds the light of the frames it replaces, added up\n"
+                                   "as a longer exposure adds it. Motion is smoother, and softer.\n"
+                                   "Nothing is invented; nothing changes at the original frame rate.")
         self.destination = QLabel()
         self.destination.setProperty("role", "muted")
         self.destination.setWordWrap(True)
         self._add("Save to", self.destination)
         buttons = QHBoxLayout()
         self.choose_folder = QPushButton("Choose a folder…")
+        self.choose_folder.setCursor(Qt.PointingHandCursor)
+        self.choose_folder.setFocusPolicy(Qt.TabFocus)
         self.choose_folder.clicked.connect(self._choose_folder)
         self.reset_folder = QPushButton("Next to the source")
         self.reset_folder.setProperty("role", "ghost")
+        self.reset_folder.setCursor(Qt.PointingHandCursor)
+        self.reset_folder.setFocusPolicy(Qt.TabFocus)
         self.reset_folder.clicked.connect(lambda: self._set("destination", ""))
         buttons.addWidget(self.choose_folder)
         buttons.addWidget(self.reset_folder)
@@ -100,9 +118,12 @@ class AdvancedPanel(QWidget):
         self.gamma.valueChanged.connect(lambda v: self._set("pre_gamma", v / 100.0))
         self.sharpness.valueChanged.connect(lambda v: self._set("sharpness", float(v)))
         self.ai_color.valueChanged.connect(lambda v: self._set("ai_color", float(v)))
+        self.video_enhance.toggled.connect(lambda v: self._set("video_enhance", bool(v)))
         self.image_format.currentIndexChanged.connect(lambda i: self._set("image_format", IMAGE_FORMATS[i]))
         self.video_quality.currentIndexChanged.connect(lambda i: self._set("video_quality", VIDEO_QUALITIES[i]))
         self.video_height.currentIndexChanged.connect(lambda i: self._set("video_height", VIDEO_HEIGHTS[i]))
+        self.video_fps.currentIndexChanged.connect(lambda i: self._set("video_fps", VIDEO_FRAME_RATES[i]))
+        self.video_blur.toggled.connect(lambda v: self._set("video_blur", bool(v)))
         self.use_gpu.toggled.connect(lambda v: self._set("use_gpu", bool(v)))
         self.use_fp16.toggled.connect(lambda v: self._set("use_fp16", bool(v)))
         self.show_histogram.toggled.connect(lambda v: self._set("show_histogram", bool(v)))
@@ -121,7 +142,7 @@ class AdvancedPanel(QWidget):
         self._row += 1
 
     def _combo(self, text: str, entries) -> QComboBox:
-        box = QComboBox()
+        box = Combo()
         box.addItems(entries)
         self._add(text, box)
         return box
@@ -146,13 +167,14 @@ class AdvancedPanel(QWidget):
         row.addWidget(slider, 1)
         row.addWidget(value)
         holder = QWidget()
+        holder.setObjectName("row")               # no ground of its own: the panel shows through
         holder.setLayout(row)
         row.setContentsMargins(0, 0, 0, 0)
         self._add(text, holder)
         return slider, value
 
     def _check(self, text: str) -> QCheckBox:
-        box = QCheckBox(text)
+        box = Switch(text)
         self._grid.addWidget(box, self._row, 0, 1, 2)
         self._row += 1
         return box
@@ -171,9 +193,12 @@ class AdvancedPanel(QWidget):
             self.gamma.setValue(int(round(options.pre_gamma * 100)))
             self.sharpness.setValue(int(round(options.sharpness)))
             self.ai_color.setValue(int(round(options.ai_color)))
+            self.video_enhance.setChecked(options.video_enhance)
             self.image_format.setCurrentIndex(IMAGE_FORMATS.index(options.image_format))
             self.video_quality.setCurrentIndex(VIDEO_QUALITIES.index(options.video_quality))
             self.video_height.setCurrentIndex(VIDEO_HEIGHTS.index(options.video_height))
+            self.video_fps.setCurrentIndex(VIDEO_FRAME_RATES.index(options.video_fps))
+            self.video_blur.setChecked(options.video_blur)
             self.use_gpu.setChecked(options.use_gpu and torch.cuda.is_available())
             self.use_fp16.setChecked(options.use_fp16)
             self.show_histogram.setChecked(options.show_histogram)
@@ -186,6 +211,7 @@ class AdvancedPanel(QWidget):
         self.destination.setText(folder if folder else "Next to the source file")
         self.reset_folder.setVisible(bool(folder))
         self.use_fp16.setEnabled(self.use_gpu.isChecked() and self.use_gpu.isEnabled())
+        self.video_blur.setEnabled(bool(self._options.video_fps))
 
     def _set(self, name: str, value) -> None:
         if self._loading or getattr(self._options, name) == value:

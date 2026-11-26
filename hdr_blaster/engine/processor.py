@@ -49,10 +49,20 @@ class HDRColorProcessor:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
+    def measures(self, color_strength=0.0, edge_strength=0.0, use_enhancement=True) -> bool:
+        """Whether :meth:`process_image` measures anything on the picture with these settings
+        (the colour model's weights, the sharpening's edge maximum). When it does not, an
+        analysis has no need of the picture."""
+        return edge_strength > 0 or bool(use_enhancement and color_strength > 0 and self.color_net.enabled)
+
     def process_image(self, original_tensor, color_strength=0.0, edge_strength=0.0, use_enhancement=True,
-                      params=None, keep_levels=False):
+                      params=None, keep_levels=False, release_cache=True):
         """
         Process an HDR image tensor with color and edge enhancements, returning the processed tensor.
+
+        ``release_cache=False`` keeps the GPU memory this image used for the next one: a
+        video hands the same memory from frame to frame, and giving it back to the driver
+        after each of them costs several milliseconds per frame.
         """
         try:
             tensor = original_tensor.to(self.device, dtype=torch.float16 if self.use_fp16 else torch.float32)
@@ -91,7 +101,8 @@ class HDRColorProcessor:
                 if self.device.type == 'cpu' or (self.device.type == 'cuda' and self.use_fp16):
                     enhanced = enhanced.float()
 
-                self.clear_gpu_memory()
+                if release_cache:
+                    self.clear_gpu_memory()
                 return enhanced
 
         except MissingRenderParam:

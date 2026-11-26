@@ -45,6 +45,7 @@ class QueueStrip(QScrollArea):
             chip.setProperty("role", "chip")
             chip.setProperty("state", item.state)
             chip.setCursor(Qt.PointingHandCursor)
+            chip.setFocusPolicy(Qt.TabFocus)
             chip.setToolTip(item.message or item.path)
             chip.setContextMenuPolicy(Qt.CustomContextMenu)
             chip.clicked.connect(lambda _checked, i=index: self.selected.emit(i))

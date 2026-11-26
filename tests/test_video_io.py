@@ -189,3 +189,85 @@ def test_a_failed_final_rename_leaves_no_partial_file(clip, device, tmp_path, mo
     monkeypatch.setattr(os, "replace", real_replace)
     writer.abort()
     assert list(tmp_path.iterdir()) == []
+
+
+# ------------------------------------------------------ the graphics card as decoder
+
+def test_the_graphics_card_decodes_the_same_code_values_as_the_processor(clip, device):
+    """Decoding HEVC and AV1 is exact by specification: NVDEC must give what FFmpeg gives."""
+    from hdr_blaster.video import reader
+
+    path, _ = clip
+    if device.type != "cuda" or not reader.hardware_decoding(path):
+        pytest.skip("no graphics card that decodes this clip")
+    packets = []
+    plain = list(read_frames(path, device, hardware=False))
+    fast = list(read_frames(path, device, on_packet=packets.append, hardware=True))
+    assert len(fast) == len(plain) > 0 and packets, "audio packets are handed over the same way"
+    for a, b in zip(fast, plain):
+        assert (a.index, a.pts, a.time_s) == (b.index, b.pts, b.time_s)
+        for one, other in ((a.y, b.y), (a.u, b.u), (a.v, b.v)):
+            assert one.dtype == other.dtype and one.shape == other.shape and torch.equal(one, other)
+
+
+def test_without_a_card_that_decodes_the_processor_does(clip, device, monkeypatch):
+    from hdr_blaster.video import reader
+
+    def refuse(stream):
+        raise OSError("no NVDEC here")
+
+    path, _ = clip
+    monkeypatch.setattr(reader, "_open_hardware", refuse)
+    monkeypatch.setattr(reader, "_hardware_checked", {})
+    assert reader.hardware_decoding(path) is False
+    assert len(list(read_frames(path, device))) == len(list(read_frames(path, device, hardware=False)))
+
+
+def test_frames_read_into_main_memory_do_not_share_their_buffer(clip):
+    """The reader reuses one buffer: a frame kept (the stages keep a few) must not change
+    when the next one is read."""
+    path, _ = clip
+    frames = read_frames(path, torch.device("cpu"))
+    first = next(frames)
+    kept = first.y.clone()
+    next(frames), next(frames)
+    assert torch.equal(first.y, kept)
+
+
+def test_a_card_that_decodes_differently_is_not_used(clip, device, monkeypatch, caplog):
+    """The card is trusted only after its first frame came out as the processor decodes it."""
+    import logging
+
+    from hdr_blaster.video import reader
+
+    path, _ = clip
+    if device.type != "cuda" or not reader.hardware_decoding(path):
+        pytest.skip("no graphics card that decodes this clip")
+    real = reader._first_frame
+
+    def one_code_off(path, hardware):
+        frame = real(path, hardware)
+        if hardware:
+            y = frame[1].clone()
+            y[5, 7] += 1
+            frame = (frame[0], y) + frame[2:]
+        return frame
+
+    monkeypatch.setattr(reader, "_hardware_checked", {})
+    monkeypatch.setattr(reader, "_first_frame", one_code_off)
+    with caplog.at_level(logging.WARNING):
+        assert reader.hardware_decoding(path) is False
+    assert "as the processor does" in caplog.text
+    assert len(list(read_frames(path, device))) == 20, "and the file is read all the same"
+
+
+def test_frames_that_are_not_wanted_are_counted_but_not_carried(clip, device):
+    path, _ = clip
+    everything = list(read_frames(path, device))
+    some = list(read_frames(path, device, wanted=lambda index: index % 3 == 0))
+    assert [(f.index, f.pts) for f in some] == [(f.index, f.pts) for f in everything]
+    for light, whole in zip(some, everything):
+        if light.index % 3 == 0:
+            assert torch.equal(light.y, whole.y) and torch.equal(light.u, whole.u) and torch.equal(light.v, whole.v)
+        else:
+            assert light.y is None and light.u is None and light.v is None

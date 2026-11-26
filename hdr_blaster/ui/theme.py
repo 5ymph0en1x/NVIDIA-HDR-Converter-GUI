@@ -5,9 +5,12 @@ INK = "#17161B"        # window background
 VELVET = "#211F27"     # raised surfaces: bars, panel, chips
 VELVET_HI = "#2C2A34"  # hovered or pressed surfaces
 SEAM = "#34313D"       # hairlines
+LIFT = "#3B3846"       # what is chosen or pressed: the pill of a segmented choice
+RIM = "#4C4859"        # the fine edge of a raised or hovered control
+DIM = "#6B6775"        # what cannot be used right now
 IVORY = "#ECE9E4"      # text, and the one prominent button
 MIST = "#9C98A6"       # secondary text
-GREEN = "#76B900"      # the single accent: chosen look, progress
+GREEN = "#76B900"      # the single accent: sliders, switches, progress
 EMBER = "#E0795B"      # errors
 
 FONT_FAMILIES = ["Segoe UI Variable Text", "Segoe UI", "Inter", "Noto Sans"]
@@ -30,51 +33,79 @@ STYLE = f"""
 QWidget {{ background: {INK}; color: {IVORY}; }}
 QWidget#bar, QWidget#header, QWidget#queue {{ background: {VELVET}; }}
 QWidget#panel {{ background: {VELVET}; border-left: 1px solid {SEAM}; }}
+QWidget#row {{ background: transparent; }}
 QLabel {{ background: transparent; }}
 QLabel[role="muted"] {{ color: {MIST}; }}
 QLabel[role="done"] {{ color: {IVORY}; }}
-QLabel[role="section"] {{ color: {MIST}; font-size: 12px; padding-top: 10px; }}
+QLabel[role="section"] {{ color: {MIST}; font-size: 12px; padding-top: 12px; }}
 QLabel#banner {{ background: {VELVET_HI}; color: {IVORY}; padding: 9px 14px; border-left: 3px solid {EMBER}; }}
 QLabel#banner[kind="info"] {{ border-left: 3px solid {GREEN}; }}
 
+/* Buttons are pills. Every one carries a one-pixel edge, shown or not, so that nothing
+   moves when the edge appears (hover, keyboard focus). */
 QPushButton {{
-    background: {VELVET_HI}; color: {IVORY}; border: none; border-radius: 6px;
-    padding: 7px 14px; min-height: 18px;
+    background: {VELVET_HI}; color: {IVORY}; border: 1px solid transparent; border-radius: 15px;
+    padding: 5px 16px; min-height: 18px;
 }}
-QPushButton:hover {{ background: #383542; }}
-QPushButton:pressed {{ background: #413E4C; }}
-QPushButton:disabled {{ color: #6B6775; }}
-QPushButton:focus {{ outline: none; border: 1px solid {MIST}; padding: 6px 13px; }}
+QPushButton:hover {{ background: {LIFT}; border-color: {RIM}; }}
+QPushButton:pressed {{ background: #454150; }}
+QPushButton:disabled {{ color: {DIM}; }}
+QPushButton:focus {{ outline: none; border-color: {MIST}; }}
 
-QPushButton[role="look"] {{ border-radius: 15px; padding: 6px 16px; background: transparent; color: {MIST}; }}
-QPushButton[role="look"]:hover {{ color: {IVORY}; background: {VELVET_HI}; }}
-QPushButton[role="look"]:checked {{ background: {GREEN}; color: #121B02; }}
-QPushButton[role="look"]:focus {{ border: 1px solid {MIST}; padding: 5px 15px; }}
+/* the quiet button: an outline until it is needed */
+QPushButton[role="ghost"] {{ background: transparent; color: {MIST}; border-color: {SEAM}; }}
+QPushButton[role="ghost"]:hover {{ background: {VELVET_HI}; color: {IVORY}; border-color: {RIM}; }}
+QPushButton[role="ghost"]:pressed {{ background: {LIFT}; }}
+QPushButton[role="ghost"]:checked {{ background: {LIFT}; color: {IVORY}; border-color: {RIM}; }}
+QPushButton[role="ghost"]:focus {{ border-color: {MIST}; }}
 
-QPushButton[role="ghost"] {{ background: transparent; color: {MIST}; }}
-QPushButton[role="ghost"]:hover {{ color: {IVORY}; background: {VELVET_HI}; }}
+/* one choice of a segmented control: only its text; the pill is painted by the control */
+QPushButton[role="segment"] {{
+    background: transparent; color: {MIST}; border: 1px solid transparent; border-radius: 15px;
+    padding: 5px 17px; font-weight: 500;
+}}
+QPushButton[role="segment"]:hover {{ background: transparent; color: {IVORY}; border-color: transparent; }}
+QPushButton[role="segment"]:pressed {{ background: transparent; }}
+QPushButton[role="segment"]:checked {{ color: {IVORY}; }}
+QPushButton[role="segment"]:disabled {{ color: {DIM}; }}
+QPushButton[role="segment"]:focus {{ border-color: {MIST}; }}
 
-QPushButton[role="chip"] {{ background: transparent; color: {MIST}; text-align: left; padding: 6px 12px; }}
-QPushButton[role="chip"]:hover {{ background: {VELVET_HI}; color: {IVORY}; }}
-QPushButton[role="chip"]:checked {{ background: {VELVET_HI}; color: {IVORY}; }}
+QPushButton[role="chip"] {{ background: transparent; color: {MIST}; text-align: left; padding: 5px 14px; }}
+QPushButton[role="chip"]:hover {{ background: {VELVET_HI}; color: {IVORY}; border-color: transparent; }}
+QPushButton[role="chip"]:checked {{ background: {LIFT}; color: {IVORY}; border-color: {RIM}; }}
 QPushButton[role="chip"][state="done"] {{ color: {GREEN}; }}
 QPushButton[role="chip"][state="failed"] {{ color: {EMBER}; }}
 
+QSlider {{ background: transparent; }}
+QSlider:horizontal {{ min-height: 22px; }}
 QSlider::groove:horizontal {{ height: 4px; background: {SEAM}; border-radius: 2px; }}
 QSlider::sub-page:horizontal {{ background: {GREEN}; border-radius: 2px; }}
-QSlider::handle:horizontal {{ width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; background: {IVORY}; }}
-QSlider::handle:horizontal:disabled {{ background: #6B6775; }}
+QSlider::sub-page:horizontal:disabled {{ background: {DIM}; }}
+QSlider::handle:horizontal {{
+    width: 12px; margin: -6px 0; border-radius: 8px; background: {IVORY}; border: 2px solid {VELVET};
+}}
+QSlider::handle:horizontal:hover {{ background: #FFFFFF; }}
+QSlider::handle:horizontal:disabled {{ background: {DIM}; }}
 
 QComboBox {{
-    background: {INK}; border: 1px solid {SEAM}; border-radius: 6px; padding: 5px 8px; min-height: 18px;
+    background: {INK}; border: 1px solid {SEAM}; border-radius: 9px; padding: 6px 30px 6px 11px; min-height: 18px;
 }}
-QComboBox:focus {{ border: 1px solid {MIST}; }}
-QComboBox::drop-down {{ border: none; width: 22px; }}
-QComboBox QAbstractItemView {{ background: {VELVET}; border: 1px solid {SEAM}; selection-background-color: {VELVET_HI}; }}
+QComboBox:hover {{ border-color: {RIM}; }}
+QComboBox:focus {{ border-color: {RIM}; }}
+QComboBox:on {{ border-color: {MIST}; }}
+QComboBox:disabled {{ color: {DIM}; }}
+QComboBox::drop-down {{ border: none; width: 28px; }}
+QComboBox::down-arrow {{ image: none; width: 0; height: 0; }}
+QComboBox QAbstractItemView {{
+    background: {VELVET}; border: 1px solid {RIM}; padding: 4px; outline: none;
+    selection-background-color: {LIFT}; selection-color: {IVORY};
+}}
+QComboBox QAbstractItemView::item {{ min-height: 26px; padding: 2px 8px; border-radius: 6px; }}
+QComboBox QAbstractItemView::item:selected {{ background: {LIFT}; color: {IVORY}; }}
 QCheckBox {{ background: transparent; spacing: 8px; }}
 QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid {MIST}; background: {INK}; }}
 QCheckBox::indicator:checked {{ background: {GREEN}; border: 1px solid {GREEN}; }}
-QCheckBox:disabled {{ color: #6B6775; }}
+QCheckBox:disabled {{ color: {DIM}; }}
 QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
 QScrollBar:horizontal {{ height: 6px; background: transparent; }}
 QScrollBar:vertical {{ width: 6px; background: transparent; }}

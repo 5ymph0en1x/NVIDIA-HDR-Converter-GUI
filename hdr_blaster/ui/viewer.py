@@ -65,6 +65,7 @@ class CompareView(QWidget):
         self._browse = QPushButton("Browse…", self)
         self._browse.clicked.connect(self.browse_requested)
         self._browse.setCursor(Qt.PointingHandCursor)
+        self._browse.setFocusPolicy(Qt.TabFocus)
         self._hdr = None                       # the HDR surface, on a screen that takes one
         self._hdr_box = None                   # the widget that holds it
         self._hdr_pictures = None              # (source, result) for it: half floats, 1.0 = 80 nits

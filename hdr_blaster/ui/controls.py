@@ -5,6 +5,7 @@ from PySide6.QtWidgets import QButtonGroup, QHBoxLayout, QLabel, QPushButton, QS
 
 from ..session import LOOKS
 from . import theme
+from .widgets import Segmented
 
 
 class ElidedLabel(QLabel):
@@ -36,7 +37,8 @@ class ElidedLabel(QLabel):
 
 
 class LookBar(QWidget):
-    """Auto, Natural, Punchy, Golden. Exactly one is chosen."""
+    """Faithful, Natural, Punchy, Golden: one segmented choice. One is chosen, or none
+    when an advanced operator replaces the looks."""
 
     look_chosen = Signal(str)
 
@@ -44,22 +46,18 @@ class LookBar(QWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(12)
         label = QLabel("Look")
         label.setProperty("role", "muted")
         layout.addWidget(label)
-        layout.addSpacing(6)
+        self._choice = Segmented()
+        layout.addWidget(self._choice)
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
         self.buttons = {}
         for name in LOOKS:
-            button = QPushButton(name)
-            button.setCheckable(True)
-            button.setProperty("role", "look")
-            button.setCursor(Qt.PointingHandCursor)
-            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            button = self._choice.add(name)
             self._group.addButton(button)
-            layout.addWidget(button)
             self.buttons[name] = button
             button.clicked.connect(lambda _checked, n=name: self.look_chosen.emit(n))
 
@@ -84,6 +82,7 @@ class ConvertButton(QPushButton):
         super().__init__("Convert", parent)
         self._progress = None                       # None: idle; 0..1 while working
         self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.TabFocus)
         self.setMinimumWidth(150)
         font = self.font()
         font.setPixelSize(14)
@@ -117,15 +116,21 @@ class ConvertButton(QPushButton):
         painter = QPainter(self)
         painter.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
         box = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = box.height() / 2                   # a pill, like every button of the window
         shape = QPainterPath()
-        shape.addRoundedRect(box, 8, 8)
+        shape.addRoundedRect(box, radius, radius)
         painter.setClipPath(shape)
         if self._progress is None:
-            base = theme.IVORY if self.isEnabled() else theme.VELVET_HI
-            painter.fillRect(box, theme.colour("#FFFFFF" if (self.underMouse() and self.isEnabled()) else base))
-            painter.setPen(theme.colour(theme.INK if self.isEnabled() else "#6B6775"))
+            if not self.isEnabled():
+                ground = theme.VELVET_HI
+            elif self.isDown():
+                ground = "#D8D4CD"
+            else:
+                ground = "#FFFFFF" if self.underMouse() else theme.IVORY
+            painter.fillRect(box, theme.colour(ground))
+            painter.setPen(theme.colour(theme.INK if self.isEnabled() else theme.DIM))
         else:
-            painter.fillRect(box, theme.colour(theme.VELVET_HI))
+            painter.fillRect(box, theme.colour(theme.LIFT))
             painter.fillRect(QRectF(box.left(), box.top(), box.width() * self._progress, box.height()),
                              theme.colour(theme.GREEN, 150))
             painter.setPen(theme.colour(theme.IVORY))
@@ -135,7 +140,7 @@ class ConvertButton(QPushButton):
             painter.setClipping(False)
             painter.setPen(theme.colour(theme.MIST))
             painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(box, 8, 8)
+            painter.drawRoundedRect(box.adjusted(2, 2, -2, -2), radius - 2, radius - 2)
         painter.end()
 
 
@@ -161,12 +166,14 @@ class ActionBar(QWidget):
         self.reveal = QPushButton("Show in folder")
         self.reveal.setProperty("role", "ghost")
         self.reveal.setCursor(Qt.PointingHandCursor)
+        self.reveal.setFocusPolicy(Qt.TabFocus)
         self.reveal.hide()
         self.reveal.clicked.connect(self.reveal_clicked)
         layout.addWidget(self.reveal)
         self.cancel = QPushButton("Cancel")
         self.cancel.setProperty("role", "ghost")
         self.cancel.setCursor(Qt.PointingHandCursor)
+        self.cancel.setFocusPolicy(Qt.TabFocus)
         self.cancel.hide()
         self.cancel.clicked.connect(self.cancel_clicked)
         layout.addWidget(self.cancel)
