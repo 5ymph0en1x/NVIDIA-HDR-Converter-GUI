@@ -1,0 +1,11 @@
+# Text files keep LF line endings in the repository and in every checkout,
+# whatever core.autocrlf says on the machine.
+* text=auto eol=lf
+
+# Never converted.
+*.pth binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.jxr binary
+*.mp4 binary

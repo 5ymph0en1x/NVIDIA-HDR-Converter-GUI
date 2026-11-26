@@ -1,74 +1,115 @@
-# NVIDIA HDR Converter GUI
+# NVIDIA HDR Converter GUI — HDR Blaster
 
-Convert NVIDIA HDR screenshots (JXR format) to JPEG with advanced AI enhancement and intelligent tone mapping.
+**Version 3.0.0**
+
+Convert NVIDIA HDR captures to SDR: JXR screenshots to JPEG or TIFF, and HDR10 recordings to
+H.264 video, in one window. Version 3 of *NVIDIA HDR Converter GUI* is a new application,
+called HDR Blaster; `NHC.py` still starts it.
 
 <p align="center">
-  <img width="1024" src="interface.jpg">
+  <img width="1024" src="docs/screenshot.png">
 </p>
+
+## What's new in 3.0.0
+
+- **A new window** (Qt): drop a file, look at the HDR source and the SDR result on either
+  side of a divider, convert. Four looks up front, everything else in an Advanced panel.
+- **Videos**: HDR10 recordings are converted to H.264 SDR, with their audio untouched.
+- **Faithful by default**: the result shows the scene at the luminance the game gave it;
+  only what is brighter than your screen's white is rolled off (ITU-R BT.2390).
+- **Every look and operator keeps the picture's dark tones and mid-grey.** They are
+  variations of the same picture, not re-exposures of it, and each classical operator has
+  a character of its own.
+- **The HDR source is shown in real HDR** on a display with HDR switched on, as Windows'
+  own viewer shows it.
+- **The preview is the conversion**: rendered at the file's size, shown pixel for pixel.
+- **Commands without the window**: `--convert`, `--convert-video`, `--version`.
+- The author's image-adaptive 3D LUT colour models are unchanged (the *AI colour* setting).
 
 ## Features
 
-### Core Functionality
-- **Convert NVIDIA JXR (HDR)** screenshots to JPEG format
-- **Intelligent HDR tone mapping** with automatic algorithm selection
-- **AI-powered color enhancement** using ensemble deep learning models
-- **Batch processing** support for folders
-- **Live preview** with before/after comparison and histogram visualization
-- **HDR metadata extraction** from JXR files for optimal processing
+### Core functionality
+- **JXR captures** (HDR screenshots) to JPEG and/or TIFF
+- **HDR10 recordings** to H.264 SDR video, never heavier than the source
+- **Looks and operators** that keep what the game decided (see *Renderings*)
+- **Batch processing**: several files or a folder, in a queue
+- **The HDR source shown in real HDR.** On a display with HDR switched on, the picture area
+  is presented in HDR (an scRGB surface, like Windows' own viewer): on the left of the
+  divider the capture as the game showed it, with its lights far above the window's white;
+  on the right the SDR result at the luminance an SDR window gives it on that screen. On a
+  display without HDR the source is shown in the SDR window, cut at its white, and labelled so
+- **Live preview** with before/after comparison and an optional histogram. Both pictures
+  are rendered at the file's real size and brought to the window in a single Spline36
+  resampling (anti-ringing, linear light when reducing); shown at the file's size they are
+  its pixels, untouched
 
-### AI Color Enhancement
-- **Multi-model ensemble** using VGG16, ResNet34, and DenseNet121
-- **CBAM attention mechanism** for spatial and channel-wise feature enhancement
-- **Perceptual color preservation** during tone mapping
+### AI colour enhancement
+- **Image-adaptive 3D LUT** pretrained on the MIT-Adobe FiveK dataset (Zeng et al., TPAMI 2020)
+- **Per-image LUT prediction**: a lightweight CNN blends 3 basis 33×33×33 LUTs based on each input's content
+- **Pure-PyTorch trilinear interpolation** via `F.grid_sample` — no CUDA extension to compile
 - **Edge enhancement** with Sobel filters and adaptive strength control
-- **Color balance optimization** across shadows, midtones, and highlights
 - **Half-precision (FP16)** support for memory-efficient GPU processing
+- **~2.4 MB pretrained weights**, included in `models/3dlut/` (downloaded on first launch if missing)
 
-### Advanced Tone Mapping Algorithms
-- **Perceptual** - Advanced tone mapping preserving local contrast and color relationships
-- **Adaptive** - Intelligent blending of multiple operators based on image regions
-- **Mantiuk06** - Contrast-based tone mapping with local adaptation
-- **Drago03** - Logarithmic tone mapping optimized for extreme dynamic ranges
-- **Hable** - Filmic tone mapping curve (Uncharted 2)
-- **ACES** - Academy Color Encoding System RRT+ODT
-- **Reinhard** - Extended Reinhard with white point adaptation
-- **Filmic** - Cinematic tone mapping
-- **Uncharted2** - Game-optimized tone mapping
+### Renderings
+A game's HDR picture is finished work, so every rendering keeps what the game decided and
+only handles what is brighter than SDR white. All of them obey the same rules: dark tones
+are the scene's own, mid-grey stays mid-grey, the scene's peak lands on white. They differ
+above the shadows.
 
-### Intelligent Processing
-- **Automatic tone mapping selection** based on comprehensive image analysis
-- **Scene classification** (high-key, low-key, extreme highlights detection)
-- **Dynamic range analysis** with histogram-based optimization
-- **Local contrast preservation** and enhancement
-- **Color saturation analysis** and adaptive correction
+- **Faithful** ⭐ — the default: the scene at its own luminance; only what exceeds your screen's
+  white is rolled off (ITU-R BT.2390), hues kept.
+- **Natural / Punchy / Golden** — Faithful, graded: softer with fading highlights; more
+  contrast and colour; punchy in a warm light.
+- The classical operators, each with the trait it is known for. (Held to the same shadows,
+  mid-grey and peak, their published curves are the same curve to within a level or two;
+  what tells them apart is how each treats the tones above the shadows.)
+  - **Reinhard** — soft: nothing touched up to mid-grey, a gentle shoulder from there; bright
+    colours go pastel.
+  - **Hable** — film: more contrast in the mid-tones, muted colours, lights that fade.
+  - **ACES** — vivid: strong contrast, rich mid-tones, lights that burn to white.
+  - **Drago03** — flat: the whole range above the shadows compressed evenly, colours kept.
+  - **Perceptual** — luminous: the BT.2390 roll-off in ICtCp. A coloured light keeps its hue
+    and its brightness; its colour yields (Faithful keeps the colour and lets it darken).
+  - **Mantiuk06** — local: a soft roll-off of the large shapes, their local contrast
+    reinforced (grain is left alone).
+- **Adaptive** — two of the operators, chosen from the picture and blended by brightness.
+- **Auto-select** — one operator chosen from the picture's statistics (dynamic range,
+  highlights, local contrast, saturation).
+- **Neural (AI)** — HDRNet-style learned operator, taught by Punchy. See
+  [`training/README.md`](training/README.md) to retrain or fine-tune.
 
-### User Interface
-- **Modern dark-themed GUI** with TKinterModernThemes
-- **Dual preview modes** (Big/Small) with resizable interface
-- **Real-time histogram visualization** with RGB channel analysis
-- **Progress tracking** for batch operations
-- **Device switching** (GPU/CPU) with live performance monitoring
-- **Parameter adjustment** with live preview updates
+### User interface
+- **One window**: drop a file, look, convert
+- **HDR source and SDR result side by side** under a divider you drag
+- **Four looks** up front (Faithful, Natural, Punchy, Golden); everything else in an Advanced panel
+- **The source view is the original**: Exposure and Gamma shape the result only
+- **Queue** for several captures and recordings, progress and cancel on the one button
+- **Exact video preview** once the recording has been analysed in the background
+- **Nothing is ever overwritten**: results are written as `<name>_SDR`, numbered if needed
 
 ## Requirements
 
-### System Requirements
-- **Python 3.8+**
-- **NVIDIA GPU** (recommended) with CUDA support now available in exe
+### System requirements
+- **Windows 10 or 11** (built and tested there)
+- **Python 3.14+**
+- **NVIDIA GPU** (recommended) with CUDA support; the CPU path works but is slow
 - **4GB+ RAM** (8GB+ recommended for large images)
 
-### Python Dependencies
+### Python dependencies
 ```txt
-torch>=2.0.0
-torchvision>=0.15.0
-Pillow==10.2.0
-numpy==1.26.4
-matplotlib==3.9.3
-imagecodecs==2024.9.22
-TKinterModernThemes==1.10.4
+torch==2.11.0
+numpy==2.4.3
+pillow==12.1.1
+imagecodecs==2026.5.10
+tifffile==2026.5.2
+av==19.0.2
+pyside6-essentials==6.12.0
 ```
 
-**Install PyTorch:** Visit https://pytorch.org/ for CUDA-compatible installation
+**Install PyTorch first**, from the PyTorch index, to get the CUDA build:
+`pip install torch --index-url https://download.pytorch.org/whl/cu130`.
+The dependencies are declared in `pyproject.toml`; `requirements.txt` mirrors them.
 
 ## Installation
 
@@ -80,6 +121,7 @@ TKinterModernThemes==1.10.4
 
 2. **Install dependencies:**
    ```bash
+   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
    pip install -r requirements.txt
    ```
 
@@ -88,124 +130,119 @@ TKinterModernThemes==1.10.4
    python NHC.py
    ```
 
+A standalone `HDR_Blaster.exe` (no Python needed) can be built with PyInstaller: see
+[`BUILD.md`](BUILD.md).
+
 ## Usage
 
-### Single File Conversion
-1. Launch the application
-2. Select **"Single File"** mode
-3. Browse and select input JXR file
-4. Choose output JPEG location
-5. Adjust parameters (gamma, exposure, enhancement strength)
-6. Click **"Convert"**
+### The window
 
-### Batch Processing
-1. Select **"Folder"** mode
-2. Choose folder containing JXR files
-3. Configure enhancement parameters
-4. Click **"Convert"**
-
-> **Note:** Converted files are saved in a `Converted_JPGs` subfolder with automatic naming
-
-### Parameter Configuration
-
-#### Basic Parameters
-- **Tone Map**: Displays auto-detected optimal algorithm
-- **Gamma**: Pre-gamma correction (0.1-3.0, default: 1.0)
-- **Exposure**: Auto-exposure adjustment (0.1-3.0, default: 1.0)
-
-#### AI Enhancement Controls
-- **Enable AI Enhancement**: Toggle neural network-based color correction
-- **Strength**: Edge enhancement intensity (0-100%, default: 50%)
-
-#### Device Settings
-- **GPU/CPU Selection**: Automatic CUDA detection with fallback
-- **Half-Precision Toggle**: Enable FP16 for memory efficiency (GPU only)
-
-### Interface Modes
-- **Big Mode**: 2200×850 window with 720×406 previews
-- **Small Mode**: 1760×840 window with 512×288 previews
-
-## Technical Architecture
-
-### HDR Processing Pipeline
-1. **JXR Decoding** with metadata extraction
-2. **Image Analysis** for optimal tone mapping selection
-3. **Tone Mapping** using selected algorithm
-4. **AI Enhancement** (optional) with color correction
-5. **Edge Enhancement** (optional) with adaptive filtering
-6. **sRGB Conversion** and JPEG encoding
-
-### AI Enhancement Architecture
-```
-Input → VGG16 Features    ↘
-     → ResNet34 Features  → Feature Fusion → CBAM Attention → Color Transform → Output
-     → DenseNet Features  ↗
+```bash
+python NHC.py            # or: python -m hdr_blaster
 ```
 
-### Key Components
-- **HDRMetadata**: Extracts luminance and color space information
-- **AdvancedToneMapper**: Multi-algorithm tone mapping with automatic selection
-- **PerceptualColorPreserver**: CIE LAB color space preservation
-- **ColorCorrectionNet**: Ensemble deep learning model
-- **EdgeEnhancementBlock**: Sobel-based edge detection and enhancement
-- **DeviceManager**: GPU/CPU switching with memory optimization
+1. Drop a JXR capture, an HDR10 recording, several files or a folder on the window.
+2. Look at the result: the unconverted picture is on the left of the divider, the
+   converted one on the right. Drag the divider. For a video, the timeline chooses
+   the frame; once the video has been analysed in the background the preview is
+   exactly the frame the converted file will contain.
+3. Pick a look if you wish (Faithful, Natural, Punchy, Golden) and press **Convert**.
+   The classical operators, *Auto-select* and the neural operator are in Advanced, under Operator.
 
-### Performance Optimizations
-- **Memory-efficient tensor operations** with automatic cleanup
-- **Multi-threaded processing** for batch operations
-- **Progressive image loading** for large files
-- **CUDA memory management** with automatic cache clearing
-- **Half-precision support** reducing memory usage by 50%
+The result is written next to the source as `<name>_SDR.jpg` or `<name>_SDR.mp4`,
+never over an existing file. Everything else (precise operator, exposure, sharpness,
+AI colour, formats, video quality and size, destination folder, GPU or CPU) is in the
+**Advanced** panel.
 
-### Image Analysis Metrics
-- **Dynamic range analysis** (min/max/mean luminance)
-- **Zone system analysis** (shadow/midtone/highlight distribution)
-- **Local contrast measurement** with variance analysis
-- **Color saturation evaluation** across channels
-- **Scene classification** (high-key/low-key/extreme highlights)
+### Without the window
 
-## Supported Formats
+```bash
+python NHC.py --convert capture.jxr [--method punchy] [--format JPEG|TIFF|Both]
+python NHC.py --convert-video recording.mp4 [--method punchy] [--quality high|balanced|compact] [--height 1080]
+python NHC.py --version
+```
+
+Both commands render Faithful unless told otherwise (`--method auto` lets the engine pick
+an operator) and write `<name>_SDR` next to the source, never over an existing file.
+
+Videos: HDR10 (PQ, BT.2020, 10-bit) recordings are converted to H.264 SDR with the
+source's own timestamps and its audio copied untouched. The result is never heavier
+than the source.
+
+## Technical architecture
+
+### Processing pipeline
+1. **Decoding**: a JXR capture (floating-point scRGB) or a frame of an HDR10 recording
+2. **Rendering** with the chosen look or operator (**Faithful** by default); a video is
+   analysed first, so that its measured parameters are steady within each shot
+3. **AI colour retouch** (optional) via the image-adaptive 3D LUT
+4. **Edge enhancement** (optional)
+5. **sRGB conversion**, dithering, and JPEG/TIFF or H.264 encoding
+
+### AI enhancement architecture
+```
+                          ┌─ basis LUT 0 (3×33×33×33) ─┐
+Input (downsampled 256²) → Classifier CNN → 3 weights →┤  basis LUT 1                ├→ combined LUT → trilinear lookup → Output
+                          └─ basis LUT 2                ┘
+```
+The classifier (~440 K params) predicts 3 blending weights from a 256×256 downsampled view of the input.
+The 3 basis LUTs are linearly combined into a single image-adaptive 3D LUT, then applied to the full-resolution image via trilinear interpolation (pure PyTorch `F.grid_sample`).
+Total inference cost: ~600 K params, sub-millisecond on a modern GPU.
+
+### Layout of the code
+- `NHC.py` — the launcher
+- `hdr_blaster/engine/` — the renderings (`renderings.py`), tone-mapping dispatch and the
+  Auto-select choice (`tonemap.py`), the 3D LUT colour models (`lut3d.py`), sharpening
+- `hdr_blaster/io/` — JXR reading; `hdr_blaster/video/` — HDR10 decoding, analysis, encoding
+- `hdr_blaster/preview.py`, `hdr_blaster/resample.py` — what the window shows
+- `hdr_blaster/ui/` — the window, and the HDR surface (`hdr_surface.py`)
+- `training/` — the neural tone mapper: model, training code, shipped checkpoint
+- `models/3dlut/` — the 3D LUT weights
+- `tests/` — the test suite; `tools/` — icon generation, on-screen HDR check
+
+### Tests
+```bash
+pip install pytest
+python -m pytest
+```
+The tests need real captures: put a few `.jxr` files in `samples/` first (without them
+most tests are skipped, and one fails to say so). Reading a capture, the colour models, the original sharpening and the files
+written are checked bit for bit against a frozen copy of the original application
+(`tests/legacy/`). On a display with HDR switched on, `HDR_BLASTER_ONSCREEN=1` adds a check
+that reads back what the HDR surface presents.
+
+## Supported formats
 
 ### Input
-- **JXR files** (JPEG XR) from NVIDIA HDR screenshots
-- **HDR metadata** automatic extraction and utilization
+- **JXR captures** (JPEG XR, floating-point scRGB) from the NVIDIA app or Windows
+- **HDR10 recordings** (PQ, BT.2020, 10-bit 4:2:0) in MP4, MKV or MOV
 
 ### Output
-- **JPEG** with optimized quality settings (95% quality, optimized compression)
+- **JPEG** (4:4:4, dithered) and/or **TIFF** for captures
+- **MP4** (H.264, BT.709) for recordings, never heavier than the source
 
-## Logging and Debugging
-- **Comprehensive logging** to `hdr_converter.log`
-- **Real-time status updates** in GUI
-- **Error handling** with detailed messages
-- **Performance metrics** logging
+## Logging
+- The window writes its log to `%LOCALAPPDATA%\HDR Blaster\hdr_blaster.log`
+- The commands without the window write `hdr_converter.log` in the current folder
 
-## Known Limitations
-- **JXR format only** - other HDR formats not supported
-- **NVIDIA screenshots** - optimized for NVIDIA HDR capture format
-- **Memory requirements** - large images may require significant RAM
+## Known limitations
+- **HDR input only**: SDR, HLG and Dolby Vision files are refused with an explanation
+- **Windows**: built and tested on Windows with an NVIDIA GPU; the CPU path works but is slow
+- **Real HDR display of the source** needs Windows with HDR switched on for the screen the
+  window is on; elsewhere the source is shown cut at the window's white
+- **Video speed**: about 20 frames per second at 1440p on an RTX 4090
 
 ## Troubleshooting
-
-### Common Issues
-- **"imagecodecs version compatibility"**: Update imagecodecs to latest version
-- **CUDA out of memory**: Enable FP16 mode or switch to CPU processing
-- **JXR decode failure**: Ensure file is valid NVIDIA HDR screenshot
-
-### Performance Tips
-- **Use GPU mode** for faster processing
-- **Enable FP16** to reduce memory usage
-- **Close other applications** when processing large batches
-- **Use Small mode** for lower memory usage
+- **CUDA out of memory**: tick *Half precision* or untick the GPU in the Advanced panel
+- **A capture is refused**: only floating-point JXR captures (HDR screenshots) are accepted
+- **A video is refused**: only HDR10 (PQ, BT.2020) recordings are accepted
 
 ## Acknowledgments
-- **PyTorch** pretrained models (VGG16, ResNet34, DenseNet121)
-- **TKinterModernThemes** for modern GUI design
+- **Hui Zeng et al.** for the [Image-Adaptive 3D LUT](https://github.com/HuiZeng/Image-Adaptive-3DLUT) model (TPAMI 2020) — pretrained weights used under Apache 2.0
+- **MIT-Adobe FiveK** dataset (Bychkovsky et al.) used to train the LUT model
+- **Qt for Python (PySide6)** for the interface, **PyAV / FFmpeg** for video
 - **imagecodecs** for JXR decoding support
 - **NVIDIA** for HDR screenshot format documentation
 
 ## License
-This project is open source. Please check the license file for details.
-
----
-
-**Version**: Enhanced Edition with AI-powered processing and intelligent tone mapping
+This project is open source. Please check the [license file](LICENSE) for details.

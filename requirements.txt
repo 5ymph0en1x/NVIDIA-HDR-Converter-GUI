@@ -1,8 +1,9 @@
-torch>=2.5.1
-torchvision>=0.16.1
-Pillow>=10.2.0
-numpy>=1.26.4
-matplotlib>=3.9.3
-imagecodecs>=2024.9.22
-TKinterModernThemes>=1.10.4
-tifffile
+# Install torch first, from the PyTorch index, to get the CUDA build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+torch==2.11.0
+numpy==2.4.3
+pillow==12.1.1
+imagecodecs==2026.5.10
+tifffile==2026.5.2
+av==19.0.2
+pyside6-essentials==6.12.0

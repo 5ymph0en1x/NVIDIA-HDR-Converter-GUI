@@ -1,0 +1,24 @@
+# environments
+.venv/
+training/venv/
+# local tooling
+.claude/
+.superpowers/
+# data too heavy for git
+samples/
+training/datasets/
+training/checkpoints/epoch_*.pth
+training/checkpoints/val_*/
+*.mp4
+*.mkv
+*.mov
+# build and run outputs
+dist/
+build/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+training/checkpoints_*/
+# the folder assembled for upload (tools/make_release.py)
+to_GitHub/
