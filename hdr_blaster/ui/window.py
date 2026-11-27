@@ -6,19 +6,26 @@ from dataclasses import replace
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtCore import QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QImage
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSlider, QVBoxLayout, QWidget
 
 from ..display import display_of_window
 from ..session import Options, Queue, collect, describe_output, display_name
 from .advanced import PANEL_WIDTH, AdvancedPanel
 from .controls import ActionBar, ElidedLabel
-from .queue_strip import QueueStrip
+from .queue_panel import QUEUE_WIDTH, QueueButton, QueuePanel
 from .viewer import CompareView, histogram_of
 from .workers import Backend
 
 STAGES = {"method": "Choosing the operator", "analyse": "Analysing", "render": "Converting"}
 FILE_FILTER = "HDR captures and recordings (*.jxr *.mp4 *.mkv *.mov);;All files (*)"
+PICTURE_ROOM = 360          # what the picture keeps between the two panels; less, and one of them closes
+# The part of a file's conversion each pass stands for, by the pass it began with: a video
+# already analysed for its preview is only rendered, one whose operator is chosen by the
+# program is read three times. Rough shares of the time, for the line of the whole run.
+PASSES = {"method": {"method": (0.0, 0.25), "analyse": (0.25, 0.6), "render": (0.6, 1.0)},
+          "analyse": {"analyse": (0.0, 0.45), "render": (0.45, 1.0)},
+          "render": {"render": (0.0, 1.0)}}
 
 
 def clock(seconds: float) -> str:
@@ -30,6 +37,7 @@ class MainWindow(QMainWindow):
     _show = Signal(int, str, str, float, object, object, bool, str)
     _analyse = Signal(int, str, object)
     _convert = Signal(object, object)
+    _thumbnail = Signal(str, str, object, str)
 
     def __init__(self, settings_path: str = ""):
         super().__init__()
@@ -52,6 +60,10 @@ class MainWindow(QMainWindow):
         self._saved = None                     # (text, file, settings) of the last success
         self._job_index = self._job_total = self._run_saved = 0
         self._panel_open = False
+        self._first_pass = None                    # the pass the file being converted began with
+        self._left_out = []                        # files just taken out because they cannot be converted
+        self._queue_open = False
+        self._queue_dismissed = False              # closed by hand: it does not open by itself again
 
         # ----- layout
         centre = QWidget()
@@ -64,7 +76,11 @@ class MainWindow(QMainWindow):
         header.setObjectName("header")
         header.setAttribute(Qt.WA_StyledBackground, True)
         row = QHBoxLayout(header)
-        row.setContentsMargins(18, 9, 12, 9)
+        row.setContentsMargins(12, 9, 12, 9)
+        self.queue_button = QueueButton()
+        self.queue_button.clicked.connect(lambda: self.toggle_queue(by_hand=True))
+        row.addWidget(self.queue_button)
+        row.addSpacing(12)
         self.file_label = ElidedLabel(Qt.ElideMiddle)
         self.file_label.set_full_text("No file yet")
         self.detail_label = QLabel("")
@@ -137,12 +153,6 @@ class MainWindow(QMainWindow):
         self.bar.reveal_clicked.connect(self.reveal)
         column.addWidget(self.bar)
 
-        self.strip = QueueStrip()
-        self.strip.selected.connect(self.select)
-        self.strip.removed.connect(self.remove)
-        self.strip.hide()
-        column.addWidget(self.strip)
-
         self.panel = AdvancedPanel(self.viewer)
         self.panel.set_options(self.options)
         self.panel.changed.connect(self._on_advanced)
@@ -154,6 +164,19 @@ class MainWindow(QMainWindow):
         self._slide.finished.connect(self._after_slide)
         self._slide.valueChanged.connect(self._follow_panel)
         self.viewer.resized.connect(self._place_panel)
+
+        self.queue_panel = QueuePanel(self.viewer)
+        self.queue_panel.selected.connect(self.select)
+        self.queue_panel.removed.connect(self.remove)
+        self.queue_panel.add_requested.connect(self.browse)
+        self.queue_panel.clear_requested.connect(self.clear_finished)
+        self.queue_panel.close_requested.connect(lambda: self.toggle_queue(False, by_hand=True))
+        self.queue_panel.hide()
+        self._slide_queue = QPropertyAnimation(self.queue_panel, b"geometry", self)
+        self._slide_queue.setDuration(180)
+        self._slide_queue.setEasingCurve(QEasingCurve.OutCubic)
+        self._slide_queue.finished.connect(self._after_slide)
+        self._slide_queue.valueChanged.connect(self._follow_panel)
         # The room for the picture changed (window resized, panel opened): once it has
         # settled, ask for the picture at its new size. It is never stretched to fit.
         self._asked_box = None
@@ -170,6 +193,9 @@ class MainWindow(QMainWindow):
         self._show.connect(self.backend.show)
         self._analyse.connect(self.backend.analyse)
         self._convert.connect(self.backend.convert)
+        self._thumbnail.connect(self.backend.thumbnail)
+        self.backend.thumbnail_ready.connect(self._on_thumbnail)
+        self.backend.thumbnail_refused.connect(self._on_thumbnail_refused)
         self.backend.preview_ready.connect(self._on_preview)
         self.backend.preview_failed.connect(self._on_preview_failed)
         self.backend.analysis_progress.connect(self._on_analysis_progress)
@@ -198,6 +224,7 @@ class MainWindow(QMainWindow):
 
     def add_paths(self, paths) -> None:
         items, rejected = collect(paths)
+        self._left_out = []                        # what these files turn out to be is a new matter
         first_new = len(self.queue.items)
         added = self.queue.add(items)
         if rejected:
@@ -208,12 +235,25 @@ class MainWindow(QMainWindow):
             self.notify("Already in the list.", kind="info")
         if added:
             self.select(first_new)
+            # the file shown gives its own picture to its row; the others are read behind
+            for item in self.queue.items[first_new + 1:]:
+                self._ask_thumbnail(item)
+            # Several files: the queue shows itself, unless the user closed it, or the settings
+            # are open and there is no room for both (its button then tells how many wait).
+            if len(self.queue.items) > 1 and not self._queue_open and not self._queue_dismissed \
+                    and (not self._panel_open or self._room_for_both()):
+                self.toggle_queue(True)
         else:
             self._refresh()
 
     def select(self, index: int) -> None:
         if not 0 <= index < len(self.queue.items):
             return
+        # A file left before its preview came (another row clicked at once) has given no
+        # picture to its row: it is read behind, as for the files that were never shown.
+        left = self.queue.current
+        if left is not None and left is not self.queue.items[index] and self.queue_panel.wants_thumbnail(left.path):
+            self._ask_thumbnail(left)
         self.queue.selected = index
         self.timeline.blockSignals(True)
         self.timeline.setValue(0)
@@ -228,12 +268,32 @@ class MainWindow(QMainWindow):
         was_current = index == self.queue.selected
         self.queue.remove(index)
         if not self.queue.items:
-            self.backend.latest_show += 1
-            self.backend.analysis_token += 1
-            self.viewer.clear()
-            self._facts = None
+            self._emptied()
         elif was_current:
             self.select(self.queue.selected)
+            return
+        self._refresh()
+
+    def _emptied(self) -> None:
+        self.backend.latest_show += 1
+        self.backend.analysis_token += 1
+        self.backend.forget_thumbnails()
+        self.viewer.clear()
+        self._facts = None
+
+    def clear_finished(self) -> None:
+        """Take the converted files out of the queue."""
+        if self._converting:
+            return
+        current, at = self.queue.current, self.queue.selected
+        self.queue.items = [item for item in self.queue.items if item.state != "done"]
+        if not self.queue.items:
+            self.queue.selected = -1
+            self._emptied()
+        elif current in self.queue.items:
+            self.queue.selected = self.queue.items.index(current)
+        else:
+            self.select(min(at, len(self.queue.items) - 1))
             return
         self._refresh()
 
@@ -284,14 +344,55 @@ class MainWindow(QMainWindow):
         self.viewer.set_source_tag("HDR source" if self.viewer.shows_hdr()
                                    else f"HDR source, white at {round(facts['white_nits'])} nits")
         self.viewer.set_histogram(histogram_of(after) if self.options.show_histogram else None)
+        if self.queue_panel.wants_thumbnail(item.path):
+            self._on_thumbnail(item.path, before)   # its row gets the picture just made, for nothing more
         self._refresh()
+
+    def _ask_thumbnail(self, item) -> None:
+        self._thumbnail.emit(item.path, item.kind, self.options.to_dict(), display_of_window(int(self.winId())))
+
+    def _on_thumbnail_refused(self, path: str, message: str) -> None:
+        """A file read for its row turned out not to be one this program converts (a video
+        that is not HDR10, a capture that is not HDR): as a file that cannot be shown, it
+        leaves the list, and the window says why. Not during a conversion: the conversion
+        says it then, on the row."""
+        index = next((i for i, item in enumerate(self.queue.items) if item.path == path), -1)
+        if index < 0 or index == self.queue.selected or self._converting:
+            return
+        self._leave_out(self.queue.items[index].name, message)
+        self.queue.remove(index)
+        self._refresh()
+
+    def _leave_out(self, name: str, message: str) -> None:
+        """Say why a file left the list. Several in a row (a folder with videos that are not
+        HDR) are named together: each one's message would only replace the one before."""
+        if not self.banner.isVisible():
+            self._left_out = []
+        self._left_out.append(name)
+        if len(self._left_out) == 1:
+            self.notify(message if name in message else f"{name}: {message}", keep=True)
+        else:
+            names = ", ".join(self._left_out[:3]) + ("…" if len(self._left_out) > 3 else "")
+            self.notify(f"{len(self._left_out)} files cannot be converted and were left out: {names}. "
+                        "JXR screenshots and HDR10 videos can be converted.", keep=True)
+
+    def _on_thumbnail(self, path: str, rgb) -> None:
+        """A picture of a file for its row in the queue: ``rgb`` is (h, w, 3) bytes, any size."""
+        if not self.queue_panel.wants_thumbnail(path):
+            return
+        height, width = rgb.shape[:2]
+        image = QImage(rgb.tobytes(), width, height, 3 * width, QImage.Format_RGB888)
+        wide, tall = self.backend.THUMBNAIL
+        if width > wide or height > tall:
+            image = image.scaled(wide, tall, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.queue_panel.set_thumbnail(path, image.copy())
 
     def _on_preview_failed(self, request: int, message: str) -> None:
         item = self.queue.current
         if request != self.backend.latest_show or item is None:
             return
         # A file that cannot even be shown does not stay in the list: say why, and move on.
-        self.notify(message if item.name in message else f"{item.name}: {message}")
+        self._leave_out(item.name, message)
         self.backend.analysis_token += 1
         self.queue.remove(self.queue.selected)
         self._facts = None
@@ -355,6 +456,7 @@ class MainWindow(QMainWindow):
         self.backend.stop_convert = False
         self.banner.hide()
         self.bar.convert.set_working("Starting…", 0.0)
+        self.queue_panel.set_overall(0.0)
         self._refresh()
         self._convert.emit(jobs, self.options.to_dict())
 
@@ -365,8 +467,10 @@ class MainWindow(QMainWindow):
 
     def _on_item_started(self, index: int) -> None:
         self._job_index += 1
+        self._first_pass = None
         self.queue.items[index].state = "working"
         self._refresh()
+        self.queue_panel.set_progress(index, "Starting…", None)
 
     def _on_item_progress(self, index: int, stage: str, done: int, total: int) -> None:
         if not self._converting or self.backend.stop_convert:
@@ -376,8 +480,17 @@ class MainWindow(QMainWindow):
         fraction = min(1.0, done / total) if total else 0.0
         prefix = f"{self._job_index} of {self._job_total}, " if self._job_total > 1 else ""
         verb = STAGES.get(stage, "Converting")
-        percent = f" {int(100 * fraction)} %" if total else ""
+        # A capture is one step: nothing to count, it is being converted and then it is done.
+        counted = total > 1
+        percent = f" {int(100 * fraction)} %" if counted else ""
         self.bar.convert.set_working(f"{prefix}{verb.lower() if prefix else verb}…{percent}", fraction)
+        self.queue_panel.set_progress(index, f"{verb}…{percent}", fraction if counted else None)
+        # the row follows the pass it names; the line of the whole run never goes back
+        if self._first_pass is None:
+            self._first_pass = stage if stage in PASSES else "render"
+        start, end = PASSES[self._first_pass].get(stage, (0.0, 1.0))
+        whole = (self._job_index - 1 + start + (end - start) * fraction) / max(1, self._job_total)
+        self.queue_panel.set_overall(max(whole, self.queue_panel.overall() or 0.0))
 
     def _on_item_finished(self, index: int, state: str, message: str, outputs) -> None:
         item = self.queue.items[index]
@@ -392,6 +505,7 @@ class MainWindow(QMainWindow):
     def _on_queue_finished(self) -> None:
         self._converting = False
         self.bar.convert.set_idle()
+        self.queue_panel.set_overall(None)
         if self._last_outputs:
             # The news of a success takes no line of its own (a line above the picture pushed
             # it down at every conversion): it is given where the output is described, next to
@@ -415,7 +529,9 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(target)))
 
     # ------------------------------------------------------------------ view
-    def notify(self, text: str, kind: str = "error") -> None:
+    def notify(self, text: str, kind: str = "error", keep: bool = False) -> None:
+        if not keep:
+            self._left_out = []                    # another matter is on the banner now
         self.banner.setProperty("kind", kind)
         self.banner.style().unpolish(self.banner)
         self.banner.style().polish(self.banner)
@@ -444,7 +560,8 @@ class MainWindow(QMainWindow):
         if is_video:
             self.time_label.setText(f"{clock(self._time())} / {clock(self._facts.get('duration_s', 0.0))}")
 
-        self.strip.set_items(self.queue.items, self.queue.selected)
+        self.queue_panel.set_items(self.queue.items, self.queue.selected, converting=self._converting)
+        self.queue_button.set_count(len(self.queue.items))
         self.bar.looks.set_look(None if self.options.operator else self.options.look)
         self.bar.looks.setEnabled(not self._converting)
         self.panel.setEnabled(not self._converting)
@@ -466,23 +583,44 @@ class MainWindow(QMainWindow):
                 self.bar.convert.set_idle("Convert")
             self.bar.convert.setEnabled(item is not None)
 
-    # -------------------------------------------------------- advanced panel
+    # ------------------------------------------------------------ the panels
     def toggle_advanced(self, show=None) -> None:
         """Slide the advanced panel in or out. Without an argument, the other way round."""
         if not isinstance(show, bool):
             show = not self._panel_open
         self._panel_open = show
         self.advanced_button.setChecked(show)
-        hidden, shown = self._panel_places()
-        self._slide.stop()
+        if show and self._queue_open and not self._room_for_both():
+            self.toggle_queue(False)                # too narrow for both: the one asked for stays
+        self._slide_it(self._slide, self.panel, self._panel_places(), show)
+
+    def toggle_queue(self, show=None, by_hand: bool = False) -> None:
+        """Slide the queue in or out, on the left. ``by_hand``: the user did it. A queue the
+        user closed stays closed when more files come; its button still says how many."""
+        if not isinstance(show, bool):
+            show = not self._queue_open
+        self._queue_open = show
+        if by_hand:
+            self._queue_dismissed = not show
+        self.queue_button.setChecked(show)
+        if show and self._panel_open and not self._room_for_both():
+            self.toggle_advanced(False)
+        self._slide_it(self._slide_queue, self.queue_panel, self._queue_places(), show)
+
+    def _slide_it(self, slide, panel, places, show: bool) -> None:
+        hidden, shown = places
+        slide.stop()
         if show:
-            if not self.panel.isVisible():
-                self.panel.setGeometry(hidden)
-            self.panel.show()
-            self.panel.raise_()
-        self._slide.setStartValue(self.panel.geometry())
-        self._slide.setEndValue(shown if show else hidden)
-        self._slide.start()
+            if not panel.isVisible():
+                panel.setGeometry(hidden)
+            panel.show()
+            panel.raise_()
+        slide.setStartValue(panel.geometry())
+        slide.setEndValue(shown if show else hidden)
+        slide.start()
+
+    def _room_for_both(self) -> bool:
+        return self.viewer.width() - PANEL_WIDTH - QUEUE_WIDTH >= PICTURE_ROOM
 
     def _panel_places(self):
         """(hidden, shown) rectangles of the panel, inside the picture area. Being a child of
@@ -490,23 +628,38 @@ class MainWindow(QMainWindow):
         width, height = self.viewer.width(), self.viewer.height()
         return QRect(width, 0, PANEL_WIDTH, height), QRect(width - PANEL_WIDTH, 0, PANEL_WIDTH, height)
 
+    def _queue_places(self):
+        """The same for the queue, on the left edge."""
+        height = self.viewer.height()
+        return QRect(-QUEUE_WIDTH, 0, QUEUE_WIDTH, height), QRect(0, 0, QUEUE_WIDTH, height)
+
     def _place_panel(self) -> None:
-        """The picture area changed size: keep the open panel on its right edge."""
-        if self._panel_open and self._slide.state() != QPropertyAnimation.Running:
-            self.panel.setGeometry(self._panel_places()[1])
-        elif self._panel_open:
-            self._slide.setEndValue(self._panel_places()[1])
+        """The picture area changed size: keep each open panel on its edge. Too narrow for
+        both, the settings give way to the files."""
+        if self._panel_open and self._queue_open and not self._room_for_both():
+            self.toggle_advanced(False)
+        for is_open, slide, panel, places in ((self._panel_open, self._slide, self.panel, self._panel_places()),
+                                              (self._queue_open, self._slide_queue, self.queue_panel,
+                                               self._queue_places())):
+            if is_open and slide.state() != QPropertyAnimation.Running:
+                panel.setGeometry(places[1])
+            elif is_open:
+                slide.setEndValue(places[1])
         self._follow_panel()
 
     def _after_slide(self) -> None:
-        if not self._panel_open:
+        if not self._panel_open and self._slide.state() != QPropertyAnimation.Running:
             self.panel.hide()
+        if not self._queue_open and self._slide_queue.state() != QPropertyAnimation.Running:
+            self.queue_panel.hide()
         self._place_panel()
 
     def _follow_panel(self, *_args) -> None:
-        """The picture gives way to the panel instead of being covered by it."""
+        """The picture gives way to the panels instead of being covered by them."""
         covered = self.viewer.width() - self.panel.x() if self.panel.isVisible() else 0
         self.viewer.set_inset_right(covered)
+        queue = self.queue_panel
+        self.viewer.set_inset_left(queue.x() + queue.width() if queue.isVisible() else 0)
 
     # ---------------------------------------------------------- drag and drop
     def dragEnterEvent(self, event) -> None:

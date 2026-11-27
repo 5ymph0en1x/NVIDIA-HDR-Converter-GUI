@@ -23,7 +23,7 @@ import logging
 import threading
 from collections import deque
 
-from PySide6.QtCore import QCoreApplication, QObject, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal, Slot
 
 from ..display import sdr_white_nits
 from ..session import Engines, Item, Options, convert_item
@@ -79,6 +79,8 @@ class Backend(QObject):
     item_progress = Signal(int, str, int, int)               # index, stage, done, total
     item_finished = Signal(int, str, str, object)            # index, state, message, files written
     queue_finished = Signal()
+    thumbnail_ready = Signal(str, object)                    # path, rgb8 picture of the file, small
+    thumbnail_refused = Signal(str, str)                     # path, why this file cannot be converted
 
     def __init__(self):
         super().__init__()
@@ -95,6 +97,9 @@ class Backend(QObject):
         self.analysis = None
         self._pending = deque()
         self._busy = False
+        self._thumbnails = deque()                 # files of the queue whose picture is still to be read
+        self._converting = False                   # the queue is being converted: no picture is read meanwhile
+        self._thumbnail_due = False                # the next picture is already asked of this thread's loop
 
     # ----------------------------------------------------------------- engine
     @Slot()
@@ -170,6 +175,60 @@ class Backend(QObject):
             self._source_key = None
             self.preview_failed.emit(request, str(exc))
 
+    # ------------------------------------------------------- pictures of the queue
+    THUMBNAIL = (192, 108)                         # the room a row has for it, twice over for sharp screens
+
+    @Slot(str, str, object, str)
+    def thumbnail(self, path: str, kind: str, options: dict, screen: str = "") -> None:
+        """A small picture of a file waiting in the queue: the capture, or a frame from the
+        start of the recording, as the source view shows it. Asked for many files at once,
+        they are read one at a time, each after whatever the window asked meanwhile: a
+        preview never waits behind a row of them. They are read between the frames of a
+        background analysis, as previews are (a long recording shown first would keep the
+        other rows bare for a minute), but never during a conversion."""
+        if not any(waiting[0] == path for waiting in self._thumbnails):
+            self._thumbnails.append((path, kind, options, screen))
+        self._schedule_thumbnail()
+
+    def _schedule_thumbnail(self) -> None:
+        """Read the next picture once what already waits for this thread has been served."""
+        if self._thumbnails and not self._thumbnail_due:
+            self._thumbnail_due = True
+            QTimer.singleShot(0, self._next_thumbnail)
+
+    def forget_thumbnails(self) -> None:
+        """(window's thread) The files left the queue: their pictures are not wanted any more."""
+        self._thumbnails.clear()
+
+    def _next_thumbnail(self) -> None:
+        self._thumbnail_due = False
+        if self._converting or self.closing:
+            return                                 # the conversion starts them again when it ends
+        try:
+            path, kind, options, screen = self._thumbnails.popleft()
+        except IndexError:
+            return                                 # none left (the window may empty the list at any time)
+        try:
+            load_engine()
+            from .. import preview
+            from ..io.jxr_info import UnsupportedCapture
+            from ..video.reader import UnsupportedVideo
+        except Exception:
+            return                                 # the preview has said why
+        try:
+            _, device = self.engines.get(Options.from_dict(options))
+            white, _ = sdr_white_nits(screen)
+            if kind == "video":
+                source = preview.load_video_frame(path, 1.0, device, white_nits=white, box=self.THUMBNAIL)
+            else:
+                source = preview.load_image(path, device, white_nits=white, box=self.THUMBNAIL)
+            self.thumbnail_ready.emit(path, preview.to_rgb8(source.before))
+        except (UnsupportedVideo, UnsupportedCapture) as exc:
+            self.thumbnail_refused.emit(path, str(exc))               # not a file this program converts
+        except Exception:
+            logging.debug("no picture for the queue", exc_info=True)   # the row keeps its plain frame
+        self._schedule_thumbnail()
+
     # --------------------------------------------------------- long tasks, queued
     @Slot(int, str, object)
     def analyse(self, token: int, path: str, options: dict) -> None:
@@ -194,6 +253,7 @@ class Backend(QObject):
                     self._run_queue(*task[1:])
         finally:
             self._busy = False
+            self._schedule_thumbnail()
 
     @staticmethod
     def _breathe() -> None:
@@ -235,6 +295,7 @@ class Backend(QObject):
     def _run_queue(self, jobs: list, options: dict) -> None:
         """Convert the jobs in order. Whatever happens, ``queue_finished`` is emitted: the
         window must never be left waiting."""
+        self._converting = True
         try:
             load_engine()
             from ..video.job import Cancelled, analyse_video
@@ -276,4 +337,5 @@ class Backend(QObject):
                     logging.exception("conversion failed")
                     self.item_finished.emit(index, "failed", str(exc), [])
         finally:
+            self._converting = False
             self.queue_finished.emit()

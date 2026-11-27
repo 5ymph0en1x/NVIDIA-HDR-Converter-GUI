@@ -7,7 +7,7 @@ loads PyTorch in the background, so that the window does not wait for it.
 """
 import logging
 
-__version__ = "3.1.0"
+__version__ = "3.1.1"
 
 _logging_configured = False
 _torch_configured = False

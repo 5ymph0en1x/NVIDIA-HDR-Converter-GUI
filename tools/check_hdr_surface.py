@@ -116,6 +116,17 @@ def check_window(capture: str) -> bool:
     wait(lambda: False, 0.3)
     result = viewer._hdr.read_back()
     white = float(window._facts["white_nits"])
+    # With the queue open the surface starts where the queue ends: the picture must be
+    # presented where the viewer says it is, and the queue must not be under the surface.
+    window.toggle_queue(True)
+    wait(lambda: False, 0.6)
+    wait(lambda: viewer._made_for(viewer._after, viewer.picture_rect()), 60)
+    viewer.set_split(1.0)
+    wait(lambda: False, 0.5)
+    beside = viewer._hdr.read_back()
+    inset, box = viewer._inset_left, viewer._hdr_box.geometry()
+    place = viewer.picture_rect()
+    queue_right = window.queue_panel.x() + window.queue_panel.width()
     window.close()
     if shown is None or result is None:
         print("nothing could be read back")
@@ -133,8 +144,21 @@ def check_window(capture: str) -> bool:
     dark = shown_nits < 0.5 * white
     agreement = float(np.median(after[dark] / np.maximum(shown_nits[dark], 1e-3)))
     print(f"   below half of SDR white, result / source = {agreement:.3f} (1.000: the same picture on both sides)")
-    return (shown_nits.max() > 0.9 * min(file_nits.max(), 10000.0) and after.max() <= white * 1.01
-            and abs(agreement - 1.0) < 0.03)
+    ok = (shown_nits.max() > 0.9 * min(file_nits.max(), 10000.0) and after.max() <= white * 1.01
+          and abs(agreement - 1.0) < 0.03)
+    if beside is None:
+        print("nothing could be read back with the queue open")
+        return False
+    bx, by = round((place.left() - inset) * ratio), round(place.top() * ratio)
+    bw, bh = round(place.width() * ratio), round(place.height() * ratio)
+    inside = beside[by:by + bh, bx:bx + bw, :3].astype(np.float32)[60:-110, 60:-60].max(-1) * 80.0
+    margin = beside[by + bh // 4:by + 3 * bh // 4, max(0, bx - 10):max(1, bx - 4), :3].astype(np.float32).max() * 80.0
+    print(f"   queue open: the surface starts at {box.x()} (the queue ends at {queue_right}), is {beside.shape[1]} wide "
+          f"for a box of {round(box.width() * ratio)}; picture {bw}x{bh} at {bx},{by}, presented up to "
+          f"{inside.max():.0f} nits; just left of it {margin:.0f} nits")
+    beside_ok = (inset > 0 and box.x() == inset == queue_right and abs(beside.shape[1] - box.width() * ratio) <= 2
+                 and inside.max() > 0.8 * shown_nits.max() and margin < 0.1 * white)
+    return ok and beside_ok
 
 
 if __name__ == "__main__":

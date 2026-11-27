@@ -69,15 +69,24 @@ def check(window, sizes) -> list:
     for width, height in sizes:
         window.resize(width, height)
         settle()
-        for state in ("closed", "open"):
-            window.toggle_advanced(state == "open")
+        # the settings and the queue, each closed or open; too narrow for both, the last opened stays
+        for advanced, queue in ((False, False), (True, False), (False, True), (True, True)):
+            window.toggle_advanced(False)
+            window.toggle_queue(queue)
+            window.toggle_advanced(advanced)
             settle(0.35)
-            problems += [f"{width}x{height}, panel {state}: {p}" for p in cramped(window)]
+            state = f"settings {'open' if advanced else 'closed'}, queue {'open' if queue else 'closed'}"
+            problems += [f"{width}x{height}, {state}: {p}" for p in cramped(window)]
             bar_top = window.bar.mapTo(window, window.bar.rect().topLeft()).y()
-            panel_bottom = window.panel.mapTo(window, window.panel.rect().bottomLeft()).y()
-            if state == "open" and panel_bottom > bar_top:
-                problems.append(f"{width}x{height}: the advanced panel covers the action bar")
+            for name, panel in (("advanced panel", window.panel), ("queue", window.queue_panel)):
+                if panel.isVisible() and panel.mapTo(window, panel.rect().bottomLeft()).y() > bar_top:
+                    problems.append(f"{width}x{height}: the {name} covers the action bar")
+            picture = window.viewer.picture_rect()
+            if window.viewer.has_picture() and (picture.left() < window.viewer._inset_left
+                                                or picture.right() > window.viewer.width() - window.viewer._inset_right):
+                problems.append(f"{width}x{height}, {state}: a panel covers the picture")
         window.toggle_advanced(False)
+        window.toggle_queue(False)
         settle(0.35)
     return problems
 

@@ -66,7 +66,7 @@ def test_the_window_opens_empty_and_invites_a_file(window):
     assert not window.viewer.has_picture()
     assert window.file_label.text() == "No file yet"
     assert not window.bar.convert.isEnabled() and window.bar.convert.text() == "Convert"
-    assert not window.timeline_row.isVisible() and not window.strip.isVisible()
+    assert not window.timeline_row.isVisible() and not window.queue_panel.isVisible()
     assert not window.banner.isVisible() and not window.panel.isVisible()
     assert window.bar.looks.look() == "Faithful"
     assert list(window.bar.looks.buttons) == ["Faithful", "Natural", "Punchy", "Golden"]
@@ -267,12 +267,12 @@ def test_a_folder_adds_its_supported_files_and_the_queue_appears(window, capture
     (capture.parent / "notes.txt").write_text("x")
     window.add_paths([str(capture.parent)])
     assert [i.name for i in window.queue.items] == ["clip.mp4", "shot.jxr"]
-    assert window.strip.isVisible() and len(window.strip.chips) == 2
+    assert window.queue_panel.isVisible() and len(window.queue_panel.rows) == 2
     assert window.bar.convert.text() == "Convert 2 files"
     assert wait(lambda: window.viewer.has_picture())
     window.add_paths([str(capture)])
     assert len(window.queue.items) == 2 and "Already in the list" in window.banner.text()
-    window.strip.chips[1].click()
+    window.queue_panel.rows[1].click()
     assert wait(lambda: window._facts is not None and window._facts["path"] == str(capture))
     assert window.file_label.text() == "shot.jxr"
     window.bar.convert.click()
@@ -280,7 +280,8 @@ def test_a_folder_adds_its_supported_files_and_the_queue_appears(window, capture
     assert [i.state for i in window.queue.items] == ["done", "done"]
     assert window.bar._full_summary == "Saved 2 files" and not window.banner.isVisible()
     window.remove(0)
-    assert [i.name for i in window.queue.items] == ["shot.jxr"] and not window.strip.isVisible()
+    assert [i.name for i in window.queue.items] == ["shot.jxr"]
+    assert [row.name for row in window.queue_panel.rows] == ["shot.jxr"] and window.queue_button.count() == 1
 
 
 # ------------------------------------------------------------ panel and settings
@@ -478,7 +479,8 @@ def test_the_panel_never_covers_the_timeline_the_banner_or_the_bar(window, video
     assert wait(lambda: window.viewer.has_picture())
     window.notify("holiday.jpg is not an HDR capture or recording.")
     settle(0.3)
-    assert window.strip.isVisible() and window.timeline_row.isVisible() and window.banner.isVisible()
+    assert window.panel.isVisible() and window.timeline_row.isVisible() and window.banner.isVisible()
+    assert window.queue_button.count() == 2, "the settings stay open; the queue's button tells what waits"
 
     def box(widget):
         top_left = widget.mapTo(window, widget.rect().topLeft())
@@ -487,9 +489,19 @@ def test_the_panel_never_covers_the_timeline_the_banner_or_the_bar(window, video
     px0, py0, px1, py1 = box(window.panel)
     vx0, vy0, vx1, vy1 = box(window.viewer)
     assert (py0, py1) == (vy0, vy1) and px1 == vx1, "the panel occupies the right of the picture area, nothing else"
-    for widget in (window.timeline_row, window.banner, window.bar, window.strip, window.time_label):
+    for widget in (window.timeline_row, window.banner, window.bar, window.time_label):
         _, y0, _, y1 = box(widget)
         assert y1 <= py0 or y0 >= py1, f"{type(widget).__name__} is under the panel"
+    window.resize(1700, 900)
+    window.toggle_queue(True)
+    settle(0.5)
+    assert window.panel.isVisible() and window.queue_panel.isVisible()
+    qx0, qy0, qx1, qy1 = box(window.queue_panel)
+    vx0, vy0, vx1, vy1 = box(window.viewer)
+    assert (qx0, qy0, qy1) == (vx0, vy0, vy1), "and the queue the left of it"
+    for widget in (window.timeline_row, window.banner, window.bar, window.time_label):
+        _, y0, _, y1 = box(widget)
+        assert y1 <= qy0 or y0 >= qy1, f"{type(widget).__name__} is under the queue"
 
 
 def test_a_failure_to_start_does_not_leave_the_window_stuck(window, video, monkeypatch):

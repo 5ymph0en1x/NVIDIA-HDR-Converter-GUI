@@ -57,6 +57,7 @@ class CompareView(QWidget):
         self._histogram = None                 # (3, 64) float in 0..1, or None
         self._blend = 1.0
         self._inset_right = 0                  # room kept free on the right (the advanced panel)
+        self._inset_left = 0                   # and on the left (the queue)
         self._fade = QVariantAnimation(self)
         self._fade.setDuration(150)
         self._fade.setStartValue(0.0)
@@ -101,11 +102,12 @@ class CompareView(QWidget):
         if not self.shows_hdr():
             self._hdr_box.hide()
             return
-        self._hdr_box.setGeometry(0, 0, max(1, self.width() - self._inset_right), self.height())
+        self._hdr_box.setGeometry(self._inset_left, 0, max(1, self._free()), self.height())
         self._hdr.drop_target = self.window()            # files dropped on the picture go to the window
         ratio = self.devicePixelRatioF()
         rect = self.picture_rect()
-        place = tuple(round(v * ratio) for v in (rect.left(), rect.top(), rect.width(), rect.height()))
+        # (the surface starts where the queue ends: the picture's place is counted from there)
+        place = tuple(round(v * ratio) for v in (rect.left() - self._inset_left, rect.top(), rect.width(), rect.height()))
         ivory, ink = theme.colour(theme.IVORY), theme.colour(theme.INK)
         self._hdr.set_layout(place, self._hdr_white, 0.75 * ratio,
                              (ivory.redF(), ivory.greenF(), ivory.blueF(), 230 / 255),
@@ -153,6 +155,7 @@ class CompareView(QWidget):
     def _on_surface_pointer(self, kind: str, x: float, y: float) -> None:
         if self._before is None:
             return
+        x += self._inset_left                      # the surface starts where the queue ends
         self._hdr.setCursor(Qt.SplitHCursor if self.picture_rect().contains(QPointF(x, y)) else Qt.ArrowCursor)
         if kind == "press":
             self._dragging = True
@@ -266,8 +269,12 @@ class CompareView(QWidget):
         """The room there is for the picture, (width, height) in SCREEN pixels: the size a
         picture is asked for."""
         ratio = self.devicePixelRatioF()
-        return (max(40, math.floor((self.width() - self._inset_right - 2 * MARGIN) * ratio)),
+        return (max(40, math.floor((self._free() - 2 * MARGIN) * ratio)),
                 max(40, math.floor((self.height() - 2 * MARGIN) * ratio)))
+
+    def _free(self) -> int:
+        """The width the panels leave to the picture."""
+        return self.width() - self._inset_left - self._inset_right
 
     def picture_rect(self) -> QRectF:
         """Where the picture sits: as large as its room allows, keeping its shape, and on
@@ -277,15 +284,22 @@ class CompareView(QWidget):
         ratio = self.devicePixelRatioF()
         box_w, box_h = self.picture_box()
         w, h = fit_size(box_w, box_h, self._before.width(), self._before.height())
-        left = round(MARGIN * ratio + (box_w - w) / 2)
+        left = round((self._inset_left + MARGIN) * ratio + (box_w - w) / 2)
         top = round((self.height() * ratio - h) / 2)
         return QRectF(left / ratio, top / ratio, w / ratio, h / ratio)
 
     def set_inset_right(self, pixels: int) -> None:
         """Keep this much of the right side free: the picture moves over, it is never covered."""
+        self._set_inset("_inset_right", pixels)
+
+    def set_inset_left(self, pixels: int) -> None:
+        """The same on the left, for the queue."""
+        self._set_inset("_inset_left", pixels)
+
+    def _set_inset(self, side: str, pixels: int) -> None:
         pixels = max(0, int(pixels))
-        if pixels != self._inset_right:
-            self._inset_right = pixels
+        if pixels != getattr(self, side):
+            setattr(self, side, pixels)
             self._scaled.clear()
             self._place_browse()
             self.update()
@@ -324,8 +338,8 @@ class CompareView(QWidget):
 
     def _place_browse(self) -> None:
         hint = self._browse.sizeHint()
-        free = self.width() - self._inset_right
-        self._browse.setGeometry((free - hint.width()) // 2, self.height() // 2 + 34, hint.width(), hint.height())
+        self._browse.setGeometry(self._inset_left + (self._free() - hint.width()) // 2, self.height() // 2 + 34,
+                                 hint.width(), hint.height())
 
     # -------------------------------------------------------------------- paint
     def paintEvent(self, event) -> None:
@@ -339,8 +353,8 @@ class CompareView(QWidget):
         painter.end()
 
     def _paint_empty(self, painter: QPainter) -> None:
-        free = self.width() - self._inset_right
-        box = QRectF(0, 0, free, self.height()).adjusted(28, 28, -28, -28)
+        free, left = self._free(), self._inset_left
+        box = QRectF(left, 0, free, self.height()).adjusted(28, 28, -28, -28)
         pen = QPen(theme.colour(theme.GREEN if self._drop_hover else theme.SEAM), 1.5, Qt.DashLine)
         painter.setPen(pen)
         painter.setBrush(theme.colour(theme.VELVET, 120 if self._drop_hover else 0))
@@ -350,12 +364,12 @@ class CompareView(QWidget):
         title.setPixelSize(20)
         painter.setFont(title)
         painter.setPen(theme.colour(theme.IVORY))
-        painter.drawText(QRectF(0, centre - 52, free, 32), Qt.AlignCenter, "Drop an HDR capture or recording")
+        painter.drawText(QRectF(left, centre - 52, free, 32), Qt.AlignCenter, "Drop an HDR capture or recording")
         body = painter.font()
         body.setPixelSize(13)
         painter.setFont(body)
         painter.setPen(theme.colour(theme.MIST))
-        painter.drawText(QRectF(0, centre - 16, free, 24), Qt.AlignCenter,
+        painter.drawText(QRectF(left, centre - 16, free, 24), Qt.AlignCenter,
                          "JXR screenshots and HDR10 videos from the NVIDIA app")
 
     def _paint_pictures(self, painter: QPainter) -> None:

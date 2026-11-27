@@ -1,6 +1,6 @@
 # NVIDIA HDR Converter GUI — HDR Blaster
 
-**Version 3.1.0**
+**Version 3.1.1**
 
 Convert NVIDIA HDR captures to SDR: JXR screenshots to JPEG or TIFF, and HDR10 recordings to
 H.264 video, in one window. Version 3 of *NVIDIA HDR Converter GUI* is a new application,
@@ -9,6 +9,24 @@ called HDR Blaster; `NHC.py` still starts it.
 <p align="center">
   <img width="1024" src="docs/screenshot.png">
 </p>
+
+## What's new in 3.1.1
+
+- **The queue is a panel of its own, on the left of the picture.** With several files it
+  slides in as Advanced does on the right, and the picture gives way to it. One row per
+  file: a picture of it, whether it is a capture or a video, and where its conversion
+  stands (the pass and its percentage, the file saved, or why it failed). The line of
+  names under the action bar is gone.
+- **The whole run can be followed**: the row at work fills as its file advances, a file
+  that is done draws its tick, and a line under the title tells how far the list is.
+- **A file that cannot be converted says so at once**: a video that is not HDR10 leaves the
+  list as soon as it is read, instead of waiting to be chosen or converted.
+- The *Queue* button, top left, shows and hides the panel and tells how many files wait.
+  Up, Down and Delete walk the list; *Clear finished* takes the converted files out.
+- A capture being converted no longer claims "0 %".
+- Nothing changes in the converted files: they are those of 3.1.0, byte for byte.
+- 3.1.0 was not published on its own: what it brought comes with this version, and is
+  told below.
 
 ## What's new in 3.1.0
 
@@ -134,7 +152,9 @@ above the shadows.
 - **HDR source and SDR result side by side** under a divider you drag
 - **Four looks** up front (Faithful, Natural, Punchy, Golden); everything else in an Advanced panel
 - **The source view is the original**: Exposure and Gamma shape the result only
-- **Queue** for several captures and recordings, progress and cancel on the one button
+- **Queue panel** on the left for several captures and recordings: a picture of each file,
+  what it is (capture or video) and where its conversion stands; progress and cancel on the
+  one button
 - **Exact video preview** once the recording has been analysed in the background
 - **Frame rate of a video**: Original, 120, 60 or 30 frames per second, in Advanced, with
   motion blur made of the dropped frames if you switch it on
@@ -204,6 +224,13 @@ python NHC.py            # or: python -m hdr_blaster
    exactly the frame the converted file will contain.
 3. Pick a look if you wish (Faithful, Natural, Punchy, Golden) and press **Convert**.
    The classical operators, *Auto-select* and the neural operator are in Advanced, under Operator.
+
+With several files, the queue opens on the left of the picture, as Advanced does on the
+right: one row per file, with a picture of it, whether it is a capture or a video, and where
+its conversion stands. Click a row to look at that file; the cross that appears on a row
+takes the file out of the list; *Clear finished* takes out the converted ones. The *Queue*
+button, top left, shows and hides the panel and tells how many files wait. A video that
+turns out not to be HDR10 leaves the list by itself, and the window says why.
 
 The result is written next to the source as `<name>_SDR.jpg` or `<name>_SDR.mp4`,
 never over an existing file. Everything else (precise operator, exposure, sharpness,

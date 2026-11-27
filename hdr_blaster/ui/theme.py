@@ -23,6 +23,23 @@ def app_font() -> QFont:
     return font
 
 
+def motion() -> bool:
+    """May the interface animate? Not when the system is set to show no animation
+    (Windows: Settings, Accessibility, Visual effects): everything then lands at once."""
+    import sys
+
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        shown = ctypes.c_int(1)
+        ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(shown), 0)   # SPI_GETCLIENTAREAANIMATION
+        return bool(shown.value)
+    except Exception:
+        return True
+
+
 def colour(hex_value: str, alpha: int = 255) -> QColor:
     c = QColor(hex_value)
     c.setAlpha(alpha)
@@ -31,8 +48,9 @@ def colour(hex_value: str, alpha: int = 255) -> QColor:
 
 STYLE = f"""
 QWidget {{ background: {INK}; color: {IVORY}; }}
-QWidget#bar, QWidget#header, QWidget#queue {{ background: {VELVET}; }}
+QWidget#bar, QWidget#header {{ background: {VELVET}; }}
 QWidget#panel {{ background: {VELVET}; border-left: 1px solid {SEAM}; }}
+QWidget#queue_panel {{ background: {VELVET}; border-right: 1px solid {SEAM}; }}
 QWidget#row {{ background: transparent; }}
 QLabel {{ background: transparent; }}
 QLabel[role="muted"] {{ color: {MIST}; }}
@@ -69,12 +87,6 @@ QPushButton[role="segment"]:pressed {{ background: transparent; }}
 QPushButton[role="segment"]:checked {{ color: {IVORY}; }}
 QPushButton[role="segment"]:disabled {{ color: {DIM}; }}
 QPushButton[role="segment"]:focus {{ border-color: {MIST}; }}
-
-QPushButton[role="chip"] {{ background: transparent; color: {MIST}; text-align: left; padding: 5px 14px; }}
-QPushButton[role="chip"]:hover {{ background: {VELVET_HI}; color: {IVORY}; border-color: transparent; }}
-QPushButton[role="chip"]:checked {{ background: {LIFT}; color: {IVORY}; border-color: {RIM}; }}
-QPushButton[role="chip"][state="done"] {{ color: {GREEN}; }}
-QPushButton[role="chip"][state="failed"] {{ color: {EMBER}; }}
 
 QSlider {{ background: transparent; }}
 QSlider:horizontal {{ min-height: 22px; }}

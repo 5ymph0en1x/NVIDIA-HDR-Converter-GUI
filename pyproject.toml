@@ -1,6 +1,6 @@
 [project]
 name = "hdr-blaster"
-version = "3.1.0"
+version = "3.1.1"
 description = "Convert NVIDIA HDR captures to SDR with intelligent tone mapping"
 requires-python = ">=3.14"
 # Exact versions: the rendering is verified bit for bit against the original on this
