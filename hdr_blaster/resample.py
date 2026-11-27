@@ -18,6 +18,8 @@ from typing import Tuple
 
 import torch
 
+from .fit import fit_size  # noqa: F401  (the size to resize to; kept in a module that needs no PyTorch)
+
 
 def spline36(x: torch.Tensor) -> torch.Tensor:
     """The Spline36 kernel: 1 at 0, 0 at every other whole number, nothing beyond 3."""
@@ -80,10 +82,3 @@ def resize(image: torch.Tensor, height: int, width: int, antiring: bool = True) 
     if width * image.shape[-2] <= height * image.shape[-1]:
         return _along(_along(image, width, 3, antiring), height, 2, antiring)
     return _along(_along(image, height, 2, antiring), width, 3, antiring)
-
-
-def fit_size(box_width: int, box_height: int, width: int, height: int) -> Tuple[int, int]:
-    """(width, height) of the largest picture of this shape that fits the box. A picture
-    made for a box is recognised by it: ``fit_size(box, *fit_size(box, w, h))`` is itself."""
-    scale = min(box_width / width, box_height / height)
-    return max(1, round(width * scale)), max(1, round(height * scale))

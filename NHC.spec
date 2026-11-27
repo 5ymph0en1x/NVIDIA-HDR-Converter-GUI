@@ -1,11 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 r"""
 NHC.spec — build HDR Blaster (the Qt window, photos and videos) as a standalone
-ONE-FILE .exe.
+FOLDER: HDR_Blaster.exe next to the libraries it loads.
 
     .venv\Scripts\python.exe -m PyInstaller NHC.spec --noconfirm
-    dist\HDR_Blaster.exe --convert capture.jxr            # headless self-test, image
-    dist\HDR_Blaster.exe --convert-video recording.mp4    # headless self-test, video
+    dist\HDR_Blaster\HDR_Blaster.exe --convert capture.jxr            # headless self-test, image
+    dist\HDR_Blaster\HDR_Blaster.exe --convert-video recording.mp4    # headless self-test, video
+
+A folder, not one file, because of the start-up time: a one-file executable writes its
+2.6 GB of libraries to the temporary folder at EVERY launch and deletes them when it
+closes (measured: 22 s before Python even starts, 30 s to the window, 25 s of clean-up).
+The same program run from its folder shows its window in a few seconds. The one-file
+build is still there for whoever wants it:
+
+    $env:HDR_BLASTER_ONEFILE = "1"; .venv\Scripts\python.exe -m PyInstaller NHC.spec --noconfirm
+    # -> dist\HDR_Blaster.exe
 
 CUDA trim (explained in BUILD.md): only DLLs that appear in no import table are
 dropped. PyAV brings its own FFmpeg libraries; PySide6 is collected by its hook.
@@ -38,6 +47,8 @@ datas += [
 # Slim the bundle: none of these are used by the app at runtime.
 # NB: do NOT exclude any torch.* submodule — torch/__init__.py imports many of
 # them (distributions, fft, linalg, ...) at import time, so excluding breaks it.
+ONE_FILE = os.environ.get("HDR_BLASTER_ONEFILE") == "1"
+
 excludes = ["matplotlib", "torchvision", "scipy", "pandas", "pytest", "IPython",
             "notebook", "sphinx", "setuptools", "pip", "wheel", "tkinter", "TKinterModernThemes",
             "PySide6.QtNetwork", "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtSql", "PySide6.QtTest"]
@@ -80,9 +91,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    *((a.binaries, a.datas) if ONE_FILE else ()),
     [],
+    exclude_binaries=not ONE_FILE,
     name="HDR_Blaster",
     debug=False,
     bootloader_ignore_signals=False,
@@ -97,3 +108,13 @@ exe = EXE(
     entitlements_file=None,
     icon="hdr_blaster/ui/icon.ico",
 )
+
+if not ONE_FILE:
+    COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="HDR_Blaster",    # dist\HDR_Blaster\HDR_Blaster.exe, the libraries in _internal
+    )

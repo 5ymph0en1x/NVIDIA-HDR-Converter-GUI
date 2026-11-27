@@ -747,3 +747,51 @@ def test_the_window_shows_the_icon(window, qapp):
     corner, middle = image.pixelColor(0, 0), image.pixelColor(24, 6)
     assert corner.alpha() == 0, "round: its corners are transparent"
     assert middle.alpha() == 255 and middle.saturation() > 80, "and it is not a blank square"
+
+
+# ------------------------------------------------------- the panel keeps its width
+
+def beyond_the_panel(panel) -> list:
+    """The visible controls of the panel that reach past its right edge."""
+    from PySide6.QtWidgets import QWidget
+
+    out = []
+    for widget in panel.findChildren(QWidget):
+        if widget.isVisible() and widget.width() > 0:
+            right = widget.mapTo(panel, widget.rect().topRight()).x()
+            if right > panel.width():
+                name = getattr(widget, "text", lambda: "")() or type(widget).__name__
+                out.append(f"{type(widget).__name__} '{name[:30]}' ends at {right} of {panel.width()}")
+    return out
+
+
+DEEP_FOLDER = (r"C:\Users\SYMPHO~1\AppData\Local\Temp\claude\762bb878c4e13d8f"
+               r"\ae547df8-6d00-404f-9721-893571242893\scratchpad\out_old")
+
+
+@pytest.mark.parametrize("folder", [r"D:\Pictures", DEEP_FOLDER, "D:\\" + "a_folder_with_a_very_long_name_" * 5,
+                                    "//server/share/" + "screenshots/" * 12 + "sdr"],
+                         ids=["short", "deep", "one long name", "network"])
+def test_a_destination_never_pushes_the_panel_beyond_its_width(window, folder):
+    """Reported with a screenshot: every control of the Advanced panel cut off at the right.
+    The folder shown under "Save to" was a long path, which a label cannot break: it asked
+    for its whole width, and the panel's content grew wider than the panel."""
+    from dataclasses import replace
+
+    window.resize(1280, 800)
+    window.toggle_advanced(True)
+    settle(0.4)
+    panel = window.panel
+    assert not beyond_the_panel(panel), "the panel fits to begin with"
+    panel.set_options(replace(window.options, destination=folder))
+    settle(0.3)
+    assert panel.reset_folder.isVisible(), "a folder is chosen: the way back is offered"
+    assert not beyond_the_panel(panel)
+    assert panel.destination.toolTip() == folder, "the whole path can be read"
+    assert panel.destination.text().replace("\u200b", "") == folder, "and it is the path that is shown"
+    for button in (panel.choose_folder, panel.reset_folder):
+        assert button.width() >= button.sizeHint().width() - 1, f"'{button.text()}' has room for its text"
+    panel.set_options(replace(window.options, destination=""))
+    settle(0.2)
+    assert panel.destination.text() == "Next to the source file" and panel.destination.toolTip() == ""
+    assert not beyond_the_panel(panel)

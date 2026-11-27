@@ -1,6 +1,6 @@
 # NVIDIA HDR Converter GUI — HDR Blaster
 
-**Version 3.0.2**
+**Version 3.0.3**
 
 Convert NVIDIA HDR captures to SDR: JXR screenshots to JPEG or TIFF, and HDR10 recordings to
 H.264 video, in one window. Version 3 of *NVIDIA HDR Converter GUI* is a new application,
@@ -9,6 +9,17 @@ called HDR Blaster; `NHC.py` still starts it.
 <p align="center">
   <img width="1024" src="docs/screenshot.png">
 </p>
+
+## What's new in 3.0.3
+
+- **The program opens in about a second.** It took thirty. The standalone build is now a
+  folder (`HDR_Blaster.exe` next to its libraries, published as one zip) instead of a single
+  file that unpacked 2.6 GB to the temporary folder at every launch, and left them there
+  whenever it did not close cleanly. Unzip it once, anywhere, and keep the two together.
+- **The window no longer waits for the engine**: it opens at once, and a file can be shown
+  about three seconds after the start. The converted files are the same, byte for byte.
+- **The Advanced panel keeps its width** when a folder is chosen under *Save to*: its
+  controls were cut off at the right. A long folder is shown on several lines.
 
 ## What's new in 3.0.2
 
@@ -155,7 +166,8 @@ The dependencies are declared in `pyproject.toml`; `requirements.txt` mirrors th
    python NHC.py
    ```
 
-A standalone `HDR_Blaster.exe` (no Python needed) can be built with PyInstaller: see
+A standalone build (no Python needed) can be made with PyInstaller: a folder holding
+`HDR_Blaster.exe` and its libraries, whose window opens in about a second. See
 [`BUILD.md`](BUILD.md).
 
 ## Usage

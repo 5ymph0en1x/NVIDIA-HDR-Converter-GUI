@@ -178,6 +178,10 @@ class MainWindow(QMainWindow):
         self.backend.item_progress.connect(self._on_item_progress)
         self.backend.item_finished.connect(self._on_item_finished)
         self.backend.queue_finished.connect(self._on_queue_finished)
+        # That thread waits for the engine (PyTorch) as it starts; the window does not: the
+        # engine takes seconds to load, and the window has nothing to compute until a file comes.
+        self.backend.ready.connect(self.panel.set_cuda)
+        self.thread.started.connect(self.backend.load)
         self.thread.start()
 
         geometry = self._settings.value("window/geometry")

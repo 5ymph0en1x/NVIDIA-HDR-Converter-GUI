@@ -1,8 +1,10 @@
-# Building HDR Blaster — standalone one-file .exe with bundled CUDA
+# Building HDR Blaster — standalone folder with bundled CUDA
 
-HDR Blaster ships as a **single self-contained `HDR_Blaster.exe`** (the Qt window, photos and
-videos). The end user needs **no Python, no CUDA Toolkit, no PyTorch install** — only a recent
-**NVIDIA driver** (the driver provides `nvcuda.dll`; everything else is bundled).
+HDR Blaster ships as a **self-contained folder**: `HDR_Blaster.exe` (the Qt window, photos and
+videos) and, next to it, `_internal`, the libraries it loads. The end user needs **no Python,
+no CUDA Toolkit, no PyTorch install** — only a recent **NVIDIA driver** (the driver provides
+`nvcuda.dll`; everything else is bundled). The folder is published as one zip: unzip it
+anywhere, start `HDR_Blaster.exe`. The two must stay together.
 
 ## Build
 
@@ -12,7 +14,11 @@ uv pip install --python .venv\Scripts\python.exe pyinstaller psutil
 
 # build
 .venv\Scripts\python.exe -m PyInstaller NHC.spec --noconfirm
-# -> dist\HDR_Blaster.exe
+# -> dist\HDR_Blaster\HDR_Blaster.exe, and dist\HDR_Blaster\_internal
+
+# the file to publish
+.venv\Scripts\python.exe -c "import shutil; shutil.make_archive('dist/HDR_Blaster', 'zip', 'dist', 'HDR_Blaster')"
+# -> dist\HDR_Blaster.zip
 ```
 
 Run PyInstaller through this environment's Python (`python -m PyInstaller`), not through
@@ -24,16 +30,55 @@ executable without PyAV, whose video conversion failed at start).
 Self-test the result (headless, no window):
 
 ```powershell
-dist\HDR_Blaster.exe --convert "path\to\shot.jxr"             # writes shot_SDR.jpg, exits 0 on success
-dist\HDR_Blaster.exe --convert-video "path\to\recording.mp4"   # writes recording_SDR.mp4
+dist\HDR_Blaster\HDR_Blaster.exe --convert "path\to\shot.jxr"             # writes shot_SDR.jpg, exits 0 on success
+dist\HDR_Blaster\HDR_Blaster.exe --convert-video "path\to\recording.mp4"   # writes recording_SDR.mp4
 ```
 
-Verified on 2026-11-25 (Python 3.14.2, torch 2.11.0+cu130, PyAV 19.0.2, PySide6 6.12.0, RTX 4090):
-the one-file executable is 1.77 GB; started without Python it converts a capture, converts a
-796-frame 1440p recording with NVENC (84.4 MB to 75.3 MB), and its window opens and renders a
-preview. Start-up takes 30 to 60 s: the one-file bundle unpacks itself first. PyAV carries its
+Verified on 2026-11-27 (Python 3.14.2, torch 2.11.0+cu130, PyAV 19.0.2, PySide6 6.12.0, RTX 4090):
+the folder is 2.68 GB (1.78 GB zipped); started without Python it converts a capture and a
+796-frame 1440p recording with NVDEC and NVENC, and writes the same files, byte for byte, as
+the source run by Python; its window is on screen in about a second and, started with a
+capture, has its models loaded 3.2 s after the start and shows the picture. PyAV carries its
 own FFmpeg libraries; PySide6 is collected by its PyInstaller hook. The window writes its log to
 `%LOCALAPPDATA%\HDR Blaster\hdr_blaster.log`.
+
+## Start-up time: a folder, and a window that does not wait
+
+The program used to take 30 s to show its window. Measured on the machine above, two causes:
+
+| | one file, before | folder, now |
+|---|---|---|
+| unpacking 2.6 GB of libraries to `%TEMP%` | 22 s, at **every** launch | none |
+| imports before the window | 8 s, PyTorch included (2.4 s of it from the source) | 0.8 s; PyTorch loads behind the window |
+| **window on screen** | **30 s** | **0.8 to 0.9 s** (0.9 to 1.2 s with the processor half busy) |
+| engine ready (a file can be shown) | 30 s | about 3 s |
+| after closing | 25 s deleting the 2.6 GB | nothing |
+
+- **A folder instead of one file.** A one-file executable is an archive that unpacks itself
+  to the temporary folder each time it starts, and deletes it when it closes: 2.6 GB written
+  and erased per launch. When the program does not close cleanly (killed, crash, power cut)
+  the 2.6 GB stay there: fifteen such folders, 40 GB, were found on the development machine.
+  The one-file build is still available, for whoever prefers a single file to a quick start:
+
+  ```powershell
+  $env:HDR_BLASTER_ONEFILE = "1"; .venv\Scripts\python.exe -m PyInstaller NHC.spec --noconfirm
+  # -> dist\HDR_Blaster.exe (1.77 GB)
+  ```
+
+- **The window does not wait for PyTorch.** Nothing the window imports to build itself needs
+  PyTorch any more; a thread imports the engine meanwhile, and the window's background thread
+  waits for it before it computes anything (`hdr_blaster/ui/workers.py`). The results are the
+  same files, byte for byte, as before.
+
+  That thread must be one started by Python, not a slot of the window's `QThread`: PyTorch's
+  bindings remember the Python thread state of the thread that imports them, and a slot runs
+  under a state made for that one call. Imported there, PyTorch dies on the first model it
+  loads (`Fatal Python error: _PyThreadState_Attach: non-NULL old thread state`).
+  `tests/test_startup.py` starts the program in a fresh process, with and without a file, and
+  checks who imported what.
+
+The very first start after unzipping is slower (2.7 s measured): Windows reads and checks
+the libraries once.
 
 ## Intelligent CUDA bundling (the interesting part)
 
@@ -83,7 +128,7 @@ sub-libraries (`ops`, `cnn`, `engines_precompiled`, `engines_runtime_compiled`,
 
 ## Bundled assets
 
-`NHC.spec` bundles, and the app reads them from `sys._MEIPASS` when frozen:
+`NHC.spec` bundles, and the app reads them from `sys._MEIPASS` (the `_internal` folder) when frozen:
 `models\3dlut\sRGB\*` (3D LUT weights), `training\model.py` + `training\checkpoints\
 latest.pth` (neural tone mapper), and the icon (`hdr_blaster\ui\icon.ico`, made from `app.ico`
 by `tools\make_icon.py`). The heavy `training\datasets\` and
@@ -99,10 +144,13 @@ by `tools\make_icon.py`). The heavy `training\datasets\` and
 |---|---|
 | `torch\lib` CUDA DLLs, naïve | ~2.56 GB |
 | dropped (verified unused) | ~336 MB |
-| **`HDR_Blaster.exe`** (one-file, GPU) | **~1.77 GB** |
-| the same build *without* the trim (est.) | ~2.06 GB → **‑22 %** |
+| **`dist\HDR_Blaster`** (folder, GPU) | **2.68 GB** |
+| **`dist\HDR_Blaster.zip`**, the file to publish | **1.78 GB** |
+| `HDR_Blaster.exe` as one file (`HDR_BLASTER_ONEFILE=1`) | ~1.77 GB |
+| the one-file build *without* the trim (est.) | ~2.06 GB → **‑22 %** |
 
-Verified on Python 3.14.2 / torch 2.11.0+cu130 / RTX 4090, **with the CUDA Toolkit
-scrubbed from the environment** (clean end-user machine simulation): the trimmed
-one-file exe self-tests green (`--selftest` converts a JXR on CUDA) and the windowed
-GUI initializes on CUDA and reaches its main event loop.
+The trim was verified on Python 3.14.2 / torch 2.11.0+cu130 / RTX 4090, **with the CUDA
+Toolkit scrubbed from the environment** (clean end-user machine simulation), on the one-file
+build of 2026-11-25: it self-tests green (`--selftest` converts a JXR on CUDA) and the windowed
+GUI initializes on CUDA and reaches its main event loop. The folder build holds the same
+libraries; that scrubbed-environment check has not been run again on it.

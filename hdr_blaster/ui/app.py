@@ -6,7 +6,7 @@ from PySide6.QtCore import QCoreApplication, QLocale, QStandardPaths, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from .. import configure_runtime
+from .. import configure_logging
 from . import theme
 
 
@@ -49,21 +49,27 @@ def create_application(argv=None) -> QApplication:
     return app
 
 
-def main(argv=None) -> int:
-    """Open the window. Files given on the command line are queued."""
+def main(argv=None, settings_path: str = "") -> int:
+    """Open the window. Files given on the command line are queued. ``settings_path``: a
+    file to keep the settings in, instead of the user's own (the tests give one)."""
     argv = list(sys.argv if argv is None else argv)
+    # PyTorch takes seconds to import: a thread starts on it now, and the window opens
+    # without waiting. The background thread of the window waits for it before it computes.
+    from .workers import start_loading_engine
+
+    start_loading_engine()
     app = create_application(argv)
     # The log goes to the user's own application folder: the current folder may be
     # anywhere, and not writable, when the program is started by a double-click.
     folder = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
     try:
         os.makedirs(folder, exist_ok=True)
-        configure_runtime(os.path.join(folder, "hdr_blaster.log"))
+        configure_logging(os.path.join(folder, "hdr_blaster.log"))
     except OSError:
-        configure_runtime(os.devnull)
+        configure_logging(os.devnull)
     from .window import MainWindow
 
-    window = MainWindow()
+    window = MainWindow(settings_path)
     window.show()
     paths = [a for a in argv[1:] if not a.startswith("-")]
     if paths:

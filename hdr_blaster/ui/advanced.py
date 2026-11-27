@@ -2,10 +2,9 @@
 import os
 from dataclasses import replace
 
-import torch
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-                               QScrollArea, QSlider, QVBoxLayout, QWidget)
+                               QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget)
 
 from .widgets import CloseButton, Combo, Switch
 from ..session import (IMAGE_FORMATS, OPERATORS, RANGES, VIDEO_FRAME_RATES, VIDEO_HEIGHTS, VIDEO_QUALITIES,
@@ -16,6 +15,20 @@ QUALITY_NAMES = {"high": "High", "balanced": "Balanced", "compact": "Compact"}
 HEIGHT_NAMES = {0: "Original size", 1080: "1080p", 720: "720p"}
 RATE_NAMES = {0: "Original", 120: "120 fps", 60: "60 fps", 30: "30 fps"}
 FORMAT_NAMES = {"JPEG": "JPEG", "TIFF": "TIFF", "Both": "JPEG and TIFF"}
+
+
+def breakable(path: str, run: int = 18) -> str:
+    """The same path with invisible places where a line may break: after each separator,
+    and inside a name too long for the panel. A label breaks a text between its words only,
+    and a path is one word: left as it is, it asks for its whole length in one line."""
+    out, since = [], 0
+    for char in path:
+        out.append(char)
+        since += 1
+        if char in "\\/_-. " or since >= run:
+            out.append("\u200b")
+            since = 0
+    return "".join(out)
 
 
 class AdvancedPanel(QWidget):
@@ -32,6 +45,7 @@ class AdvancedPanel(QWidget):
         self.setFixedWidth(PANEL_WIDTH)
         self._options = Options()
         self._loading = False
+        self._cuda = None                    # whether a graphics card can be used: not known until the engine is loaded
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -86,9 +100,18 @@ class AdvancedPanel(QWidget):
                                    "Nothing is invented; nothing changes at the original frame rate.")
         self.destination = QLabel()
         self.destination.setProperty("role", "muted")
+        self.destination.setTextFormat(Qt.PlainText)
         self.destination.setWordWrap(True)
+        # The folder takes the width the panel has and as many lines as it needs. It never
+        # asks for more width: the panel does not scroll sideways, so whatever is wider than
+        # it pushes every control of the panel out of sight.
+        policy = self.destination.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Ignored)
+        self.destination.setSizePolicy(policy)
         self._add("Save to", self.destination)
-        buttons = QHBoxLayout()
+        # one under the other: side by side, the two are wider than their column
+        buttons = QVBoxLayout()
+        buttons.setSpacing(6)
         self.choose_folder = QPushButton("Choose a folder…")
         self.choose_folder.setCursor(Qt.PointingHandCursor)
         self.choose_folder.setFocusPolicy(Qt.TabFocus)
@@ -98,9 +121,8 @@ class AdvancedPanel(QWidget):
         self.reset_folder.setCursor(Qt.PointingHandCursor)
         self.reset_folder.setFocusPolicy(Qt.TabFocus)
         self.reset_folder.clicked.connect(lambda: self._set("destination", ""))
-        buttons.addWidget(self.choose_folder)
-        buttons.addWidget(self.reset_folder)
-        buttons.addStretch(1)
+        buttons.addWidget(self.choose_folder, 0, Qt.AlignLeft)
+        buttons.addWidget(self.reset_folder, 0, Qt.AlignLeft)
         grid.addLayout(buttons, self._row, 1)
         self._row += 1
 
@@ -108,9 +130,6 @@ class AdvancedPanel(QWidget):
         self.use_gpu = self._check("Use the graphics card")
         self.use_fp16 = self._check("Half precision (less memory)")
         self.show_histogram = self._check("Show the histogram")
-        if not torch.cuda.is_available():
-            self.use_gpu.setEnabled(False)
-            self.use_gpu.setToolTip("No CUDA graphics card was found: conversions run on the processor.")
         grid.setRowStretch(self._row, 1)
 
         self.operator.currentTextChanged.connect(lambda text: self._set("operator", OPERATORS[text]))
@@ -183,6 +202,15 @@ class AdvancedPanel(QWidget):
     def options(self) -> Options:
         return self._options
 
+    def set_cuda(self, available: bool) -> None:
+        """What the engine found once loaded. Without a graphics card the switch is off and
+        cannot be turned on; the option itself is left as the user set it."""
+        self._cuda = bool(available)
+        self.use_gpu.setEnabled(self._cuda)
+        self.use_gpu.setToolTip("" if self._cuda
+                                else "No CUDA graphics card was found: conversions run on the processor.")
+        self.set_options(self._options)
+
     def set_options(self, options: Options) -> None:
         """Show these options without announcing a change."""
         self._options = options
@@ -199,7 +227,7 @@ class AdvancedPanel(QWidget):
             self.video_height.setCurrentIndex(VIDEO_HEIGHTS.index(options.video_height))
             self.video_fps.setCurrentIndex(VIDEO_FRAME_RATES.index(options.video_fps))
             self.video_blur.setChecked(options.video_blur)
-            self.use_gpu.setChecked(options.use_gpu and torch.cuda.is_available())
+            self.use_gpu.setChecked(options.use_gpu and self._cuda is not False)
             self.use_fp16.setChecked(options.use_fp16)
             self.show_histogram.setChecked(options.show_histogram)
             self._refresh()
@@ -208,7 +236,8 @@ class AdvancedPanel(QWidget):
 
     def _refresh(self) -> None:
         folder = self._options.destination
-        self.destination.setText(folder if folder else "Next to the source file")
+        self.destination.setText(breakable(folder) if folder else "Next to the source file")
+        self.destination.setToolTip(folder)
         self.reset_folder.setVisible(bool(folder))
         self.use_fp16.setEnabled(self.use_gpu.isChecked() and self.use_gpu.isEnabled())
         self.video_blur.setEnabled(bool(self._options.video_fps))

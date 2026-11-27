@@ -19,7 +19,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QVariantAnimation, Signal
 from PySide6.QtGui import QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QPushButton, QWidget
 
-from ..resample import fit_size
+from ..fit import fit_size
 from . import theme
 
 MARGIN = 16                                    # around the picture, in the widget's units

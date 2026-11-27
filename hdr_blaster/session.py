@@ -1,17 +1,22 @@
 """What the user is doing, without any window: the files queued, the options chosen, and
 how one queued file is converted. The interface is a thin layer over this module.
+
+The window imports this module before PyTorch is loaded (loading it takes seconds, and the
+window must not wait): what computes is imported where it is used, not here.
 """
 import math
 import os
 import re
 from dataclasses import asdict, dataclass, field, fields
-from typing import Callable, Dict, List, Optional, Tuple
-
-import torch
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from .display import sdr_white_nits
-from .engine.pipeline import RenderSettings, export_image, render
-from .video.job import Cancelled, VideoAnalysis, VideoSettings, analyse_video, make_engine, render_video
+
+if TYPE_CHECKING:
+    import torch
+
+    from .engine.pipeline import RenderSettings
+    from .video.job import VideoAnalysis, VideoSettings
 
 # The four looks offered up front. Everything else lives in the advanced panel.
 # Faithful shows the scene at its own luminance; the three others grade it above its shadows.
@@ -83,12 +88,16 @@ class Options:
         A video takes neither Sharpness nor AI colour unless ``video_enhance`` is on:
         nothing is then measured on its pictures, and its analysis does not have to
         render them (about twice as fast)."""
+        from .engine.pipeline import RenderSettings
+
         enhance = kind != "video" or self.video_enhance
         return RenderSettings(method=self.method(), color_strength=self.ai_color if enhance else 0.0,
                               edge_strength=self.sharpness if enhance else 0.0, use_enhancement=True,
                               white_nits=reference_white())
 
     def video_settings(self) -> VideoSettings:
+        from .video.job import VideoSettings
+
         return VideoSettings(render=self.render_settings("video"), quality=self.video_quality,
                              out_height=self.video_height or None,
                              frame_rate=float(self.video_fps) if self.video_fps else None,
@@ -267,6 +276,8 @@ class Engines:
         self._cache = {}
 
     def device_for(self, options: Options) -> torch.device:
+        import torch
+
         return torch.device("cuda" if options.use_gpu and torch.cuda.is_available() else "cpu")
 
     def get(self, options: Options):
@@ -274,6 +285,8 @@ class Engines:
         fp16 = bool(options.use_fp16 and device.type == "cuda")
         key = (device.type, fp16)
         if key not in self._cache:
+            from .video.job import make_engine
+
             self._cache[key] = make_engine(device, use_fp16=fp16)
         return self._cache[key], device
 
@@ -284,6 +297,11 @@ def convert_item(item: Item, options: Options, engine, device,
                  analysis: Optional[VideoAnalysis] = None) -> List[str]:
     """Convert one queued file. Returns the files written. Raises :class:`Cancelled` when
     asked to stop (nothing is left behind), any other exception on failure."""
+    import torch
+
+    from .engine.pipeline import export_image, render
+    from .video.job import Cancelled, analyse_video, render_video
+
     base = output_base(item.path, item.kind, options)
     if options.destination and not os.path.isdir(options.destination):
         raise FileNotFoundError(f"the destination folder does not exist: {options.destination}")

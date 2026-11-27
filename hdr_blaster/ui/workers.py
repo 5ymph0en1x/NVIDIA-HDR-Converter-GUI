@@ -13,20 +13,64 @@ of work arrive from the window:
 Long tasks let the thread's event loop run between frames, so a preview request is served
 within a frame or two even in the middle of a conversion. They never nest: a long task
 that arrives while another runs waits for it to unwind.
+
+The engine is not loaded when the window opens: importing PyTorch takes seconds, and the
+window is on screen meanwhile (``start_loading_engine``, ``load_engine``). So nothing
+that computes is imported at the top of this module, which the window imports: each task
+waits for the engine, then imports what it uses.
 """
 import logging
+import threading
 from collections import deque
 
 from PySide6.QtCore import QCoreApplication, QObject, Signal, Slot
 
-from .. import preview
 from ..display import sdr_white_nits
 from ..session import Engines, Item, Options, convert_item
-from ..video.job import Cancelled, analyse_video, exposure_of, frames_to_keep
-from ..video.reader import UnsupportedVideo
+
+# The engine is imported by a thread started by Python, never by the thread of the Backend
+# itself. PyTorch's bindings remember the Python thread state of the thread that imports
+# them, and a slot of a QThread runs under a state made for that one call: imported there,
+# PyTorch later attaches to a state that no longer exists, and the program dies on the
+# first model it loads ("Fatal Python error: _PyThreadState_Attach"). Found by starting the
+# program with a file; tests/test_startup.py does it again.
+_engine_thread = None
+_engine_error = None
+_engine_lock = threading.Lock()
+
+
+def _import_engine() -> None:
+    global _engine_error
+    try:
+        from .. import configure_torch
+
+        configure_torch()
+        from .. import preview  # noqa: F401
+        from ..video import job  # noqa: F401
+    except Exception as exc:
+        logging.exception("the engine could not be loaded")
+        _engine_error = exc
+
+
+def start_loading_engine() -> None:
+    """Begin importing the engine, and return at once."""
+    global _engine_thread
+    with _engine_lock:
+        if _engine_thread is None:
+            _engine_thread = threading.Thread(target=_import_engine, name="hdr-blaster-engine", daemon=True)
+            _engine_thread.start()
+
+
+def load_engine() -> None:
+    """Return once the engine is imported and set up. Raises what stopped it, each time."""
+    start_loading_engine()
+    _engine_thread.join()
+    if _engine_error is not None:
+        raise _engine_error
 
 
 class Backend(QObject):
+    ready = Signal(bool)                                     # the engine is loaded; a CUDA card can be used
     preview_ready = Signal(int, object, object, object)     # request, before rgb8, after rgb8, facts
     preview_failed = Signal(int, str)
     analysis_progress = Signal(int, int, int)                # token, frames done, total
@@ -52,6 +96,19 @@ class Backend(QObject):
         self._pending = deque()
         self._busy = False
 
+    # ----------------------------------------------------------------- engine
+    @Slot()
+    def load(self) -> None:
+        """Wait for the engine, as this thread starts, and tell the window what it found.
+        Whatever the window asks for in the meantime waits its turn behind this."""
+        try:
+            load_engine()
+        except Exception:
+            return        # logged; the first file shown fails the same way, and says why
+        import torch
+
+        self.ready.emit(torch.cuda.is_available())
+
     # ---------------------------------------------------------------- preview
     @Slot(int, str, str, float, object, object, bool, str)
     def show(self, request: int, path: str, kind: str, time_s: float, options: dict, box, hdr: bool = False,
@@ -63,6 +120,10 @@ class Backend(QObject):
         if request < self.latest_show or self.closing:
             return                                        # a newer request is already waiting
         try:
+            load_engine()
+            from .. import preview
+            from ..video.job import exposure_of, frames_to_keep
+
             chosen = Options.from_dict(options)
             engine, device = self.engines.get(chosen)
             white, white_source = sdr_white_nits(screen)   # what this screen's white stands for, now
@@ -142,6 +203,12 @@ class Backend(QObject):
     def _run_analysis(self, token: int, path: str, options: dict) -> None:
         if token != self.analysis_token:
             return
+        try:
+            load_engine()
+        except Exception:
+            return                                        # the preview has said why
+        from ..video.job import Cancelled, analyse_video
+
         chosen = Options.from_dict(options)
         if self.analysis is not None and self.analysis.src == path \
                 and self.analysis.matches(chosen.video_settings()):
@@ -169,6 +236,10 @@ class Backend(QObject):
         """Convert the jobs in order. Whatever happens, ``queue_finished`` is emitted: the
         window must never be left waiting."""
         try:
+            load_engine()
+            from ..video.job import Cancelled, analyse_video
+            from ..video.reader import UnsupportedVideo
+
             chosen = Options.from_dict(options)
             for index, path, kind in jobs:
                 if self.stop_convert or self.closing:
