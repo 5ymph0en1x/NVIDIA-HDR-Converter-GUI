@@ -34,7 +34,8 @@ import torch
 import torch.nn.functional as F
 
 from ..engine.pipeline import RenderSettings, measure, render, resolve_method
-from .colour import scrgb_to_engine, srgb_to_yuv420, yuv_to_engine, yuv_to_scrgb
+from . import fused
+from .colour import scrgb_to_engine, srgb_to_yuv420, yuv_to_scrgb
 from ..engine.params import RenderParams
 from .reader import (HardwareDecodingFailed, UnsupportedVideo, VideoInfo, check_supported, probe,
                      read_frames)
@@ -230,9 +231,16 @@ def _check(cancelled):
         raise Cancelled()
 
 
-def _to_engine(frame, info: VideoInfo, settings: VideoSettings) -> torch.Tensor:
-    return yuv_to_engine(frame.y, frame.u, frame.v, info.fmt,
-                         pre_gamma=settings.pre_gamma, exposure=settings.exposure)
+def _to_engine(frame, info: VideoInfo, settings: VideoSettings, chain=None) -> torch.Tensor:
+    """The frame in the engine's working space. ``chain``: the fused stages, when they are used."""
+    light = (yuv_to_scrgb if chain is None else chain.yuv_to_scrgb)(frame.y, frame.u, frame.v, info.fmt)
+    return scrgb_to_engine(light, settings.pre_gamma, settings.exposure)
+
+
+def _chain(device, reference: bool):
+    """The fused stages of a frame (see :mod:`fused`): the same bits in far fewer operations.
+    None for the reference way, which is what they are held against, and on the processor."""
+    return None if reference else fused.chain_for(device)
 
 
 def _frames(src, device, reference: bool, on_packet=None, wanted=None):
@@ -328,13 +336,14 @@ def analyse_video(src, settings: VideoSettings, device,
             method = _decoding_again(lambda: _choose_method(src, info, settings, engine, device,
                                                             progress, cancelled, reference))
         render_settings = replace(settings.render, method=method)
+        chain = _chain(device, reference)
 
         def measure_every_frame():
             recorded, times, pts, signatures = [], [], [], []
             with _frames(src, device, reference) as frames:
                 for frame in frames:
                     _check(cancelled)
-                    linear = _to_engine(frame, info, settings)
+                    linear = _to_engine(frame, info, settings, chain)
                     if reference:
                         params = render(engine.tone_mapper, engine.loader, engine.processor, linear,
                                         render_settings, release_cache=False)[1]
@@ -385,6 +394,14 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
     written = sum(keep)
     blur = bool(settings.motion_blur) and written < len(keep)
     cuts = set(analysis.cuts)
+    chain = _chain(device, reference)
+    # The file is the same whichever way the pictures reach the encoder, so the faster one
+    # is taken, as measured (RTX 4090, 1440p, frames a second of the source): every frame
+    # written, 173 through memory for 157 on the card; fewer frames written, 295 on the
+    # card for 253 through memory at 60 a second, 357 for 290 at 30.
+    on_card = not reference and written < len(keep)
+    to_light = yuv_to_scrgb if chain is None else chain.yuv_to_scrgb
+    to_planes = srgb_to_yuv420 if chain is None else chain.srgb_to_yuv420
 
     def kept(index: int) -> bool:
         return index >= len(keep) or keep[index]      # a frame past the analysis is looked at: it is an error
@@ -393,7 +410,9 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
         """One encode of the whole file. Returns its writer, closed; leaves no file on failure."""
         writer = VideoWriter(dst, info, quality=settings.quality,
                              size=None if size == (info.width, info.height) else size,
-                             max_bit_rate=budget, average=average, frame_rate=settings.frame_rate)
+                             max_bit_rate=budget, average=average, frame_rate=settings.frame_rate,
+                             sessions=1 if reference else 2,      # the two hardware encoders at once, or in turns
+                             device=device if on_card else None)  # pictures left on the card, or through memory
         encoder = None
         try:
             # Dropped frames are only counted, unless their light is wanted.
@@ -406,11 +425,11 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
                     linear = scrgb_to_engine(light, settings.pre_gamma, settings.exposure)
                     srgb, _ = render(engine.tone_mapper, engine.loader, engine.processor, linear,
                                      render_settings, params=_on_device(stable[index], device),
-                                     release_cache=False)
+                                     release_cache=False, fast=chain)
                     if size != (info.width, info.height):
                         srgb = F.interpolate(srgb, size=(size[1], size[0]), mode="bicubic",
                                              align_corners=False, antialias=True).clamp(0.0, 1.0)
-                    picture = writer.frame(pts, *srgb_to_yuv420(srgb))
+                    picture = writer.frame(pts, *to_planes(srgb))
                     if encoder is None:
                         writer.encode(picture)
                     else:
@@ -428,7 +447,7 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
                     if keep[frame.index]:
                         if exposure is not None:
                             finish(exposure)           # the picture before this one has all its light
-                        light = yuv_to_scrgb(frame.y, frame.u, frame.v, info.fmt)
+                        light = to_light(frame.y, frame.u, frame.v, info.fmt)
                         if blur:
                             exposure, gathering = [frame.index, frame.pts, light, 1], True
                         else:
@@ -438,7 +457,7 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
                         if frame.index in cuts:
                             gathering = False          # another shot begins: not this picture's light
                         else:
-                            exposure[2] = exposure[2] + yuv_to_scrgb(frame.y, frame.u, frame.v, info.fmt)
+                            exposure[2] = exposure[2] + to_light(frame.y, frame.u, frame.v, info.fmt)
                             exposure[3] += 1
                     if progress:
                         progress("render", frame.index + 1, info.frames)

@@ -1,6 +1,6 @@
 # NVIDIA HDR Converter GUI — HDR Blaster
 
-**Version 3.0.3**
+**Version 3.1.0**
 
 Convert NVIDIA HDR captures to SDR: JXR screenshots to JPEG or TIFF, and HDR10 recordings to
 H.264 video, in one window. Version 3 of *NVIDIA HDR Converter GUI* is a new application,
@@ -9,6 +9,25 @@ called HDR Blaster; `NHC.py` still starts it.
 <p align="center">
   <img width="1024" src="docs/screenshot.png">
 </p>
+
+## What's new in 3.1.0
+
+- **Videos convert a third faster again, with the same pictures, bit for bit.** A one-minute
+  1440p recording at 120 frames per second took 1.8 minutes; it takes about 1.2 (0.9 at 60
+  frames per second, 0.8 at 30). Each stage of a frame, from the recording's planes to the
+  finished picture, is now one operation on the graphics card instead of dozens. A fused
+  stage is used only after it has given, on your machine, exactly what the plain stage gives.
+- **Both hardware encoders of the card are put to work** when it has two (an RTX 4090 does):
+  the video is encoded in segments of 250 frames by two encoders that take turns. The file
+  is the same whether they work at the same time or one after the other. If a second
+  encoder is not to be had (other programs hold them, an older driver), one encoder encodes
+  the whole video, as before.
+- **At a lower frame rate, pictures reach the encoder without leaving the card.** The
+  encoder gives the same packets as when they go through main memory; this too is checked
+  on your machine before it is relied on.
+- The pictures are those of 3.0.3; the encoded file is not byte for byte the one 3.0.3
+  wrote when two encoders share the work: the same key frames, the same quality on average
+  (within 0.2 dB on the recordings measured), single groups of frames a little above or below.
 
 ## What's new in 3.0.3
 
@@ -273,8 +292,8 @@ that reads back what the HDR surface presents.
 - **Windows**: built and tested on Windows with an NVIDIA GPU; the CPU path works but is slow
 - **Real HDR display of the source** needs Windows with HDR switched on for the screen the
   window is on; elsewhere the source is shown cut at the window's white
-- **Video speed**: a one-minute 1440p recording at 120 frames per second (7,142 frames) converts in about 1.8 minutes on an RTX 4090 (analysis 190 frames per second, rendering and
-  encoding 110), 2.4 minutes with sharpening, 1.2 minutes at 60 frames per second and 1 minute at 30
+- **Video speed**: a one-minute 1440p recording at 120 frames per second (7,142 frames) converts in about 1.2 minutes on an RTX 4090 (analysis 235 frames per second, rendering and
+  encoding 178), 1.9 minutes with sharpening, 0.9 minute at 60 frames per second and 0.8 minute at 30
 
 ## Troubleshooting
 - **CUDA out of memory**: switch on *Half precision*, or switch off *Use the graphics card*, in the Advanced panel

@@ -126,6 +126,26 @@ sub-libraries (`ops`, `cnn`, `engines_precompiled`, `engines_runtime_compiled`,
 > To validate a built exe the way an end user will run it: strip CUDA/NVIDIA
 > entries from `PATH`, unset `CUDA_PATH*`, then run `--selftest`.
 
+## The fused stages need the card's compiler
+
+A video frame is computed by a few operations compiled for the card at the first frame
+(`hdr_blaster/video/fused.py`, through PyTorch's `jiterator`). That needs NVRTC, which is
+among the libraries kept in the bundle (`nvrtc64_130_0.dll` and its builtins; only the
+`.alt` copy is dropped). Compiled operations are kept by PyTorch in `%TEMP%\torch\kernels`
+(a few hundred kB). Without NVRTC, or if a stage does not give the bits of the plain one,
+the plain stages are used and the log says so: slower, the same pictures.
+
+## Two encoders, and pictures left on the card
+
+With NVENC a video is encoded in segments of 250 pictures by two encoders taking turns
+(`hdr_blaster/video/writer.py`): on a card with two encoder chips both work, and the file is
+the same whether they do or not. When fewer frames are written than read (a lower frame
+rate), the pictures are handed to the encoder on the card, through PyTorch's own context
+of the card (`VideoFrame.from_dlpack`); the encoder gives the same packets as through main
+memory, which is checked on each machine, for each size, before it is relied on. Only
+sizes whose width is a multiple of 32 and height a multiple of 8 go that way: the encoder
+misreads unaligned card memory and can leave the card in error for the whole program.
+
 ## Bundled assets
 
 `NHC.spec` bundles, and the app reads them from `sys._MEIPASS` (the `_internal` folder) when frozen:

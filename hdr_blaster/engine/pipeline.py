@@ -3,7 +3,7 @@
 The GUI (single file, folder, preview) and the CLI all go through these
 functions, so there is a single place where the order of operations is decided.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple
 
 import torch
@@ -43,7 +43,7 @@ def tonemap_srgb(tone_mapper, loader, linear: torch.Tensor, method: str,
 
 
 def render(tone_mapper, loader, processor, linear: torch.Tensor, settings: RenderSettings,
-           params: Optional[RenderParams] = None, release_cache: bool = True
+           params: Optional[RenderParams] = None, release_cache: bool = True, fast=None
            ) -> Tuple[torch.Tensor, RenderParams]:
     """Full conversion of one image. Returns ``(sRGB tensor, parameters used)``.
 
@@ -52,6 +52,11 @@ def render(tone_mapper, loader, processor, linear: torch.Tensor, settings: Rende
     ``params`` nothing is measured: the recorded values are applied as they are
     (a video frame), and ``settings.method`` is ignored in favour of the
     recorded method.
+
+    ``fast``: the fused stages of a video (:class:`hdr_blaster.video.fused.Chain`). A
+    frozen Faithful frame that is neither sharpened nor recoloured is then rendered by
+    one operation on the card instead of some ninety, to the very same bits; anything
+    else is rendered here as usual.
     """
     if params is None:
         params = RenderParams(method=resolve_method(tone_mapper, linear, settings.method))
@@ -59,6 +64,27 @@ def render(tone_mapper, loader, processor, linear: torch.Tensor, settings: Rende
         raise ValueError(
             "render() replays frozen parameters only: call .freeze() on recorded "
             "parameters first (un-frozen ones would be measured again and overwritten)")
+    if (fast is not None and params.frozen and params.method == "faithful"
+            and not getattr(processor, "use_fp16", False)
+            and not processor.measures(settings.color_strength, settings.edge_strength, settings.use_enhancement)):
+        peak = params.measure("scene.peak", lambda: None)          # frozen: the recorded value, or it is missing
+
+        def plain(scene, level, white_nits):
+            """The same frame the usual way: what the fused stage is held against."""
+            recorded = RenderParams(method="faithful", stats={"scene.peak": level}, frozen=True)
+            return _finish(tone_mapper, loader, processor, scene, replace(settings, white_nits=white_nits),
+                           recorded, release_cache=False)
+
+        picture = fast.render(plain, linear, peak, settings.white_nits)
+        if release_cache:
+            processor.clear_gpu_memory()
+        return picture, params
+    return _finish(tone_mapper, loader, processor, linear, settings, params, release_cache), params
+
+
+def _finish(tone_mapper, loader, processor, linear: torch.Tensor, settings: RenderSettings,
+            params: RenderParams, release_cache: bool) -> torch.Tensor:
+    """Tone mapping, sRGB encoding, enhancement: the picture, with ``params`` filled or replayed."""
     srgb = tonemap_srgb(tone_mapper, loader, linear, params.method, params, settings.white_nits)
     enhanced = processor.process_image(
         srgb.clone(),
@@ -69,7 +95,7 @@ def render(tone_mapper, loader, processor, linear: torch.Tensor, settings: Rende
         keep_levels=tone_mapper.keeps_scene_levels(params.method),
         release_cache=release_cache,
     )
-    return enhanced, params
+    return enhanced
 
 
 def measure(tone_mapper, loader, processor, linear: torch.Tensor, settings: RenderSettings,
