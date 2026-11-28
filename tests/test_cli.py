@@ -26,9 +26,11 @@ def test_the_version_is_3_1_3_everywhere():
     done = run("--version")
     assert done.returncode == 0 and done.stdout.strip().endswith("3.1.3"), done.stdout + done.stderr
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "**Version 3.1.3**" in readme and "## What's new in 3.1.3" in readme
-    assert all(f"## What's new in {before}" in readme for before in ("3.1.2", "3.1.1", "3.1.0", "3.0.3", "3.0.2")), \
-        "what the versions before brought is still told (3.1.0 was never published on its own)"
+    assert f"badge/version-{hdr_blaster.__version__}-" in readme
+    assert f"HDR_Blaster_v{hdr_blaster.__version__}-portable.zip" in readme
+    # The README tells what the program is. What each version brought is told in the release
+    # notes, which it points to (the author, 2026-11-28: no more piling up of updates here).
+    assert "What's new in" not in readme and "NVIDIA-HDR-Converter-GUI/releases" in readme
     assert f'version = "{hdr_blaster.__version__}"' in (ROOT / "uv.lock").read_text(encoding="utf-8")
 
 
