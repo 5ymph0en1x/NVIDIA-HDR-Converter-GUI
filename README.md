@@ -135,8 +135,8 @@ None of this shows in a feature list. It is the difference between a file that l
 
 ## Get started
 
-1. Download `HDR_Blaster_v3.1.3-portable.zip` from **[Releases](https://github.com/5ymph0en1x/NVIDIA-HDR-Converter-GUI/releases)**.
-2. Unzip it anywhere and start `HDR_Blaster.exe`. Keep it next to its `_internal` folder: the two go together. No installer, no Python, no CUDA Toolkit; only a recent NVIDIA driver.
+1. Download `HDR_Blaster_v3.1.3-portable-win-x64.zip` from **[Releases](https://github.com/5ymph0en1x/NVIDIA-HDR-Converter-GUI/releases)**.
+2. Unzip it anywhere and start `HDR_Blaster_v3.1.3.exe`. Keep it next to its `_internal` folder: the two go together. No installer, no Python, no CUDA Toolkit; only a recent NVIDIA driver.
 3. Drop a capture, a recording, several files or a whole folder on the window.
 4. Look. The HDR source is on the left of the divider, the SDR result on the right; drag the divider. For a video, the timeline picks the frame.
 5. Pick a look if you wish, and press **Convert**.
