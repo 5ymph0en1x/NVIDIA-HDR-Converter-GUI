@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from hdr_blaster.engine.colour import nonnegative_rgb
 from dataset import SCRGB_WHITE_NITS, load_jxr_nits
 from model import NeuralToneMapper
 
@@ -45,7 +48,7 @@ def tonemap_file(model: NeuralToneMapper, device: torch.device, jxr_path: Path, 
                  input_unit=NeuralToneMapper.INPUT_UNIT):
     hdr = load_jxr(jxr_path, input_unit).to(device)
     with torch.inference_mode():
-        sdr = model(hdr).clamp(0, 1)
+        sdr = model(nonnegative_rgb(hdr)).clamp(0, 1)
     arr = np.rint(sdr.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
     Image.fromarray(arr).save(out_path, quality=95, optimize=True)
     logging.info(f"{jxr_path.name} -> {out_path}")

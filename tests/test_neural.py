@@ -119,18 +119,7 @@ def test_application_feeds_the_shipped_model_in_nits(shipped_engine):
 
 @pytest.mark.parametrize("white", [203.0, 480.0])
 def test_shipped_model_renders_the_look_it_was_taught_on_any_screen(shipped_engine, sample, white):
-    """The shipped model was taught by Punchy, which keeps the scene's exposure. On whole
-    captures it never saw, and for the teacher's white as for a much brighter screen, its
-    render must stay close to that look's: same exposure, real blacks.
-
-    History of what this guards against: the first shipped model lifted blacks to a
-    grey-green veil (darkest 1 % of pixels at 0.16 to 0.20), a later one over-exposed some
-    scenes, and the one before this exposed every scene by its content (15 to 34 dB from
-    the anchored look).
-
-    Measured for this model, taught by the reworked Punchy: 27.5 to 37.1 dB; its darkest
-    1 % of pixels within 0.005 of the look's; the scene's dark zones kept within 7 %.
-    """
+    """The current teacher anchors shadows and highlights, while the grid renders mid-tones."""
     from hdr_blaster.engine.pipeline import RenderSettings, render
 
     engine = shipped_engine
@@ -140,7 +129,7 @@ def test_shipped_model_renders_the_look_it_was_taught_on_any_screen(shipped_engi
                              RenderSettings(method="neural", white_nits=white))
     taught, _ = render(engine.tone_mapper, engine.loader, engine.processor, linear,
                        RenderSettings(method="punchy", white_nits=white))
-    assert set(params.stats) == {"neural.grid"}
+    assert set(params.stats) == {"neural.grid", "scene.peak"}
     assert torch.isfinite(learned).all() and float(learned.min()) >= 0.0 and float(learned.max()) <= 1.0
     psnr = -10.0 * torch.log10(((learned - taught) ** 2).mean())
     assert float(psnr) > 26.0, f"{float(psnr):.1f} dB"
@@ -154,7 +143,9 @@ def test_shipped_model_renders_the_look_it_was_taught_on_any_screen(shipped_engi
     # the rule every rendering obeys: the dark zones are the scene's own
     from hdr_blaster.engine.colour import _srgb_decode
 
-    scene = linear.clamp(min=0.0).amax(1) * 800.0
+    scene = engine.tone_mapper._relative(linear, white).amax(1) * white
+    anchors = ((scene >= white) | (scene <= 0.045 * white)).unsqueeze(1).expand_as(learned)
+    assert torch.allclose(learned[anchors], taught[anchors], atol=1e-6, rtol=0)
     shown = _srgb_decode(learned).amax(1) * white
     band = (scene >= 0.5) & (scene < 0.03 * white)
     if int(band.sum()) > 2000:

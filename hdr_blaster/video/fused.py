@@ -38,6 +38,7 @@ import numpy as np
 import torch
 
 from ..engine import renderings as R
+from ..engine.colour import nonnegative_rgb
 from ..engine.constants import ENGINE_UNIT_NITS
 from . import colour
 
@@ -79,8 +80,8 @@ def _light_code() -> str:
     def mixed(row: int) -> str:
         # The 3x3 matrix is a matrix product in the plain stage, and the library that
         # computes it adds the first two terms with a fused multiply-add, then the third.
-        return (f"fmaxf(__fmul_rn(__fadd_rn(__fmaf_rn({_f32(m[row][1])}, ng, __fmul_rn({_f32(m[row][0])}, nr)), "
-                f"__fmul_rn({_f32(m[row][2])}, nb)), {_inverse(colour.SCRGB_WHITE_NITS)}), 0.0f)")
+        return (f"__fmul_rn(__fadd_rn(__fmaf_rn({_f32(m[row][1])}, ng, __fmul_rn({_f32(m[row][0])}, nr)), "
+                f"__fmul_rn({_f32(m[row][2])}, nb)), {_inverse(colour.SCRGB_WHITE_NITS)})")
 
     return f"""
 template <typename T> void scene_light(T y, T cb_left, T cb_right, T cr_left, T cr_right, T y_offset, T y_scale,
@@ -99,38 +100,39 @@ template <typename T> void scene_light(T y, T cb_left, T cb_right, T cr_left, T 
 
 # ------------------------------------------- the scene, rendered Faithful, as sRGB
 def _faithful_code() -> str:
-    def encode(name: str, nits: str) -> str:          # renderings.pq_encode
-        return (f"    float y_{name} = powf(__fmul_rn(fminf(fmaxf({nits}, 0.0f), 10000.0f), {_inverse(10000.0)}), "
-                f"{_f32(R._PQ_M1)});\n"
-                f"    float {name} = powf(__fdiv_rn(__fadd_rn({_f32(R._PQ_C1)}, __fmul_rn({_f32(R._PQ_C2)}, y_{name})), "
-                f"__fadd_rn(1.0f, __fmul_rn({_f32(R._PQ_C3)}, y_{name}))), {_f32(R._PQ_M2)});\n")
-
-    def srgb(name: str) -> str:                       # the loader's linear_to_srgb, on (x * gain).clamp(0, 1)
-        return (f"    float l{name} = fminf(fmaxf(fminf(fmaxf(__fmul_rn(x{name}, gain), 0.0f), 1.0f), 0.0f), 1.0f);\n"
+    def srgb(name: str) -> str:                       # reconstruct RGB, then the loader's linear_to_srgb
+        return (f"    float place_{name} = __fdiv_rn(__fsub_rn(x{name}, low), fmaxf(reach, {_f32(1e-9)}));\n"
+                f"    float v{name} = kept ? x{name} : __fadd_rn(low_out, __fmul_rn(place_{name}, rise));\n"
+                f"    float l{name} = fminf(fmaxf(fminf(fmaxf(v{name}, 0.0f), 1.0f), 0.0f), 1.0f);\n"
                 f"    float s{name} = l{name} <= {_f32(0.0031308)} ? __fmul_rn({_f32(12.92)}, l{name}) : "
                 f"__fsub_rn(__fmul_rn({_f32(1 + 0.055)}, powf(l{name}, {_f32(1.0 / 2.4)})), {_f32(0.055)});\n")
 
     return f"""
-template <typename T> void faithful_srgb(T r, T g, T b, T top_code, T target, T knee, T rest, T span,
-                                         T relative, T white, T per_white, T& red, T& green, T& blue) {{
+template <typename T> void faithful_srgb(T r, T g, T b, T headroom, T slope, T relative,
+                                         T& red, T& green, T& blue) {{
     float xr = __fmul_rn(fmaxf((float)r, 0.0f), (float)relative);
     float xg = __fmul_rn(fmaxf((float)g, 0.0f), (float)relative);
     float xb = __fmul_rn(fmaxf((float)b, 0.0f), (float)relative);
     float top = fmaxf(fmaxf(xr, xg), xb);
-    float nits = __fmul_rn(top, (float)white);
-{encode("code", "nits")}    float position = __fdiv_rn(code, (float)top_code);
-    float t = fminf(fmaxf(__fdiv_rn(__fsub_rn(fminf(position, 1.0f), (float)knee), (float)span), 0.0f), 1.0f);
-    float t2 = __fmul_rn(t, t);
-    float t3 = __fmul_rn(t2, t);
-    float leave = __fmul_rn(__fadd_rn(__fsub_rn(__fmul_rn(2.0f, t3), __fmul_rn(3.0f, t2)), 1.0f), (float)knee);
-    float bend = __fmul_rn(__fadd_rn(__fsub_rn(t3, __fmul_rn(2.0f, t2)), t), (float)rest);
-    float land = __fmul_rn(__fadd_rn(__fmul_rn(-2.0f, t3), __fmul_rn(3.0f, t2)), (float)target);
-    float shoulder = __fmul_rn(__fadd_rn(__fadd_rn(leave, bend), land), (float)top_code);
-    float p = powf(fminf(fmaxf(shoulder, 0.0f), 1.0f), {_f32(1.0 / R._PQ_M2)});
-    float decoded = __fmul_rn(10000.0f, powf(__fdiv_rn(fmaxf(__fsub_rn(p, {_f32(R._PQ_C1)}), 0.0f),
-                              __fsub_rn({_f32(R._PQ_C2)}, __fmul_rn({_f32(R._PQ_C3)}, p))), {_f32(1.0 / R._PQ_M1)}));
-    float mapped = __fmul_rn(position <= (float)knee ? nits : fminf(decoded, (float)white), (float)per_white);
-    float gain = top > {_f32(1e-9)} ? __fdiv_rn(mapped, fmaxf(top, {_f32(1e-9)})) : 1.0f;
+    float low = fminf(fminf(xr, xg), xb);
+    float stops = fmaxf(__fadd_rn(log2f(fmaxf(top, {_f32(1e-9)})), 0.5f), 0.0f);
+    stops = fminf(stops, __fadd_rn(0.5f, (float)headroom));
+    float bend = fminf(stops, 0.25f);
+    float log_out = __fadd_rn(__fmul_rn((float)slope, stops),
+        __fmul_rn(__fsub_rn(1.0f, (float)slope), __fmul_rn(bend, __fsub_rn(1.0f, __fmul_rn(2.0f, bend)))));
+    float top_out = fminf(exp2f(__fsub_rn(log_out, 0.5f)), 1.0f);
+    float room = fmaxf(__fsub_rn(top_out, 0.5f), 0.0f);
+    float excess = fmaxf(__fsub_rn(low, 0.5f), 0.0f);
+    float denom = __fsub_rn(__fsub_rn(top, 0.5f), __fmul_rn(0.125f, room));
+    float end_slope = fminf(fmaxf(__fdiv_rn(__fmul_rn(0.875f, room), fmaxf(denom, {_f32(1e-9)})), 0.0f), 1.0f);
+    float toe = fminf(excess, __fmul_rn(0.25f, room));
+    float integral = __fmul_rn(toe, __fsub_rn(1.0f, __fdiv_rn(__fmul_rn(2.0f, toe), fmaxf(room, {_f32(1e-9)}))));
+    float low_out = __fadd_rn(__fadd_rn(0.5f, __fmul_rn(end_slope, excess)),
+        __fmul_rn(__fsub_rn(1.0f, end_slope), integral));
+    low_out = low <= 0.5f ? low : fminf(low_out, top_out);
+    float reach = __fsub_rn(top, low);
+    float rise = __fsub_rn(top_out, low_out);
+    bool kept = stops == 0.0f || ((float)headroom == 0.0f && top <= 1.0f);
 {srgb("r")}{srgb("g")}{srgb("b")}    red = (T)fminf(fmaxf(sr, 0.0f), 1.0f);
     green = (T)fminf(fmaxf(sg, 0.0f), 1.0f);
     blue = (T)fminf(fmaxf(sb, 0.0f), 1.0f);
@@ -191,8 +193,7 @@ class Chain:
         self.device = torch.device(device)
         self._chroma_rows = _create_jit_fn(_CHROMA_ROWS, offset=0.0, scale=1.0)
         self._light = _create_multi_output_jit_fn(_light_code(), num_outputs=3, y_offset=0.0, y_scale=1.0)
-        self._faithful = _create_multi_output_jit_fn(_faithful_code(), num_outputs=3,
-                                                     relative=1.0, white=1.0, per_white=1.0)
+        self._faithful = _create_multi_output_jit_fn(_faithful_code(), num_outputs=3, relative=1.0)
         self._luma = _create_multi_output_jit_fn(_luma_code(), num_outputs=3)
         self._chroma_sample = _create_jit_fn(_CHROMA_SAMPLE)
         self._verdicts = {}                 # (stage, kind of input) -> the fused stage may be used
@@ -286,20 +287,10 @@ class Chain:
 
     # ------------------------------------------------- the Faithful rendering
     def _faithful_srgb(self, linear, peak, white_nits):
-        white = float(white_nits)
-        # What the curve needs of the picture as a whole, by the very operations of
-        # renderings.faithful_curve: a few numbers, not worth a kernel of their own.
-        white_t = torch.as_tensor(white, dtype=torch.float32, device=linear.device)
-        peak_t = torch.maximum(torch.as_tensor(peak * white, dtype=torch.float32, device=linear.device), white_t)
-        top_code = R.pq_encode(peak_t)
-        target = R.pq_encode(white_t) / top_code
-        knee = (1.5 * target - 0.5).clamp(min=0.0)
-        rest = 1.0 - knee
-        one = ()                            # each of them one number, whatever shape the peak came in
-        red, green, blue = self._faithful(linear[0, 0], linear[0, 1], linear[0, 2], top_code.reshape(one),
-                                          target.reshape(one), knee.reshape(one), rest.reshape(one),
-                                          rest.clamp(min=1e-6).reshape(one), relative=ENGINE_UNIT_NITS / white,
-                                          white=white, per_white=1.0 / white)
+        headroom, slope = R.faithful_stops(peak.reshape(()), linear.device)
+        linear = nonnegative_rgb(linear)
+        red, green, blue = self._faithful(linear[0, 0], linear[0, 1], linear[0, 2], headroom, slope,
+                                          relative=ENGINE_UNIT_NITS / float(white_nits))
         return torch.stack((red, green, blue)).unsqueeze(0)
 
     @staticmethod
@@ -321,7 +312,7 @@ class Chain:
     def render(self, plain: Callable, linear, peak, white_nits):
         """The Faithful rendering of a scene, sRGB encoded: what ``plain(linear, peak,
         white_nits)`` gives, which is how the caller says what the plain way is."""
-        # (the plain way refuses a picture of 32 pixels or less a side: it is left to refuse it)
+        # Tiny pictures use the plain rendering path.
         usual = (linear.dim() == 4 and linear.shape[0] == 1 and linear.shape[1] == 3 and min(linear.shape[-2:]) > 32
                  and linear.dtype == torch.float32 and linear.device.type == "cuda"
                  and torch.is_tensor(peak) and peak.numel() == 1 and peak.device == linear.device)

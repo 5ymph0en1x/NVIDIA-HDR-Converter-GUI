@@ -10,7 +10,7 @@ tones above the shadows:
 * Hable       film: more contrast in the mid-tones, muted colours, lights that fade;
 * ACES        vivid: strong contrast, rich mid-tones, lights that burn to white;
 * Drago03     flat: the whole range above the shadows compressed evenly, colours kept;
-* Perceptual  luminous: the roll-off of BT.2390 in ICtCp, hue and brightness kept;
+* Perceptual  luminous: a constant-hue gamut fit and a log-light shoulder in ICtCp;
 * Mantiuk06   local: a soft roll-off of the large shapes, their detail reinforced.
 """
 import math
@@ -65,6 +65,64 @@ def contrast_at_grey(engine, device, method):
     return math.log(lum(out[1]) / lum(out[0])) / math.log(high / low)
 
 
+# ------------------------------------------------ colour and exposure checks
+
+
+def test_perceptual_gamut_fit_matches_absolute_primary_references(engine, device):
+    # Calculated independently in binary64 from the BT.709/2020 chromaticities,
+    # ST 2084 and BT.2100 matrices. At this white the red and blue intensities
+    # fall below the shoulder; only their chroma needs to fit the display.
+    values = [(1000., 0., 0.), (0., 0., 1000.), (332.0982, -24.91, -3.63), 1000.]
+    linear = patches(device, values)
+    out = centres(shown(engine, linear, "perceptual"), len(values)) * WHITE
+    expected = out.new_tensor([(480., 146.413, 95.439), (8.809, 71.862, 480.)])
+    assert torch.allclose(out[:2], expected, atol=0.15, rtol=0)
+    source = linear[:, :, 48:49, 48::96] * ENGINE_UNIT_NITS
+    a = R.to_ictcp(source.double())[0, 1:, 0, :3]
+    b = R.to_ictcp(out.T.reshape(1, 3, 1, -1).double())[0, 1:, 0, :3]
+    drift = torch.rad2deg(torch.atan2(a[0]*b[1]-a[1]*b[0], (a*b).sum(0)))
+    assert float(drift.abs().max()) < 0.12
+
+
+@pytest.mark.parametrize("white", [203., 480.])
+def test_perceptual_neutral_ramp_never_reverses(device, white):
+    ramp = torch.linspace(0, 10000 / white, 8192, device=device).view(1, 1, 1, -1)
+    out = R.perceptual(ramp.expand(1, 3, 1, -1), ramp.max(), white)
+    assert (out[..., 1:] >= out[..., :-1]).all()
+    assert torch.equal(out[:, 0], out[:, 2])
+    assert float(out.max()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_classical_gamut_fit_preserves_signed_luminance_and_representable_shadows(device):
+    from hdr_blaster.engine.colour import nonnegative_rgb
+
+    colours = patches(device, [(80., -4., 15.), (-2., 30., 1.), (2., 6., 8.), (0., 0., 0.)])
+    mapped = nonnegative_rgb(colours)
+    assert float(mapped.min()) >= 0
+    assert torch.allclose(R.luminance(mapped), R.luminance(colours), atol=1e-8, rtol=1e-6)
+    assert torch.equal(mapped[..., 192:], colours[..., 192:])
+
+
+def test_uniform_image_has_zero_contrast_at_every_size(engine, device):
+    choices = []
+    for size in (1, 4, 32, 257):
+        scene = torch.full((1, 3, size, size), 0.81, device=device)
+        stats = engine.tone_mapper.analyze_image_statistics(scene)
+        assert all(math.isfinite(value) for value in stats.values())
+        assert stats["contrast_score"] == stats["local_contrast"] == 0
+        choices.append(engine.tone_mapper.select_optimal_tonemap(stats))
+    assert len(set(choices)) == 1
+
+
+@pytest.mark.parametrize("white,floor", [(203., 0.038), (480., 0.062)])
+def test_cyberpunk_sun_and_sky_remain_distinct(engine, device, white, floor):
+    # Native pixels of the sunrise at (664, 520) and (820, 288), plus its 99.99th percentile peak.
+    linear = patches(device, [(998.75, 999.0625, 998.984375), (941.875, 797.265625, 635.625), 1185.078125])
+    for method in ("perceptual", "natural", "punchy", "golden"):
+        out = centres(shown(engine, linear, method, white), 2)
+        assert lum(out[0]) / lum(out[1]) - 1 > floor, method
+
+
 # ------------------------------------------------------------------ Reinhard
 
 def test_the_reinhard_shoulder_leaves_the_knee_smoothly_and_lands_the_peak_on_white(device):
@@ -93,9 +151,14 @@ def test_reinhard_touches_nothing_up_to_mid_grey_and_is_soft_above(engine, devic
 
 
 def test_reinhard_lets_bright_colours_go_pastel(engine, device):
-    light = patches(device, [(900.0, 380.0, 200.0), GREY * WHITE, 1000.0])
-    assert saturation(centres(shown(engine, light, "reinhard"), 1)[0]) < \
-        saturation(centres(shown(engine, light, "faithful"), 1)[0]) - 0.1
+    """Less colour than the scene's own, and than a rendering that keeps it (Drago). Faithful
+    is no longer that rendering: since 3.1.2 it shows the weakest channel of a light as the
+    source view does, and this colour comes out of both alike."""
+    colour = (900.0, 380.0, 200.0)
+    light = patches(device, [colour, GREY * WHITE, 1000.0])
+    soft = saturation(centres(shown(engine, light, "reinhard"), 1)[0])
+    assert soft < (1.0 - min(colour) / max(colour)) - 0.1
+    assert soft < saturation(centres(shown(engine, light, "drago03"), 1)[0]) - 0.1
 
 
 # --------------------------------------------------------------------- Hable
@@ -116,7 +179,8 @@ def test_aces_is_vivid_strong_contrast_rich_mid_tones_lights_that_burn_to_white(
     scene = patches(device, [(0.30 * WHITE, 0.12 * WHITE, 0.10 * WHITE), (1400.0, 500.0, 250.0), 1500.0])
     vivid, true = centres(shown(engine, scene, "aces"), 2), centres(shown(engine, scene, "faithful"), 2)
     assert saturation(vivid[0]) > saturation(true[0]) + 0.03, "richer mid-tones"
-    assert saturation(vivid[1]) < saturation(true[1]) - 0.15, "a bright colour burns towards white"
+    assert saturation(vivid[1]) < (1.0 - 250.0 / 1400.0) - 0.15, "a bright colour burns towards white"
+    assert lum(vivid[1]) > lum(true[1]) + 0.05, "further than Faithful lets it: it is brighter for it"
 
 
 # --------------------------------------------------------------------- Drago
@@ -143,9 +207,15 @@ def test_ictcp_is_the_one_of_bt2100(device):
     assert torch.allclose(R.from_ictcp(ictcp), nits, rtol=1e-6, atol=1e-6)
 
 
-def test_perceptual_is_the_faithful_roll_off_on_a_neutral(engine, device):
+def test_perceptual_reserves_a_stop_for_neutral_highlight_contrast(engine, device):
     greys = patches(device, [20.0, 150.0, 400.0, 700.0, 1000.0])
-    assert torch.allclose(shown(engine, greys, "perceptual"), shown(engine, greys, "faithful"), atol=0.004)
+    level = greys * ENGINE_UNIT_NITS / WHITE
+    # Integrated unit-to-final log slope for a one-stop shoulder, half-stop transition.
+    slope = 0.75 / (0.75 + math.log2(1000.0 / WHITE))
+    u = torch.log2(level) + 1
+    bend = u.clamp(0, 0.5)
+    expected = torch.where(u <= 0, level, 2 ** (-1 + slope*u + (1-slope)*bend*(1-bend)))
+    assert torch.allclose(shown(engine, greys, "perceptual"), expected, atol=0.004)
 
 
 def test_perceptual_keeps_the_hue_and_the_brightness_of_a_coloured_light(engine, device):
@@ -214,12 +284,9 @@ def test_mantiuk_draws_no_halo_along_an_edge(engine, device):
 def test_every_operator_offered_is_a_picture_of_its_own(engine, get_linear):
     """On the captures, at the author's white: any two renderings offered differ visibly.
     By eight levels or more over the hundredth of the picture where they differ most (the
-    lights: that is where they may), and by 1.3 levels or more on average. Before, four
-    operators were within half a level of one another.
-
-    One pair is allowed less on average: Perceptual is the Faithful roll-off done in
-    another colour space. The two agree wherever nothing is brighter than white and part
-    only on the lights, where they part clearly."""
+    lights: that is where they may), and by 1.3 levels on average above mid-grey. The
+    proportion of protected shadows in a full frame should not set this threshold. Before, four
+    operators were within half a level of one another."""
     from hdr_blaster.session import OPERATORS
 
     offered = [name for name in OPERATORS.values() if name not in ("", "auto", "neural")]
@@ -230,15 +297,16 @@ def test_every_operator_offered_is_a_picture_of_its_own(engine, get_linear):
     used = SAMPLES[:4]
     for sample in used:
         linear = get_linear(sample)
+        above_grey = linear.amax(1).flatten()[::23] > (GREY * WHITE / ENGINE_UNIT_NITS)
+        assert above_grey.any()
         pictures = [preview._srgb(shown(engine, linear, name)) for name in names]
         for i in range(len(names)):
             for j in range(i + 1, len(names)):
                 difference = (pictures[i] - pictures[j]).abs().mean(1).flatten()[::23] * 255.0
-                mean[i, j] += float(difference.mean()) / len(used)
+                mean[i, j] += float(difference[above_grey].mean()) / len(used)
                 top[i, j] += float(torch.quantile(difference, 0.99)) / len(used)
     for i, a in enumerate(names):
         for j in range(i + 1, len(names)):
             b = names[j]
             assert float(top[i, j]) >= 8.0, f"{a} and {b}: only {float(top[i, j]):.1f} levels apart where they differ most"
-            least = 0.7 if {a, b} == {"faithful", "perceptual"} else 1.3
-            assert float(mean[i, j]) >= least, f"{a} and {b}: only {float(mean[i, j]):.2f} levels apart on average"
+            assert float(mean[i, j]) >= 1.3, f"{a} and {b}: only {float(mean[i, j]):.2f} levels apart on average"

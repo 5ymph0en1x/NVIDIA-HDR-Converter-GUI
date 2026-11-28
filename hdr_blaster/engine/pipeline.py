@@ -4,13 +4,15 @@ The GUI (single file, folder, preview) and the CLI all go through these
 functions, so there is a single place where the order of operations is decided.
 """
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from .constants import REFERENCE_WHITE_NITS
-from .renderings import canonical
 from .params import RenderParams
+
+if TYPE_CHECKING:
+    from ..io.still import SdrStill
 
 
 @dataclass(frozen=True)
@@ -29,7 +31,7 @@ def resolve_method(tone_mapper, linear: torch.Tensor, requested: Optional[str]) 
     """The user's pick (under its current name), or the Auto-select oracle's choice for
     this image."""
     if requested is not None:
-        return canonical(requested)
+        return tone_mapper.available_method(requested)
     return tone_mapper.select_optimal_tonemap(tone_mapper.analyze_image_statistics(linear))
 
 
@@ -108,7 +110,7 @@ def measure(tone_mapper, loader, processor, linear: torch.Tensor, settings: Rend
     before. ``settings.method`` must be chosen already (a video's is)."""
     if settings.method is not None and not processor.measures(
             settings.color_strength, settings.edge_strength, settings.use_enhancement):
-        params = RenderParams(method=canonical(settings.method))
+        params = RenderParams(method=resolve_method(tone_mapper, linear, settings.method))
         if tone_mapper.measure_only(linear, params.method, params, settings.white_nits):
             return params
     return render(tone_mapper, loader, processor, linear, settings, release_cache=release_cache)[1]
@@ -125,6 +127,27 @@ def analyze(tone_mapper, loader, processor, linear: torch.Tensor,
     return render(tone_mapper, loader, processor, linear, settings)[1].freeze()
 
 
+@dataclass
+class PreparedCapture:
+    still: "SdrStill"
+    raw: Optional[torch.Tensor]
+    method: str
+
+    def write(self, processor, base):
+        return _write_still(processor, self.still, self.raw, base)
+
+
+@torch.inference_mode()
+def prepare_capture(engine, linear, loader, settings, pre_gamma, exposure, fmt):
+    """Render once at native resolution and retain precisely what will be written."""
+    from ..io.still import SdrStill
+    from .colour import adjust_scene
+
+    adjusted = adjust_scene(linear, pre_gamma, exposure)
+    picture, used = render(loader.tone_mapper, loader, engine.processor, adjusted, settings)
+    return PreparedCapture(SdrStill.prepare(picture, fmt), adjusted if fmt != "JPEG" else None, used.method)
+
+
 def export_image(processor, linear: torch.Tensor, enhanced: torch.Tensor, out_base: str,
                  fmt: str, include_raw: bool) -> List[str]:
     """Write the result next to ``out_base`` (no extension). ``fmt`` is JPEG, TIFF or Both.
@@ -132,19 +155,23 @@ def export_image(processor, linear: torch.Tensor, enhanced: torch.Tensor, out_ba
     ``include_raw`` also writes the untouched HDR data as a float TIFF (GUI behaviour).
     Returns the paths written, in order.
     """
-    if fmt not in ("JPEG", "TIFF", "Both"):
-        raise ValueError(f"Unsupported output format: {fmt}")
+    from ..io.still import SdrStill
+
+    return _write_still(processor, SdrStill.prepare(enhanced, fmt), linear if include_raw else None, out_base)
+
+
+def _write_still(processor, still, raw, base):
     written = []
-    if fmt in ("JPEG", "Both"):
-        path = f"{out_base}.jpg"
-        processor.save_tensor_as_image(enhanced, path, "JPEG")
+    if still.jpeg is not None:
+        path = f"{base}.jpg"
+        still.write_jpeg(path)
         written.append(path)
-    if fmt in ("TIFF", "Both"):
-        if include_raw:
-            path = f"{out_base}_raw.tiff"
-            processor.save_tensor_as_image(linear, path, "TIFF", is_hdr_data=True)
+    if still.tiff is not None:
+        path = f"{base}_tonemapped.tiff"
+        still.write_tiff(path)
+        written.append(path)
+        if raw is not None:
+            path = f"{base}_raw.tiff"
+            processor.save_tensor_as_image(raw, path, "TIFF", is_hdr_data=True)
             written.append(path)
-        path = f"{out_base}_tonemapped.tiff"
-        processor.save_tensor_as_image(enhanced, path, "TIFF", is_hdr_data=False)
-        written.append(path)
     return written

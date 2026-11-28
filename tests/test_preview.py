@@ -186,6 +186,14 @@ def test_image_preview_is_the_full_size_render_brought_to_the_display(device, vi
     assert float((shown - exact_small).abs().mean()) < 0.02
 
 
+def test_missing_neural_model_names_the_operator_actually_previewed(video_engine, device, monkeypatch):
+    monkeypatch.setattr(video_engine.tone_mapper, "neural_model", None)
+    source = preview.PreviewSource("image", "patch", torch.full((1, 3, 64, 64), 0.6, device=device), 64, 64)
+    picture = preview.render_preview(video_engine, source, RenderSettings(method="neural"))
+    assert source.method == "perceptual"
+    assert torch.equal(picture, preview.render_preview(video_engine, source, RenderSettings(method="perceptual")))
+
+
 def test_to_rgb8_gives_a_contiguous_byte_image(device):
     image = torch.rand(1, 3, 5, 7, device=device) * 1.4 - 0.2
     array = preview.to_rgb8(image)
@@ -241,7 +249,9 @@ def test_a_capture_says_it_is_floating_point_scrgb(sample):
     info = read_jxr_info(sample)
     assert (info.width, info.height) == (2560, 1440)
     assert info.is_float and "float" in info.pixel_format and info.has_alpha
-    assert not info.has_icc_profile and not info.has_xmp, "these captures carry no other colour metadata"
+    assert not info.has_icc_profile
+    if sample.name == "Desktop Screenshot 2026.11.28 - 00.36.40.69.jxr":
+        assert info.has_xmp  # The desktop recorder adds a packet to this float scRGB capture.
     check_hdr_capture(info)
 
 

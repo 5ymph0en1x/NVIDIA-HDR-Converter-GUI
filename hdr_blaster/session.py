@@ -25,8 +25,8 @@ DEFAULT_LOOK = "Faithful"
 
 # Advanced: a precise operator, which then replaces the look.
 OPERATORS: Dict[str, str] = {
-    "Follow the look": "", "Auto-select": "auto", "Perceptual": "perceptual", "Mantiuk06": "mantiuk06", "Drago03": "drago03",
-    "Hable": "hable", "ACES": "aces", "Reinhard": "reinhard", "Adaptive": "adaptive", "Neural (AI)": "neural",
+    "Follow the look": "", "Auto-select": "auto", "Perceptual": "perceptual", "Guided local contrast": "mantiuk06", "Drago03": "drago03",
+    "Hable": "hable", "ACES filmic (Narkowicz)": "aces", "Reinhard": "reinhard", "Adaptive": "adaptive", "Neural (AI)": "neural",
 }
 
 # How an operator is called in the interface (the engine's identifiers are not shown).
@@ -51,10 +51,16 @@ VIDEO_HEIGHTS = (0, 1080, 720)                 # 0 keeps the size of the source
 VIDEO_FRAME_RATES = (0, 120, 60, 30)           # 0 keeps every frame of the source
 
 
-def reference_white() -> float:
-    """What SDR white stands for on this screen, in nits: the anchor of the Faithful
-    rendering and of the HDR source view, so that the two agree."""
-    return float(sdr_white_nits()[0])
+def reference_white(screen: str = "") -> float:
+    """What SDR white stands for on a screen, in nits: the anchor of the Faithful rendering
+    and of the HDR source view, so that the two agree.
+
+    ``screen``: the name of the screen the window is on (``display.display_of_window``).
+    The preview is made for that screen, so the file must be too: with two screens in HDR
+    set to different whites, asking no screen in particular gave the file the white of
+    the first one, and a picture that was not the one previewed. Without a window (the
+    command line) no screen is named, and the first one in HDR answers."""
+    return float(sdr_white_nits(screen)[0])
 
 
 @dataclass
@@ -82,8 +88,9 @@ class Options:
         chosen = self.operator or LOOKS.get(self.look, LOOKS[DEFAULT_LOOK])
         return None if chosen == "auto" else chosen
 
-    def render_settings(self, kind: str = "image") -> RenderSettings:
-        """What to render a capture with, or (``kind="video"``) a frame of a recording.
+    def render_settings(self, kind: str = "image", screen: str = "", white_nits: Optional[float] = None) -> RenderSettings:
+        """What to render a capture with, or (``kind="video"``) a frame of a recording, for
+        the screen named (see :func:`reference_white`).
 
         A video takes neither Sharpness nor AI colour unless ``video_enhance`` is on:
         nothing is then measured on its pictures, and its analysis does not have to
@@ -93,24 +100,24 @@ class Options:
         enhance = kind != "video" or self.video_enhance
         return RenderSettings(method=self.method(), color_strength=self.ai_color if enhance else 0.0,
                               edge_strength=self.sharpness if enhance else 0.0, use_enhancement=True,
-                              white_nits=reference_white())
+                              white_nits=reference_white(screen) if white_nits is None else white_nits)
 
-    def video_settings(self) -> VideoSettings:
+    def video_settings(self, screen: str = "", white_nits: Optional[float] = None) -> VideoSettings:
         from .video.job import VideoSettings
 
-        return VideoSettings(render=self.render_settings("video"), quality=self.video_quality,
+        return VideoSettings(render=self.render_settings("video", screen, white_nits), quality=self.video_quality,
                              out_height=self.video_height or None,
                              frame_rate=float(self.video_fps) if self.video_fps else None,
                              motion_blur=bool(self.video_blur and self.video_fps),
                              pre_gamma=self.pre_gamma, exposure=self.exposure)
 
-    def picture_key(self) -> tuple:
+    def picture_key(self, screen: str = "") -> tuple:
         """Changes exactly when the converted picture would change (not when only the file
-        format, the quality or the destination do)."""
+        format, the quality or the destination do). The screen's white is part of it."""
         # (the frame rate alone changes no picture; with motion blur it decides whose light adds up)
         return (self.method(), self.pre_gamma, self.exposure, self.sharpness, self.ai_color,
                 self.video_enhance, self.video_fps if self.video_blur else 0,
-                self.use_gpu, self.use_fp16, reference_white())
+                self.use_gpu, self.use_fp16, reference_white(screen))
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -160,6 +167,7 @@ class Item:
     state: str = "waiting"                     # waiting / working / done / failed / cancelled
     message: str = ""
     outputs: List[str] = field(default_factory=list)
+    output_settings: Optional[dict] = None
 
     @property
     def name(self) -> str:
@@ -294,12 +302,14 @@ class Engines:
 def convert_item(item: Item, options: Options, engine, device,
                  progress: Optional[Callable[[str, int, int], None]] = None,
                  cancelled: Optional[Callable[[], bool]] = None,
-                 analysis: Optional[VideoAnalysis] = None) -> List[str]:
+                 analysis: Optional[VideoAnalysis] = None, screen: str = "", prepared=None,
+                 white_nits: Optional[float] = None) -> List[str]:
     """Convert one queued file. Returns the files written. Raises :class:`Cancelled` when
-    asked to stop (nothing is left behind), any other exception on failure."""
-    import torch
+    asked to stop (nothing is left behind), any other exception on failure.
 
-    from .engine.pipeline import export_image, render
+    ``screen``: the screen the window is on. The file is made for the white of that
+    screen, as its preview was (see :func:`reference_white`)."""
+    from .engine.pipeline import prepare_capture
     from .video.job import Cancelled, analyse_video, render_video
 
     base = output_base(item.path, item.kind, options)
@@ -307,29 +317,25 @@ def convert_item(item: Item, options: Options, engine, device,
         raise FileNotFoundError(f"the destination folder does not exist: {options.destination}")
 
     if item.kind == "video":
-        settings = options.video_settings()
+        settings = options.video_settings(screen, white_nits)
         if analysis is None or analysis.src != item.path or not analysis.matches(settings):
             analysis = analyse_video(item.path, settings, device, progress, cancelled, engine)
         report = render_video(analysis, base + ".mp4", settings, device, progress, cancelled, engine)
         return [report.dst]
 
-    from .io.jxr_info import check_hdr_capture, read_jxr_info
-
-    check_hdr_capture(read_jxr_info(item.path))            # an ordinary JXR picture is not scRGB
-    loader = engine.loader
-    loader.selected_pre_gamma, loader.selected_auto_exposure = options.pre_gamma, options.exposure
     if progress:
         progress("render", 0, 1)
-    linear, error, _ = loader.load_jxr(item.path)
-    if linear is None:
-        raise ValueError(f"Could not read this capture: {error}")
     if cancelled and cancelled():
         raise Cancelled()
-    with torch.inference_mode():
-        enhanced, _ = render(engine.tone_mapper, loader, engine.processor, linear, options.render_settings())
+    if prepared is None:
+        from .io.jxr import read_capture
+
+        linear, loader = read_capture(item.path, device)
+        prepared = prepare_capture(engine, linear, loader, options.render_settings(screen=screen, white_nits=white_nits),
+                                   options.pre_gamma, options.exposure, options.image_format)
     if cancelled and cancelled():
         raise Cancelled()
-    written = export_image(engine.processor, linear, enhanced, base, options.image_format, include_raw=True)
+    written = prepared.write(engine.processor, base)
     if progress:
         progress("render", 1, 1)
     return written

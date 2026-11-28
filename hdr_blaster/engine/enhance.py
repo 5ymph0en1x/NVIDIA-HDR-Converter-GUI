@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .params import measure as _measure
+from .renderings import srgb_shadow_weight
 
 
 class EdgeEnhancementBlock(nn.Module):
@@ -52,11 +53,17 @@ class EdgeEnhancementBlock(nn.Module):
             # result back to the input's range, which dims the WHOLE picture as the
             # strength rises: fine for a look, not for a rendering that promises levels.
             luminance = 0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3]
-            edge_x = F.conv2d(luminance, self.kernel_x, padding=1)
-            edge_y = F.conv2d(luminance, self.kernel_y, padding=1)
+            padded = F.pad(luminance, (1, 1, 1, 1), mode="replicate")
+            # Difference each opposing pair first: a flat field must give exactly
+            # zero before normalisation, including on the image border.
+            dx = padded[..., 2:] - padded[..., :-2]
+            dy = padded[..., 2:, :] - padded[..., :-2, :]
+            edge_x = 0.25 * (dx[..., :-2, :] + 2 * dx[..., 1:-1, :] + dx[..., 2:, :])
+            edge_y = 0.25 * (dy[..., :-2] + 2 * dy[..., 1:-1] + dy[..., 2:])
             magnitude = torch.sqrt(edge_x.pow(2) + edge_y.pow(2))
             mag_max = _measure(params, "edge.mag_max", lambda: magnitude.max())
-            gain = 1.0 + magnitude / (mag_max + 1e-8) * ((edge_strength / 100.0) * 0.2)
+            strength = magnitude / mag_max.clamp_min(torch.finfo(magnitude.dtype).tiny)
+            gain = 1.0 + srgb_shadow_weight(x) * strength * ((edge_strength / 100.0) * 0.2)
             return (x * gain).clamp(0.0, 1.0)
 
         # Normalize input for edge detection

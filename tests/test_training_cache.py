@@ -61,6 +61,16 @@ def test_origins_can_be_excluded(tmp_path):
     assert total == 10
 
 
+def test_frame_cache_keeps_signed_scene_coordinates(tmp_path):
+    writer = cache.CacheWriter(tmp_path)
+    rgb = torch.tensor([331.5, -24.9, -3.63], dtype=torch.float32).view(3, 1, 1)
+    writer.add(rgb.expand(3, cache.HEIGHT, cache.WIDTH), "red")
+    writer.close()
+    split = "val" if cache.is_held_out("red") else "train"
+    restored = cache.FrameCache(tmp_path, split)[0]["hdr"]
+    assert torch.equal(restored[:, 0, 0].float(), rgb.flatten().half().float())
+
+
 def test_wrong_frame_size_is_refused(tmp_path):
     writer = cache.CacheWriter(tmp_path / "c")
     with pytest.raises(ValueError, match="expected"):

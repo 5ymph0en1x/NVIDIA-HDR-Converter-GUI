@@ -47,16 +47,16 @@ def _cli_convert(argv) -> int:
     settings = RenderSettings(method=chosen,
                               color_strength=args.color, edge_strength=args.edge,
                               white_nits=args.white or _screen_white())
-    enhanced, _ = render(tm, loader, proc, lin, settings)
-    method = chosen or "auto-detect"
+    enhanced, used = render(tm, loader, proc, lin, settings)
+    method = used.method if chosen else f"auto-detect ({used.method})"
     if args.out:
         out_base = args.out
     else:
         from .session import Options, output_base
 
         out_base = output_base(args.input, "image", Options())    # INPUT_SDR, never over a file
-    export_image(proc, lin, enhanced, out_base, args.fmt, include_raw=False)
-    print(f"[selftest] OK  device={dev.type}  method={method}  -> {out_base}.jpg")
+    written = export_image(proc, lin, enhanced, out_base, args.fmt, include_raw=False)
+    print(f"[selftest] OK  device={dev.type}  method={method}  -> {', '.join(written)}")
     return 0
 
 

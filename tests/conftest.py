@@ -118,14 +118,14 @@ def linear_cache():
 
 
 @pytest.fixture
-def get_linear(legacy_engine, linear_cache, device, request):
-    """Function: capture path -> scene-linear tensor, as the original loader produces it."""
+def get_linear(engine, linear_cache, device, request):
+    """Function: capture path -> scene-linear tensor, including the original signed scRGB channels."""
     full = request.config.getoption("--full")
 
     def load(sample):
         key = (sample, full)
         if key not in linear_cache:
-            tensor, error, _ = legacy_engine.loader.load_jxr(str(sample))
+            tensor, error, _ = engine.loader.load_jxr(str(sample))
             assert tensor is not None, error
             if not full:
                 _, _, h, w = tensor.shape
@@ -164,6 +164,7 @@ def legacy_chain(engine, linear, method, color_strength=0.0, edge_strength=0.0,
                  use_enhancement=True):
     """The original conversion sequence, exactly as ``_convert_single_file`` runs it."""
     tm = engine.tone_mapper
+    linear = linear.clamp_min(0)  # The frozen loader supplied nonnegative coordinates.
     if method is None:
         method = tm.select_optimal_tonemap(tm.analyze_image_statistics(linear))
     tonemapped = tm.apply_tone_mapping(linear.clone(), method=method)

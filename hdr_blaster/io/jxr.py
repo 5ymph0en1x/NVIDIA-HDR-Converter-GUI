@@ -11,6 +11,18 @@ from ..engine.metadata import HDRMetadata
 from ..engine.tonemap import AdvancedToneMapper
 
 
+def read_capture(path, device):
+    """Read an unadjusted scRGB capture with metadata belonging to this file alone."""
+    from .jxr_info import check_hdr_capture, read_jxr_info
+
+    check_hdr_capture(read_jxr_info(path))
+    loader = OptimizedJXRLoader(device)
+    linear, error, _ = loader.load_jxr(str(path))
+    if linear is None:
+        raise ValueError(f"Could not read this capture: {error}")
+    return linear, loader
+
+
 class OptimizedJXRLoader:
     """
     Handles loading and processing of JXR images.
@@ -29,11 +41,7 @@ class OptimizedJXRLoader:
         """
         Safely applies gamma correction to the input image array.
         """
-        pos_mask = image > 0
-        result = np.zeros_like(image)
-        if np.any(pos_mask):
-            result[pos_mask] = np.power(image[pos_mask], gamma)
-        return result
+        return np.copysign(np.power(np.abs(image), gamma), image)
 
     def load_jxr(self, file_path: str):
         """
@@ -98,7 +106,6 @@ class OptimizedJXRLoader:
 
             # Convert to torch Tensor
             tensor = torch.from_numpy(image).float().permute(2, 0, 1).contiguous().unsqueeze(0)
-            tensor = torch.clamp(tensor, min=0.0)
             tensor = tensor.to(self.device, non_blocking=True)
 
             # Create tone mapper with metadata for later use

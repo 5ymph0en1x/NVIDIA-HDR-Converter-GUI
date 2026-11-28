@@ -1,6 +1,6 @@
 # NVIDIA HDR Converter GUI — HDR Blaster
 
-**Version 3.1.1**
+**Version 3.1.3**
 
 Convert NVIDIA HDR captures to SDR: JXR screenshots to JPEG or TIFF, and HDR10 recordings to
 H.264 video, in one window. Version 3 of *NVIDIA HDR Converter GUI* is a new application,
@@ -9,6 +9,83 @@ called HDR Blaster; `NHC.py` still starts it.
 <p align="center">
   <img width="1024" src="docs/screenshot.png">
 </p>
+
+## What's new in 3.1.3
+
+- **The picture on the right is the file.** Two faults added up. A capture opened in a
+  maximised window could be rendered for the size the window had while it loaded
+  (1170 × 658) and stretched to its place (2182 × 1227): grass and the outlines of wind
+  turbines lost their detail. And the panel showed the picture before dither and JPEG
+  compression: at the size of the file, it was up to 15 levels of 255 away from what was
+  written. The right side now shows the decoded export, fitted to the window once it has
+  its size. For JPEG it includes compression and dither; for TIFF it shows the 16-bit SDR
+  samples; **Both** previews the JPEG. **Convert** writes those very bytes. What it costs:
+  on a 2560 × 1440 capture a change of setting takes about 0.3 s to show (0.2 s for TIFF,
+  0.45 s for Both) where the render alone took 0.04 s.
+- Both formats carry an sRGB profile, and the same capture with the same settings gives
+  the same file, byte for byte, from one run to the next. **Show in folder** selects the
+  SDR result, including for TIFF-only exports.
+- **A video can be inspected as it will be written.** **SDR before H.264** is the live
+  view, for adjustments. **Preview encoded MP4** encodes the complete recording in a
+  temporary folder and shows its decoded frames; **Convert** then saves that same MP4 when
+  the source and the settings still match. The frames are decoded with exact rounding (the
+  library's default conversion showed every pixel a level darker than the file holds).
+- **Faithful and the three looks keep contrast inside the lights.** The roll-off of 3.1.2
+  brought a scene under white by a curve that arrives flat: a sun and the sky around it
+  both ended at white. From half a stop below white the upper tones now follow a shoulder
+  whose slope stays positive up to the scene's peak, which lands on white. On the
+  Cyberpunk sunrise, with SDR white at 480 nits, the solar disc is 9.6 % brighter than the
+  adjacent sky (1.8 % in 3.1.2; the source measures 22.4 %), and the wind turbines in the
+  glow can be told from it. The hue of a light does not move and a neon keeps its dark
+  channel, as before. What is given up: the lights make room for one another, so what the
+  source view shows as plain white is written around 240 of 255 on the sample captures
+  (252 in 3.1.2), and a tone at the screen's white itself 233 (240) on that sunrise. In
+  return a scene with a high peak keeps its mid-tones: under a white of 203 nits and a
+  peak of 4000, a tone at half of white is written 188, as the scene has it (175 in
+  3.1.2). A scene that fits under white is still returned as it came, and so are the
+  shadows of every scene. For a video the fused stage gives the same bits as the plain one.
+- **Perceptual** reserves one stop below white for bright structure. On the same sunrise
+  it retains 7.47 % luminance contrast between the solar disc and the adjacent sky; the
+  previous value was 0.87 % and the source measures 22.37 % (the same full-resolution
+  pixels, sharpening and AI colour at zero).
+- **Colours outside BT.709 are no longer cut on reading.** JXR and HDR10 decoding preserve
+  signed scRGB values. Channel-based operators fit out-of-gamut colours at constant linear
+  luminance before applying their curve; Perceptual fits them in ICtCp. On an HDR screen
+  the source view shows them as recorded.
+- Sharpening and AI colour protect the deep shadows of the anchored renderings, and a flat
+  area is sharpened by nothing, up to the border of the picture.
+- **The learned tone mapper has been taught again**, by the Punchy of this version, on
+  recordings read with their signed colours. The model of 3.1.2 had learned the earlier
+  roll-off: in the tones it renders it was 3.5 levels of 255 darker than today's Punchy on
+  the sample captures. It is now 1.2 levels from it on average, and each capture has
+  Punchy's exposure. Its deep shadows and its lights are bound to that look; the network
+  renders the tones in between, and the finished picture is 30.5 to 40.8 dB from
+  Punchy's. If its model cannot be loaded, the window says that Perceptual is used
+  instead.
+- Two operators are called by what they are: **Guided local contrast** (it was listed as
+  Mantiuk06; the command line and saved settings keep `mantiuk06`) and **ACES filmic
+  (Narkowicz)**. A flat peak rendered by Guided local contrast now reaches white.
+- MP4 exports signal the sRGB transfer they are encoded with (BT.709 primaries and matrix,
+  limited range, as before).
+
+## What's new in 3.1.2
+
+- **A light brighter than white is rendered as a light.** Faithful and the three looks
+  brought a light under white with one gain, read on its brightest channel: it kept its
+  whole colour and paid for it in luminance. The glow of a rising sun, a fifth of a
+  Cyberpunk 2077 capture, came out as a flat peach surface: 999 / 852 / 684 nits were
+  written 255 / 238 / 216 under a white of 480 nits, where the source view shows white.
+  Now the brightest and the weakest channel of a light each go through the curve, and the
+  middle one is placed between them so that the hue does not move. A glow whose three
+  channels pass white burns towards white; a neon, whose weakest channel is far under
+  white, keeps it as it is and stays a neon. On the sample captures the lights have the
+  saturation of the source view again (0.20 for its 0.18 on that sunrise; 0.42 before).
+  What is given up: inside a light far above white on its three channels, the detail that
+  lived in its colour is fainter, as it is in the source view. Nothing under the roll-off
+  moves, and a video costs 0.08 ms more a frame.
+- This concerns Faithful, Natural, Punchy and Golden, captures and videos alike. The
+  operators of the Advanced panel are as they were. The learned tone mapper was taught by
+  the Punchy of before and still renders its lights.
 
 ## What's new in 3.1.1
 
@@ -24,7 +101,14 @@ called HDR Blaster; `NHC.py` still starts it.
 - The *Queue* button, top left, shows and hides the panel and tells how many files wait.
   Up, Down and Delete walk the list; *Clear finished* takes the converted files out.
 - A capture being converted no longer claims "0 %".
-- Nothing changes in the converted files: they are those of 3.1.0, byte for byte.
+- **With two screens, the file is made for the screen the window is on, as its preview
+  is.** The preview asked that screen what SDR white stands for; the conversion was
+  answered by the first screen in HDR. With two HDR screens set to different "SDR content
+  brightness" (or one in HDR and one not), the file was not the picture previewed: a grey
+  of 40 nits shown at 102 of 255 was written at 82. The preview now also follows the
+  window to another screen, and a change of that setting while the program is open.
+- With a single screen in HDR nothing changes in the converted files: they are those of
+  3.1.0.
 - 3.1.0 was not published on its own: what it brought comes with this version, and is
   told below.
 
@@ -120,14 +204,17 @@ called HDR Blaster; `NHC.py` still starts it.
 - **~2.4 MB pretrained weights**, included in `models/3dlut/` (downloaded on first launch if missing)
 
 ### Renderings
-A game's HDR picture is finished work, so every rendering keeps what the game decided and
-only handles what is brighter than SDR white. All of them obey the same rules: dark tones
+A game's HDR picture is finished work. All the renderings keep its shadows while making
+room for the highlights within SDR. The same rules apply: dark tones
 are the scene's own, mid-grey stays mid-grey, the scene's peak lands on white. They differ
 above the shadows.
 
-- **Faithful** ⭐ — the default: the scene at its own luminance; only what exceeds your screen's
-  white is rolled off (ITU-R BT.2390), hues kept.
-- **Natural / Punchy / Golden** — Faithful, graded: softer with fading highlights; more
+- **Faithful** ⭐ keeps the scene's exposure through half a stop below SDR white. For scenes that
+  exceed white, a smooth transition leads into a constant slope in log luminance for
+  neutral highlights. This leaves room to distinguish the solar disc from the warm sky
+  around it. The RGB channels keep their order and the middle channel keeps its relative
+  position. Scenes that fit the display pass through the tone mapper unchanged.
+- **Natural / Punchy / Golden** use the same positive-slope shoulder after three grades: softer with fading highlights; more
   contrast and colour; punchy in a warm light.
 - The classical operators, each with the trait it is known for. (Held to the same shadows,
   mid-grey and peak, their published curves are the same curve to within a level or two;
@@ -135,16 +222,18 @@ above the shadows.
   - **Reinhard** — soft: nothing touched up to mid-grey, a gentle shoulder from there; bright
     colours go pastel.
   - **Hable** — film: more contrast in the mid-tones, muted colours, lights that fade.
-  - **ACES** — vivid: strong contrast, rich mid-tones, lights that burn to white.
+  - **ACES filmic (Narkowicz)** uses the fitted filmic curve with strong contrast, rich mid-tones, lights that burn to white.
   - **Drago03** — flat: the whole range above the shadows compressed evenly, colours kept.
-  - **Perceptual** — luminous: the BT.2390 roll-off in ICtCp. A coloured light keeps its hue
-    and its brightness; its colour yields (Faithful keeps the colour and lets it darken).
-  - **Mantiuk06** — local: a soft roll-off of the large shapes, their local contrast
-    reinforced (grain is left alone).
+  - **Perceptual** reserves one stop below white for bright structure. It compresses ICtCp
+    intensity and reduces chroma along a constant-hue ray until the colour fits SDR.
+  - **Guided local contrast** uses two guided filters to reinforce local relief and retain fine
+    detail. The command-line and saved-setting identifier remains `mantiuk06`.
 - **Adaptive** — two of the operators, chosen from the picture and blended by brightness.
 - **Auto-select** — one operator chosen from the picture's statistics (dynamic range,
   highlights, local contrast, saturation).
-- **Neural (AI)** — HDRNet-style learned operator, taught by Punchy. See
+- **Neural (AI)** uses its learned HDRNet-style grid in the mid-tones. The current Punchy look
+  anchors the shipped model in deep shadows and highlights. An unavailable model is reported
+  as a fallback to Perceptual. See
   [`training/README.md`](training/README.md) to retrain or fine-tune.
 
 ### User interface
@@ -155,7 +244,7 @@ above the shadows.
 - **Queue panel** on the left for several captures and recordings: a picture of each file,
   what it is (capture or video) and where its conversion stands; progress and cancel on the
   one button
-- **Exact video preview** once the recording has been analysed in the background
+- **Video preview** with stabilized tone mapping after background analysis and exact MP4 inspection on demand
 - **Frame rate of a video**: Original, 120, 60 or 30 frames per second, in Advanced, with
   motion blur made of the dropped frames if you switch it on
 - **Videos are neither sharpened nor AI-coloured unless asked**: nothing is then measured on
@@ -220,8 +309,7 @@ python NHC.py            # or: python -m hdr_blaster
 1. Drop a JXR capture, an HDR10 recording, several files or a folder on the window.
 2. Look at the result: the unconverted picture is on the left of the divider, the
    converted one on the right. Drag the divider. For a video, the timeline chooses
-   the frame; once the video has been analysed in the background the preview is
-   exactly the frame the converted file will contain.
+   the frame. Select **Preview encoded MP4** to inspect the decoded output.
 3. Pick a look if you wish (Faithful, Natural, Punchy, Golden) and press **Convert**.
    The classical operators, *Auto-select* and the neural operator are in Advanced, under Operator.
 
@@ -308,7 +396,7 @@ that reads back what the HDR surface presents.
 
 ### Output
 - **JPEG** (4:4:4, dithered) and/or **TIFF** for captures
-- **MP4** (H.264, BT.709) for recordings, never heavier than the source
+- **MP4** (H.264, BT.709 primaries and matrix, sRGB transfer, limited range) for recordings, never heavier than the source
 
 ## Logging
 - The window writes its log to `%LOCALAPPDATA%\HDR Blaster\hdr_blaster.log`

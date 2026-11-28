@@ -3,8 +3,8 @@
 NVIDIA's HDR screenshots (and Windows' own) are JPEG XR files whose pixel format is a
 floating-point RGBA one. That format IS the colour metadata: it means scRGB, i.e. linear
 light, BT.709 primaries, 1.0 = 80 nits, values below 0 and above 1 allowed. Such files
-carry no other luminance information (no mastering level, no ICC profile); none is
-needed, since scRGB is absolute.
+can also carry an XMP packet, for example the recorder's name. scRGB already
+defines the absolute luminance scale used here.
 
 A JXR file can also hold an ordinary 8-bit picture. Treating its integers as scRGB
 would give nonsense, so the pixel format is checked before a capture is accepted.

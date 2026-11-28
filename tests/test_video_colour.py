@@ -39,10 +39,22 @@ def test_limited_and_full_range_decode_to_the_same_light(device, nits):
     assert torch.allclose(full, torch.full_like(full, expected), rtol=0.03)
 
 
-def test_pure_bt2020_red_is_clipped_to_the_bt709_gamut(device):
+def test_pure_bt2020_red_keeps_its_signed_scrgb_coordinates(device):
     out = to_engine(ref.flat_hdr10([200.0, 0.0, 0.0]), device)[0, :, 0, 0].tolist()
     assert out[0] == pytest.approx(200.0 * 1.660491 / ENGINE_UNIT_NITS, rel=0.03)
-    assert out[1] == 0.0 and out[2] == 0.0
+    assert out[1:] == pytest.approx([-0.124550 * 200 / ENGINE_UNIT_NITS,
+                                         -0.018151 * 200 / ENGINE_UNIT_NITS], rel=0.04)
+
+
+def test_user_gamma_preserves_the_sign_of_wide_gamut_components(device):
+    from hdr_blaster.engine.colour import adjust_scene
+    planes = ref.flat_hdr10([200., 0., 0.])
+    y, u, v = (torch.from_numpy(p).to(device) for p in planes)
+    fmt = FrameFormat(width=8, height=8)
+    base = yuv_to_engine(y, u, v, fmt)
+    adjusted = yuv_to_engine(y, u, v, fmt, pre_gamma=2.0, exposure=1.5)
+    assert torch.equal(base.sign(), adjusted.sign())
+    assert torch.allclose(adjusted, adjust_scene(base, 2.0, 1.5), atol=1e-7)
 
 
 def test_black_is_exactly_zero(device):

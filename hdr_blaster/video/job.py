@@ -118,6 +118,15 @@ def output_size(info: VideoInfo, out_height: Optional[int]) -> tuple:
     return width, height
 
 
+def resize_for_output(picture, size):
+    """Apply the recording's export dimensions before encoding or fitting it to the viewer."""
+    width, height = size
+    if picture.shape[-2:] == (height, width):
+        return picture
+    return F.interpolate(picture, size=(height, width), mode="bicubic",
+                         align_corners=False, antialias=True).clamp(0.0, 1.0)
+
+
 def frames_to_keep(times: Sequence[float], frame_rate: Optional[float], source_rate=None) -> List[bool]:
     """Which frames a conversion at ``frame_rate`` writes, one answer per frame.
 
@@ -335,6 +344,8 @@ def analyse_video(src, settings: VideoSettings, device,
         if method is None:
             method = _decoding_again(lambda: _choose_method(src, info, settings, engine, device,
                                                             progress, cancelled, reference))
+        else:
+            method = engine.tone_mapper.available_method(method)
         render_settings = replace(settings.render, method=method)
         chain = _chain(device, reference)
 
@@ -426,9 +437,7 @@ def render_video(analysis: VideoAnalysis, dst, settings: VideoSettings, device,
                     srgb, _ = render(engine.tone_mapper, engine.loader, engine.processor, linear,
                                      render_settings, params=_on_device(stable[index], device),
                                      release_cache=False, fast=chain)
-                    if size != (info.width, info.height):
-                        srgb = F.interpolate(srgb, size=(size[1], size[0]), mode="bicubic",
-                                             align_corners=False, antialias=True).clamp(0.0, 1.0)
+                    srgb = resize_for_output(srgb, size)
                     picture = writer.frame(pts, *to_planes(srgb))
                     if encoder is None:
                         writer.encode(picture)

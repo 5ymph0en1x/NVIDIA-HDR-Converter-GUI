@@ -163,7 +163,7 @@ def test_a_capture_is_converted_next_to_itself(tmp_path, engines):
     seen = []
     written = convert_item(Item(str(src), "image"), options, engine, device,
                            progress=lambda *a: seen.append(a))
-    assert [os.path.basename(p) for p in written] == ["shot_SDR.jpg", "shot_SDR_raw.tiff", "shot_SDR_tonemapped.tiff"]
+    assert [os.path.basename(p) for p in written] == ["shot_SDR.jpg", "shot_SDR_tonemapped.tiff", "shot_SDR_raw.tiff"]
     assert all(os.path.getsize(p) > 10_000 for p in written)
     assert seen[0] == ("render", 0, 1) and seen[-1] == ("render", 1, 1)
     again = convert_item(Item(str(src), "image"), Options(), engine, device)
@@ -270,6 +270,8 @@ def test_operators_have_names_for_people():
     assert session.display_name("punchy") == "Punchy" and session.display_name("hable") == "Hable"
     assert session.display_name("neural") == "Neural (AI)" and session.display_name(None) == "Auto"
     assert session.display_name("faithful") == "Faithful"
+    assert session.display_name("aces") == "ACES filmic (Narkowicz)"
+    assert session.display_name("mantiuk06") == "Guided local contrast"
 
 
 # ------------------------------------------------------------ the faithful look
@@ -290,10 +292,10 @@ def test_a_settings_file_from_before_falls_back_to_faithful():
 
 
 def test_the_screens_white_reaches_the_render_and_the_picture_key(monkeypatch):
-    monkeypatch.setattr(session, "sdr_white_nits", lambda: (300.0, "display"))
+    monkeypatch.setattr(session, "sdr_white_nits", lambda screen="": (300.0, "display"))
     options = Options()
     assert options.render_settings().white_nits == 300.0
     assert options.video_settings().render.white_nits == 300.0
     before = options.picture_key()
-    monkeypatch.setattr(session, "sdr_white_nits", lambda: (480.0, "display"))
+    monkeypatch.setattr(session, "sdr_white_nits", lambda screen="": (480.0, "display"))
     assert options.picture_key() != before, "another white is another picture"

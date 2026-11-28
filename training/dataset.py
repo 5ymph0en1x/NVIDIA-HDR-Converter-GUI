@@ -61,9 +61,8 @@ BT2020_TO_BT709 = np.array([
 
 
 def bt2020_to_bt709_np(rgb: np.ndarray) -> np.ndarray:
-    """Linear BT.2020 -> linear BT.709. Out-of-gamut (negative) values are clipped,
-    as the application's JXR loader does."""
-    return np.clip(rgb @ BT2020_TO_BT709.T, 0.0, None).astype(np.float32)
+    """Linear BT.2020 to signed scRGB primaries, with luminance in nits."""
+    return (rgb @ BT2020_TO_BT709.T).astype(np.float32)
 
 
 def read_png(path) -> np.ndarray:
@@ -81,15 +80,17 @@ def load_jxr_nits(path) -> np.ndarray:
     """(H, W, 3) float32, linear BT.709 in nits, from an NVIDIA scRGB JXR capture.
 
     Same decode as the application's loader (RGBA float, alpha dropped,
-    negatives clipped), expressed in nits."""
+    signed components retained), expressed in nits."""
     if not _HAS_IMAGECODECS:
         raise ImportError("imagecodecs is required to read JXR captures")
     arr = imagecodecs.jpegxr_decode(Path(path).read_bytes())
-    if arr.dtype != np.float32:
+    if np.issubdtype(arr.dtype, np.integer):
         arr = arr.astype(np.float32) / np.iinfo(arr.dtype).max
+    else:
+        arr = arr.astype(np.float32, copy=False)
     if arr.ndim == 3 and arr.shape[2] == 4:
         arr = arr[..., :3]
-    return np.ascontiguousarray(arr.clip(min=0.0) * SCRGB_WHITE_NITS, dtype=np.float32)
+    return np.ascontiguousarray(arr * SCRGB_WHITE_NITS, dtype=np.float32)
 
 
 def _resize_at_least(arr: np.ndarray, ps: int) -> np.ndarray:
@@ -97,7 +98,7 @@ def _resize_at_least(arr: np.ndarray, ps: int) -> np.ndarray:
     h, w = arr.shape[:2]
     t = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1).unsqueeze(0)
     t = F.interpolate(t, size=(max(h, ps), max(w, ps)), mode="bicubic", align_corners=False)
-    return t.squeeze(0).permute(1, 2, 0).clamp(min=0.0).numpy()
+    return t.squeeze(0).permute(1, 2, 0).numpy()
 
 
 # ---------- color helpers ----------------------------------------------------

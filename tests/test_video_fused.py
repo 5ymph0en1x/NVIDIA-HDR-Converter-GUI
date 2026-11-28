@@ -156,10 +156,11 @@ def test_what_the_fused_stages_were_not_made_for_goes_the_plain_way(card, video_
         y, u, v, fmt = planes(144, 256, card)             # too few pixels: the colour matrix is computed otherwise
         light = colour.yuv_to_scrgb(y, u, v, fmt)
         assert fused._identical(chain.yuv_to_scrgb(y, u, v, fmt), light)
-        tiny = torch.rand(1, 3, 32, 64, device=card)      # the plain rendering refuses it: it is left to
-        with pytest.raises(RuntimeError):
-            chain.render(lambda scene, peak, white: plain_picture(video_engine, scene, 1.0, card), tiny,
-                         torch.tensor(1.0, device=card), WHITE)
+        tiny = torch.rand(1, 3, 32, 64, device=card)
+        def plain(scene, peak, white):
+            return plain_picture(video_engine, scene, float(peak), card, white)
+        fallback = chain.render(plain, tiny, torch.tensor(1.0, device=card), WHITE)
+        assert torch.equal(fallback, plain(tiny, 1.0, WHITE))
         odd = torch.rand(1, 3, 35, 64, device=card)
         with pytest.raises(ValueError):
             chain.srgb_to_yuv420(odd)

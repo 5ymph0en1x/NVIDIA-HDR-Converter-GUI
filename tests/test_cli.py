@@ -17,17 +17,17 @@ def run(*args, cwd=None):
                           capture_output=True, text=True, timeout=600)
 
 
-def test_the_version_is_3_1_1_everywhere():
+def test_the_version_is_3_1_3_everywhere():
     import hdr_blaster
 
-    assert hdr_blaster.__version__ == "3.1.1"
+    assert hdr_blaster.__version__ == "3.1.3"
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project["version"] == hdr_blaster.__version__
     done = run("--version")
-    assert done.returncode == 0 and done.stdout.strip().endswith("3.1.1"), done.stdout + done.stderr
+    assert done.returncode == 0 and done.stdout.strip().endswith("3.1.3"), done.stdout + done.stderr
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "**Version 3.1.1**" in readme and "## What's new in 3.1.1" in readme
-    assert all(f"## What's new in {before}" in readme for before in ("3.1.0", "3.0.3", "3.0.2")), \
+    assert "**Version 3.1.3**" in readme and "## What's new in 3.1.3" in readme
+    assert all(f"## What's new in {before}" in readme for before in ("3.1.2", "3.1.1", "3.1.0", "3.0.3", "3.0.2")), \
         "what the versions before brought is still told (3.1.0 was never published on its own)"
     assert f'version = "{hdr_blaster.__version__}"' in (ROOT / "uv.lock").read_text(encoding="utf-8")
 

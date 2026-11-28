@@ -29,15 +29,16 @@ lay on it). So each operator is given, above the shadows, the trait it is known 
               colours kept, lights that fade towards white at the very top;
 * ACES        vivid: its own strong contrast, rich mid-tones, lights that burn to white;
 * Drago03     flat: its logarithm compresses the whole range evenly, colours kept;
-* Perceptual  luminous: the roll-off of BT.2390 in ICtCp. A coloured light keeps its hue
-              and its brightness; its colour yields (on its brightest channel, as
-              Faithful does it, it keeps its colour and turns dark);
-* Mantiuk06   local: a soft roll-off of the large shapes, their detail reinforced.
+* Perceptual  luminous: a positive log slope on ICtCp intensity. A coloured light keeps its hue
+              and its brightness; its colour yields (Faithful keeps the weakest
+              channel of a light as the scene has it: a neon stays a neon, and dark);
+* Guided local contrast: a soft roll-off of the large shapes, their detail reinforced.
 
 Everything here works on ``x``: linear RGB relative to SDR white (1.0 = white, 0.18 =
 mid-grey), and on ``peak``: the brightest channel value of the scene on that scale.
 """
 import math
+from functools import lru_cache
 from typing import Callable, Optional
 
 import torch
@@ -93,13 +94,101 @@ def faithful_curve(nits: torch.Tensor, white_nits, peak_nits) -> torch.Tensor:
     return torch.where(position <= knee, nits, torch.minimum(pq_decode(shoulder * top), white))
 
 
+def faithful_stops(peak, device, width: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
+    """Log2 headroom above white, and the fraction of highlight contrast the display can hold."""
+    peak = torch.as_tensor(peak, dtype=torch.float32, device=device)
+    headroom = torch.log2(peak.clamp_min(1.0))
+    # The transition uses half the reserved interval. Its average slope is
+    # halfway between unity and the final slope.
+    room = 0.75 * width
+    return headroom, room / (room + headroom)
+
+
+def log_shoulder(level: torch.Tensor, peak, width: float) -> torch.Tensor:
+    """Compress the upper width stops and HDR headroom, joining at unit log slope.
+
+    The slope falls linearly through the first half of the reserved interval,
+    then stays positive up to the measured peak. Integrating gives the roll-off.
+    """
+    headroom, slope = faithful_stops(peak, level.device, width)
+    stops = (torch.log2(level.clamp_min(1e-9)) + width).clamp_min(0.0)
+    stops = torch.minimum(stops, width + headroom)
+    bend = stops.clamp_max(0.5 * width)
+    log_out = slope * stops + (1.0 - slope) * (bend * (1.0 - bend / width))
+    compressed = torch.exp2(log_out - width).clamp_max(1.0)
+    return torch.where((stops == 0.0) | ((headroom == 0) & (level <= 1)), level, compressed)
+
+
+def faithful_highlights(x: torch.Tensor, peak: torch.Tensor) -> torch.Tensor:
+    """Faithful in linear RGB relative to SDR white. Half a stop below white, a
+    quarter-stop transition joins the unchanged tones to a power law. Its positive
+    log slope keeps two bright clouds distinct up to the peak, which lands on white.
+
+    At each pixel map the weakest channel between half-white and the mapped maximum.
+    Its slope starts at one, falls linearly, then stays positive. Integrating those
+    slopes gives the expression below. The middle channel keeps its position between
+    the other two. This preserves the RGB hue of a glow and leaves a neon's dark
+    channel alone. Peak is the only scene statistic, including on video.
+    """
+    high, low = x.amax(dim=1, keepdim=True), x.amin(dim=1, keepdim=True)
+    mapped_high = log_shoulder(high, peak, 0.5)
+
+    room = (mapped_high - 0.5).clamp_min(0.0)
+    excess = (low - 0.5).clamp_min(0.0)
+    # The transition occupies a quarter of the available room. Choose the final slope so
+    # the integral reaches mapped_high exactly when low reaches high.
+    end_slope = (0.875 * room / (high - 0.5 - 0.125 * room).clamp_min(1e-9)).clamp(0.0, 1.0)
+    toe = torch.minimum(excess, 0.25 * room)
+    transition = toe * (1.0 - 2.0 * toe / room.clamp_min(1e-9))
+    mapped_low = 0.5 + end_slope * excess + (1.0 - end_slope) * transition
+    mapped_low = torch.where(low <= 0.5, low, torch.minimum(mapped_low, mapped_high))
+    position = (x - low) / (high - low).clamp_min(1e-9)
+    result = mapped_low + position * (mapped_high - mapped_low)
+    unchanged = (high <= 2.0 ** -0.5) | ((peak <= 1.0) & (high <= 1.0))
+    return torch.where(unchanged, x, result).clamp(0.0, 1.0)
+
+
+def roll_off(x: torch.Tensor, white_nits, peak) -> torch.Tensor:
+    """The 3.1.2 shoulder formerly used for the three graded looks. ``x`` is
+    relative to white and has no negative; ``peak`` is the scene's, on the same scale.
+
+    The brightest and the weakest channel of each pixel go through :func:`faithful_curve`,
+    each for itself; the middle one is placed between them where it stood between them in
+    the scene, so the hue does not move. What this gives:
+
+    * a pixel whose brightest channel is under the knee is handed back as it came, to the
+      last bit: nothing is computed for it;
+    * the brightest channel of the scene's peak lands on white, and no channel passes it;
+    * a light keeps the colour its weakest channel gives it. Under the knee that channel
+      is the scene's own: a neon stays a neon, as the source view shows it. Above white it
+      is rolled off with the brightest one, which it nearly joins: a glow brighter than
+      white on its three channels burns towards white, as it does for a camera and for the eye.
+
+    Until 3.1.1 the curve was read on the brightest channel alone and applied as one gain
+    to the three. A light kept its whole colour and paid for it in luminance: the glow of a
+    rising sun (999 / 852 / 684 nits under a white of 480) was shown as a flat peach
+    surface, 255 / 238 / 216, over a fifth of the picture."""
+    white = float(white_nits)
+    peak_nits = torch.as_tensor(peak, dtype=torch.float32, device=x.device) * white
+    top, low = x.amax(dim=1, keepdim=True), x.amin(dim=1, keepdim=True)
+    top_nits, low_nits = top * white, low * white
+    top_mapped = faithful_curve(top_nits, white, peak_nits)
+    low_mapped = faithful_curve(low_nits, white, peak_nits)
+    top_out, low_out = top_mapped / white, low_mapped / white
+    span = top - low
+    place = torch.where(span > 1e-9, (x - low) / span.clamp(min=1e-9), torch.zeros_like(x))
+    rolled = low_out + place * (top_out - low_out)
+    return torch.where(top_mapped == top_nits, x, rolled).clamp(0.0, 1.0)
+
+
 def luminance(x: torch.Tensor) -> torch.Tensor:
     return 0.2126 * x[:, 0:1] + 0.7152 * x[:, 1:2] + 0.0722 * x[:, 2:3]
 
 
 def brightest(x: torch.Tensor) -> torch.Tensor:
     """The brightest channel of each pixel, (B, 1, H, W). Curves are driven by it rather
-    than by luminance: a saturated light then stays within white and keeps its hue."""
+    than by luminance: a saturated light then stays within white and keeps its hue.
+    Faithful and the graded looks also use the weakest channel to render a coloured light."""
     return x.amax(dim=1, keepdim=True)
 
 
@@ -121,6 +210,13 @@ def shadow_weight(level: torch.Tensor) -> torch.Tensor:
     stops = torch.log2(level.clamp(min=1e-9) / GREY)
     t = ((stops + SHADOW_STOPS) / SHADOW_STOPS).clamp(0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
+
+
+def srgb_shadow_weight(srgb: torch.Tensor) -> torch.Tensor:
+    """The shadow protection used by tone mapping, on the finished sRGB picture."""
+    from .colour import _srgb_decode
+
+    return shadow_weight(_srgb_decode(brightest(srgb).float())).to(srgb.dtype)
 
 
 # ---------------------------------------------------------------- the curves
@@ -229,7 +325,7 @@ def _edge_aware_base(log_level: torch.Tensor, radius: int, epsilon: float = 0.05
     """A smoothed picture that keeps its strong edges (guided filter, guided by itself):
     a plain blur would leave a dark halo around every light."""
     mean = _box(log_level, radius)
-    variance = _box(log_level * log_level, radius) - mean * mean
+    variance = (_box(log_level * log_level, radius) - mean * mean).clamp_min(0.0)
     a = variance / (variance + epsilon)
     b = mean - a * mean
     return _box(a, radius) * log_level + _box(b, radius)
@@ -259,8 +355,11 @@ def local_contrast(x: torch.Tensor, peak: torch.Tensor, boost: float = LOCAL_BOO
     rolled = from_knee(reinhard_shoulder, shapes, peak)
     relief = (log_relief - log_shapes) * (1.0 + boost * shadow_weight(shapes))
     out = rolled * torch.exp(relief + (log_top - log_relief))
-    knee = 0.85
-    out = torch.where(out > knee, knee + (1.0 - knee) * torch.tanh((out - knee) / (1.0 - knee)), out)
+    # Limit only positive relief to the headroom above the mapped base. A flat
+    # peak now reaches white, while detail approaching the ceiling rolls off.
+    room = (1.0 - rolled).clamp_min(0.0)
+    lift = (out - rolled).clamp_min(0.0)
+    out = torch.minimum(out, rolled) + room * torch.tanh(lift / room.clamp_min(1e-9))
     gain = torch.where(top > 1e-9, out / top.clamp(min=1e-9), torch.ones_like(top))
     # in the shadows the scene itself, as everywhere else
     weight = shadow_weight(top)
@@ -276,11 +375,12 @@ _BT2020_TO_LMS = ((1688.0, 2146.0, 262.0), (683.0, 2951.0, 462.0), (99.0, 309.0,
 _LMS_TO_ICTCP = ((2048.0, 2048.0, 0.0), (6610.0, -13613.0, 7003.0), (17933.0, -17390.0, -543.0))
 
 
-def _ictcp_matrices(like: torch.Tensor):
+@lru_cache(maxsize=16)
+def _ictcp_matrices(device: torch.device, dtype: torch.dtype):
     to_lms = (torch.tensor(_BT2020_TO_LMS, dtype=torch.float64) / 4096.0) @ torch.tensor(_BT709_TO_BT2020, dtype=torch.float64)
     to_ictcp = torch.tensor(_LMS_TO_ICTCP, dtype=torch.float64) / 4096.0
-    return [m.to(device=like.device, dtype=like.dtype)
-            for m in (to_lms, to_ictcp, torch.linalg.inv(to_ictcp), torch.linalg.inv(to_lms))]
+    return tuple(m.to(device=device, dtype=dtype)
+                 for m in (to_lms, to_ictcp, torch.linalg.inv(to_ictcp), torch.linalg.inv(to_lms)))
 
 
 def _mix(matrix: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
@@ -290,41 +390,64 @@ def _mix(matrix: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
 
 def to_ictcp(nits: torch.Tensor) -> torch.Tensor:
     """Linear BT.709 RGB in nits, (B, 3, H, W) -> ICtCp."""
-    to_lms, to_ictcp_, _, _ = _ictcp_matrices(nits)
+    to_lms, to_ictcp_, _, _ = _ictcp_matrices(nits.device, nits.dtype)
     return _mix(to_ictcp_, pq_encode(_mix(to_lms, nits).clamp(min=0.0)))
 
 
 def from_ictcp(ictcp: torch.Tensor) -> torch.Tensor:
     """ICtCp -> linear BT.709 RGB in nits. A colour outside BT.709 comes back with a negative channel."""
-    _, _, to_pq_lms, to_rgb = _ictcp_matrices(ictcp)
+    _, _, to_pq_lms, to_rgb = _ictcp_matrices(ictcp.device, ictcp.dtype)
     return _mix(to_rgb, pq_decode(_mix(to_pq_lms, ictcp).clamp(0.0, 1.0)))
 
 
-def perceptual(x: torch.Tensor, peak: torch.Tensor, white_nits: float) -> torch.Tensor:
-    """The roll-off of BT.2390 as the recommendation describes it, in ICtCp: the curve is
-    applied to the intensity, and the chroma is scaled by the same ratio. Hue does not
-    move and a coloured light stays as bright as it looked. What then falls outside the
-    SDR range is brought back along a straight line towards the neutral of the same
-    intensity: the colour yields, not the brightness.
+def _fit_ictcp(ictcp: torch.Tensor, white: float) -> torch.Tensor:
+    """Reduce chroma along a ray of constant I and hue until its RGB fits the display."""
+    _, _, to_lms_code, to_rgb = _ictcp_matrices(ictcp.device, ictcp.dtype)
+    lms_code = _mix(to_lms_code, ictcp)
+    rgb = _mix(to_rgb, pq_decode(lms_code)) / white
+    outside = ((rgb < 0) | (rgb > 1)).any(dim=1)
+    # Work only on the affected pixels, in bounded chunks even for a full 4K sky.
+    indices = outside.flatten().nonzero().flatten()
+    if indices.numel() == 0:
+        return rgb
+    result = rgb.permute(0, 2, 3, 1).contiguous().view(-1, 3)
+    intensity = ictcp[:, 0].reshape(-1, 1)
+    codes = lms_code.permute(0, 2, 3, 1).reshape(-1, 3)
+    for ix in indices.split(262144):
+        neutral = intensity[ix]
+        offset = codes[ix] - neutral
+        lo, hi = torch.zeros_like(neutral), torch.ones_like(neutral)
+        for _ in range(16):
+            mid = (lo + hi) * 0.5
+            # Inverse PQ and inverse LMS are nonlinear together; test actual RGB.
+            trial = pq_decode(neutral + mid * offset) @ to_rgb.T
+            fits = ((trial >= 0.0) & (trial <= white)).all(dim=1, keepdim=True)
+            lo, hi = torch.where(fits, mid, lo), torch.where(fits, hi, mid)
+        result[ix] = (pq_decode(neutral + lo * offset) @ to_rgb.T) / white
+    b, _, h, w = ictcp.shape
+    return result.view(b, h, w, 3).permute(0, 3, 1, 2).clamp(0.0, 1.0)
 
-    What is below the knee of the curve and already within white is returned as it came."""
+
+def perceptual(x: torch.Tensor, peak: torch.Tensor, white_nits: float) -> torch.Tensor:
+    """Roll off ICtCp intensity in log light and fit chroma at that intensity.
+
+    Reserve one stop below white for bright structure. In-gamut colours below
+    the shoulder pass through exactly, including all representable shadows.
+    """
     white = float(white_nits)
-    nits = x.float().clamp(min=0.0) * white
-    ictcp = to_ictcp(nits)
+    ictcp = to_ictcp(x * white)
     intensity = ictcp[:, 0:1]
-    scene = pq_decode(intensity)                                    # the pixel's intensity, in nits
-    mapped_nits = faithful_curve(scene, white, torch.as_tensor(peak, dtype=scene.dtype, device=scene.device) * white)
-    mapped = pq_encode(mapped_nits)
-    ratio = torch.where(intensity > 1e-6, (mapped / intensity.clamp(min=1e-6)).clamp(max=1.0),
-                        torch.ones_like(intensity))
-    y = from_ictcp(torch.cat([mapped, ictcp[:, 1:] * ratio], dim=1)) / white
-    neutral = (mapped_nits / white).clamp(0.0, 1.0)
-    over = torch.where(y > 1.0, (1.0 - neutral) / (y - neutral).clamp(min=1e-9), torch.ones_like(y))
-    under = torch.where(y < 0.0, neutral / (neutral - y).clamp(min=1e-9), torch.ones_like(y))
-    keep = torch.minimum(over, under).amin(dim=1, keepdim=True).clamp(0.0, 1.0)
-    y = neutral + keep * (y - neutral)
-    untouched = (mapped_nits >= scene * (1.0 - 1e-6)) & (brightest(x) <= 1.0)
-    return torch.where(untouched, x.float().clamp(min=0.0), y).clamp(0.0, 1.0)
+    level = pq_decode(intensity) / white
+    target = log_shoulder(level, peak, 1.0)
+    mapped = torch.where(target == level, intensity, pq_encode(target * white))
+    ratio = (mapped / intensity.clamp_min(1e-9)).clamp_max(1.0)
+    rendered = _fit_ictcp(torch.cat((mapped, ictcp[:, 1:] * ratio), dim=1), white)
+    high, low = brightest(x), x.amin(dim=1, keepdim=True)
+    untouched = (target == level) & (low >= 0) & (high <= 1)
+    rendered = torch.where(untouched, x, rendered)
+    # A neutral's intensity in nits is its own channel value. Evaluating that
+    # axis directly avoids PQ round-trip noise on fine grey ramps.
+    return torch.where(high == low, log_shoulder(high.clamp_min(0), peak, 1.0), rendered)
 
 
 # ------------------------------------------------------------------ film (Hable)

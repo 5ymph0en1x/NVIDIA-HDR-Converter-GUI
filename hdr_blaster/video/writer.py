@@ -58,6 +58,7 @@ QUALITY = {
 
 # H.273 code points of the output
 _BT709 = 1
+_SRGB_TRANSFER = 13  # H.273 / IEC 61966-2-1
 _RANGE_LIMITED = 1
 
 # Pictures per segment: the distance between two key frames of the encoders used here.
@@ -285,7 +286,8 @@ class VideoWriter:
             cc.time_base = info.time_base
             self._video.time_base = info.time_base
             cc.color_range = _RANGE_LIMITED
-            cc.colorspace = cc.color_trc = cc.color_primaries = _BT709
+            cc.colorspace = cc.color_primaries = _BT709
+            cc.color_trc = _SRGB_TRANSFER
             # How the picture is to be shown travels with it: a phone video recorded
             # upright must not come out sideways, nor anamorphic pixels squashed.
             if info.sample_aspect_ratio and info.sample_aspect_ratio != 1 and size is None:

@@ -6,6 +6,8 @@ around it is unchanged and must stay so: reading a capture, the author's colour 
 (the image-adaptive 3D LUTs behind the "AI colour" slider), the original sharpening, and
 the files written.
 """
+import imagecodecs
+import numpy as np
 import pytest
 import torch
 
@@ -18,7 +20,10 @@ def test_loader_matches_legacy(sample, legacy_engine, engine):
     actual, error, actual_meta = engine.loader.load_jxr(str(sample))
     assert actual is not None, error
     assert actual_meta == expected_meta
-    assert_identical(actual, expected, "loaded linear tensor")
+    assert_identical(actual.clamp_min(0), expected, "legacy nonnegative channels")
+    raw = imagecodecs.jpegxr_decode(sample.read_bytes())[..., :3].astype(np.float32)
+    signed = torch.from_numpy(raw * 0.1).permute(2, 0, 1).unsqueeze(0).to(actual.device)
+    assert_identical(actual, signed, "signed scRGB capture in engine units")
 
 
 @pytest.fixture
@@ -48,7 +53,11 @@ def test_saved_jpeg_matches_legacy(legacy_engine, engine, picture, tmp_path):
     legacy_engine.processor.save_tensor_as_image(picture, str(old_file), "JPEG")
     torch.manual_seed(42)
     engine.processor.save_tensor_as_image(picture, str(new_file), "JPEG")
-    assert new_file.read_bytes() == old_file.read_bytes()
+    from PIL import Image
+    with Image.open(old_file) as old, Image.open(new_file) as new:
+        assert new.info["icc_profile"][36:40] == b"acsp"
+        assert new.quantization == old.quantization and new.layer == old.layer
+        assert new.tobytes() == old.tobytes()
 
 
 @pytest.mark.skipif(not SAMPLES, reason="no .jxr capture in samples/")

@@ -5,10 +5,14 @@ of work arrive from the window:
 
 * **show**: load a file (or a frame of a video) and render its preview. Quick. The latest
   request wins; older ones still waiting are dropped.
-* **analyse**: the first pass over a video, so that its preview becomes exact and the
+* **analyse**: the first pass over a video, so its preview uses stabilized parameters and the
   conversion can skip that pass. Long. Abandoned as soon as the file or the picture
   settings change.
 * **convert**: the queue. Long. Stopped by ``stop_convert``.
+
+Each of the three is told which screen the window is on: what SDR white stands for is
+asked of that screen, by all three alike. The file is the picture that was previewed
+only if both were made for the same white.
 
 Long tasks let the thread's event loop run between frames, so a preview request is served
 within a frame or two even in the middle of a conversion. They never nest: a long task
@@ -20,13 +24,15 @@ that computes is imported at the top of this module, which the window imports: e
 waits for the engine, then imports what it uses.
 """
 import logging
+import os
 import threading
+import tempfile
 from collections import deque
 
 from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal, Slot
 
 from ..display import sdr_white_nits
-from ..session import Engines, Item, Options, convert_item
+from ..session import Engines, Item, Options, convert_item, output_base
 
 # The engine is imported by a thread started by Python, never by the thread of the Backend
 # itself. PyTorch's bindings remember the Python thread state of the thread that imports
@@ -69,11 +75,23 @@ def load_engine() -> None:
         raise _engine_error
 
 
+def _file_key(path):
+    stat = os.stat(path)
+    return path, stat.st_size, stat.st_mtime_ns
+
+
+def _capture_key(file_key, options, settings, device):
+    return (file_key, settings, options.pre_gamma, options.exposure,
+            options.image_format, device.type, options.use_fp16)
+
+
 class Backend(QObject):
     ready = Signal(bool)                                     # the engine is loaded; a CUDA card can be used
     preview_ready = Signal(int, object, object, object)     # request, before rgb8, after rgb8, facts
     preview_failed = Signal(int, str)
     analysis_progress = Signal(int, int, int)                # token, frames done, total
+    encoded_ready = Signal(int, str)                     # request token, error if any
+    encoded_progress = Signal(int, int)                  # request token, percent
     analysis_ready = Signal(int)                             # token
     item_started = Signal(int)
     item_progress = Signal(int, str, int, int)               # index, stage, done, total
@@ -92,9 +110,14 @@ class Backend(QObject):
         self.closing = False
         self._source = None
         self._source_key = None
+        self._capture_key = self._capture = None
         self._light = None                 # motion blur: the light of the frames a picture stands for
         self._light_key = None
         self.analysis = None
+        self._analysis_input = None
+        self.encode_token = 0
+        self._preview_dir = None
+        self._encoded = {}                         # source path -> (settings, output file identity)
         self._pending = deque()
         self._busy = False
         self._thumbnails = deque()                 # files of the queue whose picture is still to be read
@@ -127,15 +150,17 @@ class Backend(QObject):
         try:
             load_engine()
             from .. import preview
-            from ..video.job import exposure_of, frames_to_keep
+            from ..video.job import exposure_of, frames_to_keep, output_size
 
             chosen = Options.from_dict(options)
             engine, device = self.engines.get(chosen)
             white, white_source = sdr_white_nits(screen)   # what this screen's white stands for, now
             # Gamma and Exposure are not part of the key: they never change the source. Nor is
             # the size shown: the source is kept at its real size, whatever the window's.
-            key = (path, kind, round(time_s, 4), device.type, white)
+            file_key = _file_key(path)
+            key = (file_key, kind, round(time_s, 4), device.type, white)
             if key != self._source_key:
+                self._capture_key = self._capture = None
                 if kind == "video":
                     self._source = preview.load_video_frame(path, time_s, device, white_nits=white)
                 else:
@@ -144,16 +169,18 @@ class Backend(QObject):
             self._source.pre_gamma, self._source.exposure = chosen.pre_gamma, chosen.exposure
             preview.fit(self._source, box=(int(box[0]), int(box[1])))
             source, params, final, light = self._source, None, kind == "image", None
-            analysis = self.analysis
-            video = chosen.video_settings() if kind == "video" else None
-            if video is not None and analysis is not None and analysis.src == path and analysis.matches(video):
+            video = chosen.video_settings(screen, white) if kind == "video" else None
+            analysis = self._matching_analysis(file_key, chosen, video) if video else None
+            encoded = self._encoded_path(file_key, video, chosen) if video is not None else None
+            if video is not None and not encoded and analysis is not None:
                 index = analysis.index_of(source.pts)
                 keep = frames_to_keep(analysis.times, video.frame_rate, analysis.info.average_rate)
-                if video.motion_blur and not all(keep):
+                if not keep[index] or video.motion_blur and not all(keep):
                     # The file will show, at this moment, the picture of the kept frame before
                     # it, made of the light of the frames that picture stands for.
                     index, count = exposure_of(keep, set(analysis.cuts), index)
-                    key = (path, index, count, device.type)
+                    count = count if video.motion_blur else 1
+                    key = (file_key, index, count, device.type)
                     if key != self._light_key:
                         self._light = preview.blended_light(path, analysis.times[index], count, device,
                                                             analysis.info)
@@ -161,10 +188,33 @@ class Backend(QObject):
                     light = self._light
                 params = analysis.params[index]
                 final = True
-            after = preview.render_preview(engine, source, chosen.render_settings(kind), params, light=light)
-            facts = {"kind": kind, "path": path, "width": source.width, "height": source.height,
+            if kind == "image":
+                from ..engine.pipeline import prepare_capture
+
+                settings = chosen.render_settings(kind, screen, white)
+                capture_key = _capture_key(file_key, chosen, settings, device)
+                if self._capture_key != capture_key:
+                    self._capture = prepare_capture(engine, source.linear, source.capture_loader, settings,
+                                                    chosen.pre_gamma, chosen.exposure, chosen.image_format)
+                    self._capture_key = capture_key
+                source.method = self._capture.method
+                after = preview.for_display(self._capture.still.pixels(device), source.size)
+                result_tag = "TIFF 16-bit SDR" if chosen.image_format == "TIFF" else "JPEG SDR"
+            elif encoded:
+                from ..video.encoded_preview import frame_at
+
+                after = preview.for_display(frame_at(encoded, source.time_s, device), source.size)
+                source.method = analysis.method if analysis else chosen.method()
+                result_tag, final = "Encoded MP4 SDR", True
+            else:
+                after = preview.render_preview(engine, source, video.render, params, light=light,
+                                               output_size=output_size(source, video.out_height))
+                result_tag = "SDR before H.264"
+
+            facts = {"kind": kind, "path": path, "result_tag": result_tag, "width": source.width, "height": source.height,
                      "time_s": source.time_s, "duration_s": source.duration_s, "final": final,
                      "method": source.method if final else None,
+                     "neural_fallback": chosen.method() == "neural" and source.method == "perceptual",
                      "white_nits": source.white_nits, "white_source": white_source,
                      "peak_nits": source.peak_nits,
                      # for an HDR surface, and only while this screen really is in HDR
@@ -230,14 +280,56 @@ class Backend(QObject):
         self._schedule_thumbnail()
 
     # --------------------------------------------------------- long tasks, queued
-    @Slot(int, str, object)
-    def analyse(self, token: int, path: str, options: dict) -> None:
-        self._pending.append(("analyse", token, path, options))
+    @Slot(int, str, object, str)
+    def analyse(self, token: int, path: str, options: dict, screen: str = "") -> None:
+        """``screen``: the screen the window is on, as for ``show``."""
+        self._pending.append(("analyse", token, path, options, screen))
         self._drain()
 
-    @Slot(object, object)
-    def convert(self, jobs: list, options: dict) -> None:
-        self._pending.append(("convert", jobs, options))
+    def _matching_analysis(self, file_key, chosen, settings):
+        if (self._analysis_input == (file_key, chosen.use_gpu, chosen.use_fp16)
+                and self.analysis is not None and self.analysis.matches(settings)):
+            return self.analysis
+        return None
+
+    def _analyse_video(self, file_key, chosen, settings, device, progress, cancelled, engine):
+        from ..video.job import analyse_video
+
+        analysis = analyse_video(file_key[0], settings, device, progress, cancelled, engine)
+        self.analysis = analysis
+        self._analysis_input = (file_key, chosen.use_gpu, chosen.use_fp16)
+        return analysis
+
+    def _encoded_path(self, file_key, settings, chosen):
+        entry = self._encoded.get(file_key[0])
+        if entry is not None and entry[0] == (file_key, settings, chosen.use_gpu, chosen.use_fp16):
+            output = entry[1]
+            try:
+                if _file_key(output[0]) == output:
+                    return output[0]
+            except FileNotFoundError:
+                pass
+            self._encoded.pop(file_key[0], None)
+        return None
+
+    def _remember_video(self, file_key, settings, chosen, output):
+        self._encoded[file_key[0]] = ((file_key, settings, chosen.use_gpu, chosen.use_fp16), _file_key(output))
+
+    def release_encoded_preview(self):
+        if self._preview_dir is not None:
+            self._preview_dir.cleanup()
+            self._preview_dir = None
+
+    @Slot(int, str, object, str)
+    def encode_preview(self, token, path, options, screen):
+        self._pending.append(("encode", token, path, options, screen))
+        self._drain()
+
+    @Slot(object, object, str)
+    def convert(self, jobs: list, options: dict, screen: str = "") -> None:
+        """``screen``: the screen the window was on when the conversion was asked for. The
+        whole run is made for that screen's white, the files that were never shown too."""
+        self._pending.append(("convert", jobs, options, screen))
         self._drain()
 
     def _drain(self) -> None:
@@ -249,6 +341,8 @@ class Backend(QObject):
                 task = self._pending.popleft()
                 if task[0] == "analyse":
                     self._run_analysis(*task[1:])
+                elif task[0] == "encode":
+                    self._run_encode(*task[1:])
                 else:
                     self._run_queue(*task[1:])
         finally:
@@ -260,18 +354,22 @@ class Backend(QObject):
         """Let preview requests (and newly queued tasks) through between two frames."""
         QCoreApplication.processEvents()
 
-    def _run_analysis(self, token: int, path: str, options: dict) -> None:
+    def _run_analysis(self, token: int, path: str, options: dict, screen: str = "") -> None:
         if token != self.analysis_token:
             return
         try:
             load_engine()
         except Exception:
             return                                        # the preview has said why
-        from ..video.job import Cancelled, analyse_video
+        from ..video.job import Cancelled
 
         chosen = Options.from_dict(options)
-        if self.analysis is not None and self.analysis.src == path \
-                and self.analysis.matches(chosen.video_settings()):
+        settings = chosen.video_settings(screen)
+        try:
+            file_key = _file_key(path)
+        except OSError:
+            return
+        if self._matching_analysis(file_key, chosen, settings) is not None:
             self.analysis_ready.emit(token)               # already known: nothing to do again
             return
 
@@ -285,23 +383,64 @@ class Backend(QObject):
 
         try:
             engine, device = self.engines.get(chosen)
-            self.analysis = analyse_video(path, chosen.video_settings(), device, progress, cancelled, engine)
+            self._analyse_video(file_key, chosen, settings, device, progress, cancelled, engine)
             self.analysis_ready.emit(token)
         except Cancelled:
             pass
         except Exception:
             logging.exception("background analysis failed")   # the conversion will report it properly
 
-    def _run_queue(self, jobs: list, options: dict) -> None:
+    def _run_encode(self, token, path, options, screen):
+        from ..video.job import Cancelled, render_video
+
+        def cancelled():
+            return token != self.encode_token or self.closing
+
+        def progress(stage, done, total):
+            if done % 4 == 0 or done == total:
+                self.encoded_progress.emit(token, 100 * done // max(1, total))
+                self._breathe()
+
+        if cancelled():
+            return
+        try:
+            chosen = Options.from_dict(options)
+            engine, device = self.engines.get(chosen)
+            settings = chosen.video_settings(screen)
+            file_key = _file_key(path)
+            if not self._encoded_path(file_key, settings, chosen):
+                self.release_encoded_preview()
+                folder = tempfile.TemporaryDirectory(prefix="hdr-blaster-preview-")
+                try:
+                    if self._matching_analysis(file_key, chosen, settings) is None:
+                        self._analyse_video(file_key, chosen, settings, device, progress, cancelled, engine)
+                    output = os.path.join(folder.name, "preview.mp4")
+                    render_video(self.analysis, output, settings, device, progress, cancelled, engine)
+                    if cancelled() or file_key != _file_key(path):
+                        raise Cancelled()
+                    self._remember_video(file_key, settings, chosen, output)
+                    self._preview_dir = folder
+                finally:
+                    if self._preview_dir is not folder:
+                        folder.cleanup()
+            self.encoded_ready.emit(token, "")
+        except Cancelled:
+            pass
+        except Exception as exc:
+            logging.exception("encoded preview failed")
+            self.encoded_ready.emit(token, str(exc))
+
+    def _run_queue(self, jobs: list, options: dict, screen: str = "") -> None:
         """Convert the jobs in order. Whatever happens, ``queue_finished`` is emitted: the
         window must never be left waiting."""
         self._converting = True
         try:
             load_engine()
-            from ..video.job import Cancelled, analyse_video
+            from ..video.job import Cancelled
             from ..video.reader import UnsupportedVideo
 
             chosen = Options.from_dict(options)
+            white = options.get("white_nits")
             for index, path, kind in jobs:
                 if self.stop_convert or self.closing:
                     break
@@ -317,16 +456,32 @@ class Backend(QObject):
 
                 try:
                     engine, device = self.engines.get(chosen)
-                    analysis = self.analysis
+                    analysis = None
                     if kind == "video":
-                        settings = chosen.video_settings()
-                        if analysis is None or analysis.src != path or not analysis.matches(settings):
-                            # Analysed here rather than inside convert_item, so that the result is
-                            # kept: the preview of this video is exact from now on.
-                            analysis = analyse_video(path, settings, device, progress, cancelled, engine)
-                            self.analysis = analysis
+                        settings = chosen.video_settings(screen, white)
+                        file_key = _file_key(path)
+                        analysis = self._matching_analysis(file_key, chosen, settings)
+                        encoded = self._encoded_path(file_key, settings, chosen)
+                        if encoded:
+                            from ..video.encoded_preview import publish
+
+                            output = output_base(path, kind, chosen) + ".mp4"
+                            publish(encoded, output, progress, cancelled)
+                            self._remember_video(file_key, settings, chosen, output)
+                            if self._preview_dir and os.path.dirname(encoded) == self._preview_dir.name:
+                                self.release_encoded_preview()
+                            self.item_finished.emit(index, "done", "", [output])
+                            continue
+                        if analysis is None:
+                            analysis = self._analyse_video(file_key, chosen, settings, device, progress, cancelled, engine)
+                    prepared = None
+                    if kind == "image" and self._capture_key == _capture_key(
+                            _file_key(path), chosen, chosen.render_settings(screen=screen, white_nits=white), device):
+                        prepared = self._capture
                     written = convert_item(Item(path=path, kind=kind), chosen, engine, device, progress,
-                                           cancelled=cancelled, analysis=analysis)
+                                           cancelled=cancelled, analysis=analysis, screen=screen, prepared=prepared, white_nits=white)
+                    if kind == "video":
+                        self._remember_video(file_key, settings, chosen, written[0])
                     self.item_finished.emit(index, "done", "", written)
                 except Cancelled:
                     self.item_finished.emit(index, "cancelled", "", [])

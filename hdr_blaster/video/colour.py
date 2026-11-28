@@ -3,7 +3,7 @@
 In:  HDR10 planes (Y'CbCr, PQ transfer, BT.2020 primaries, 4:2:0, chroma sited
      'left' as in every HEVC/H.264 stream that does not say otherwise).
 Out: the tensor the engine expects, identical in meaning to what the JXR loader
-     produces: linear BT.709 primaries, scRGB x 0.1 (1.0 = 800 nits), no negatives.
+     produces: linear BT.709 primaries, scRGB x 0.1 (1.0 = 800 nits), including signed wide-gamut colours.
 
 And back: a finished sRGB tensor to 8-bit BT.709 limited-range 4:2:0 planes.
 """
@@ -13,6 +13,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
+from ..engine.colour import signed_power
 from ..engine.constants import ENGINE_UNIT_NITS
 
 SCRGB_WHITE_NITS = 80.0
@@ -100,7 +101,7 @@ def scrgb_to_engine(scrgb: torch.Tensor, pre_gamma: float = 1.0, exposure: float
     """The scene's light (:func:`yuv_to_scrgb`) with the user's controls, in the engine's
     working space."""
     if pre_gamma != 1.0:
-        scrgb = scrgb ** (1.0 / pre_gamma)
+        scrgb = signed_power(scrgb, 1.0 / pre_gamma)
     if exposure != 1.0:
         scrgb = scrgb * exposure
     return scrgb * ENGINE_SCALE
@@ -108,7 +109,7 @@ def scrgb_to_engine(scrgb: torch.Tensor, pre_gamma: float = 1.0, exposure: float
 
 def yuv_to_scrgb(y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, fmt: FrameFormat) -> torch.Tensor:
     """HDR10 planes -> (1, 3, H, W) float32, the scene's light as recorded: linear BT.709
-    primaries, scRGB (1.0 = 80 nits), no negatives, before any control of the user.
+    primaries, signed scRGB (1.0 = 80 nits), before any control of the user.
     Light adds up on this scale: the average of several frames is what a longer exposure
     would have recorded."""
     if fmt.matrix != "bt2020nc":
@@ -138,7 +139,7 @@ def yuv_to_scrgb(y: torch.Tensor, u: torch.Tensor, v: torch.Tensor, fmt: FrameFo
 
     m = torch.tensor(_BT2020_TO_BT709, dtype=torch.float32, device=y.device)
     scrgb = (m @ nits2020.reshape(1, 3, -1)).reshape(1, 3, height, width) / SCRGB_WHITE_NITS
-    return scrgb.clamp(min=0.0)                  # out-of-gamut colours, as the JXR loader clips them
+    return scrgb
 
 
 def srgb_to_yuv420(srgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

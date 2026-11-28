@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QVariantAnimation, Signal
-from PySide6.QtGui import QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColorSpace, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from ..fit import fit_size
@@ -28,7 +28,9 @@ MARGIN = 16                                    # around the picture, in the widg
 def image_from_rgb8(array: np.ndarray) -> QImage:
     """(H, W, 3) uint8 -> QImage owning its pixels."""
     height, width, _ = array.shape
-    return QImage(array.data, width, height, 3 * width, QImage.Format_RGB888).copy()
+    image = QImage(array.data, width, height, 3 * width, QImage.Format_RGB888).copy()
+    image.setColorSpace(QColorSpace(QColorSpace.SRgb))
+    return image
 
 
 class CompareView(QWidget):
@@ -54,6 +56,7 @@ class CompareView(QWidget):
         self._drop_hover = False
         self._note = ""                        # small text over the picture ("Preview", "Loading")
         self._source_tag = "HDR source"
+        self._result_tag = "SDR result"
         self._histogram = None                 # (3, 64) float in 0..1, or None
         self._blend = 1.0
         self._inset_right = 0                  # room kept free on the right (the advanced panel)
@@ -225,6 +228,12 @@ class CompareView(QWidget):
     def set_note(self, text: str) -> None:
         if text != self._note:
             self._note = text
+            self.update()
+            self._refresh_overlay()
+
+    def set_result_tag(self, text: str) -> None:
+        if text != self._result_tag:
+            self._result_tag = text
             self.update()
             self._refresh_overlay()
 
@@ -417,7 +426,7 @@ class CompareView(QWidget):
         """What sits on the pictures besides the divider: the two labels and the histogram."""
         source, result = self._tags_visible(rect, x)
         self._paint_tag(painter, self._source_tag, rect.left() + 10, rect.top() + 10, left=True, visible=source)
-        after_text = "SDR result" if not self._note else f"SDR result, {self._note.lower()}"
+        after_text = self._result_tag if not self._note else f"{self._result_tag}, {self._note.lower()}"
         self._paint_tag(painter, after_text, rect.right() - 10, rect.top() + 10, left=False, visible=result)
         if self._histogram is not None:
             self._paint_histogram(painter, rect)

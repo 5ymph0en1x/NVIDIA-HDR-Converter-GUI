@@ -41,6 +41,7 @@ from model import NeuralToneMapper
 from losses import CompositeLoss
 from cache import FrameCache, GpuLoader
 from teacher import TEACHERS, Teacher, augment
+from hdr_blaster.engine.colour import nonnegative_rgb
 from dataset import (
     SyntheticHDRDataset,
     HDRTV4KDataset,
@@ -86,10 +87,10 @@ def targets_for(batch, device, teacher, ev: float):
     is rendered from that very frame; otherwise the dataset's own pair is used."""
     hdr = batch["hdr"].to(device, non_blocking=True)
     if teacher is None:
-        return hdr, batch["sdr"].to(device, non_blocking=True)
+        return nonnegative_rgb(hdr), batch["sdr"].to(device, non_blocking=True)
     if ev > 0.0:
         hdr = augment(hdr, ev=ev)
-    return hdr, teacher(hdr)
+    return nonnegative_rgb(hdr), teacher(hdr)
 
 
 def evaluate(model, val_loader, loss_fn, device, teacher=None) -> float:

@@ -109,7 +109,7 @@ def test_written_file_is_sdr_h264_with_the_source_timestamps_and_audio(clip, dev
     out, source = clips.describe(dst), clips.describe(src)
     assert (out["codec"], out["pix_fmt"]) == ("h264", "yuv420p")
     assert (out["width"], out["height"]) == (256, 144)
-    assert (out["range"], out["matrix"], out["trc"], out["primaries"]) == (1, 1, 1, 1)
+    assert (out["range"], out["matrix"], out["trc"], out["primaries"]) == (1, 1, 13, 1)
     assert out["pts_s"] == pytest.approx(source["pts_s"], abs=1e-4)
     assert out["audio_packets"] == source["audio_packets"]
     assert out["audio_bytes"] == source["audio_bytes"]
@@ -271,3 +271,39 @@ def test_frames_that_are_not_wanted_are_counted_but_not_carried(clip, device):
             assert torch.equal(light.y, whole.y) and torch.equal(light.u, whole.u) and torch.equal(light.v, whole.v)
         else:
             assert light.y is None and light.u is None and light.v is None
+
+
+# ------------------------------------------------------- the inspected MP4 frame
+
+def test_an_inspected_frame_is_decoded_to_the_rgb_its_samples_stand_for():
+    """'Preview encoded MP4' shows what the file holds. The library's default conversion
+    to RGB truncates: every pixel came out a level darker than its samples say (greys
+    included), which is an error of the preview, not of the file."""
+    import av
+    import numpy as np
+
+    from hdr_blaster.video.encoded_preview import rgb_of
+
+    def frame_of(y, cb, cr):
+        height, width = y.shape
+        chroma = np.concatenate((np.full((height // 2, width // 2), cb, np.uint8).reshape(-1),
+                                 np.full((height // 2, width // 2), cr, np.uint8).reshape(-1)))
+        frame = av.VideoFrame.from_ndarray(np.vstack((y, chroma.reshape(height // 2, width))), format="yuv420p")
+        frame.colorspace, frame.color_range = 1, 1            # BT.709, limited range: what the writer signals
+        return frame
+
+    def exact(y, cb, cr):                                     # ITU-R BT.709, limited range, in binary64
+        yy, pb, pr = (y.astype(np.float64) - 16) / 219, (cb - 128) / 224, (cr - 128) / 224
+        red, blue = yy + 1.5748 * pr, yy + 1.8556 * pb
+        green = (yy - 0.2126 * red - 0.0722 * blue) / 0.7152
+        return np.clip(np.stack((red, green, blue), -1), 0, 1) * 255
+
+    ramp = np.repeat(np.arange(16, 236, dtype=np.uint8)[None, :], 64, 0)        # every grey of the range
+    shown = rgb_of(frame_of(ramp, 128, 128)).astype(np.float64)
+    off = shown - exact(ramp, 128, 128)
+    assert shown.shape == (64, 220, 3) and np.abs(off).max() <= 0.5 + 1e-9, "each grey, rounded to the nearest level"
+    assert abs(off.mean()) < 0.05, f"no bias: {off.mean():+.2f} level"
+    for cb, cr in ((90, 200), (200, 90), (60, 60), (128, 240)):                 # flat colours: the matrix
+        flat = np.full((64, 220), 120, np.uint8)
+        off = rgb_of(frame_of(flat, cb, cr)).astype(np.float64) - exact(flat, cb, cr)
+        assert np.abs(off).max() <= 1.0, f"Cb {cb}, Cr {cr}: {np.abs(off).max():.1f} levels off"

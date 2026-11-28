@@ -17,7 +17,7 @@ converted to Python floats: that would change the arithmetic downstream.
 
 Keys
 ----
-``scene.peak``                    where the picture's highlights end, relative to white
+``scene.peak``                    where the picture's highlights end, relative to white (after grading for looks and their anchored neural model)
 ``adaptive.extreme_highlights``, ``adaptive.shadow_recovery``   branch choices (bool)
 ``lut3d.weights``                 blend weights of the three basis colour LUTs
 ``edge.in_min``, ``edge.in_max``, ``edge.mag_max``, ``edge.out_min``, ``edge.out_max``

@@ -82,7 +82,7 @@ def test_hdrtv4k_converts_bt2020_primaries_to_bt709(dataset, tmp_path):
     root = hdrtv_pair(tmp_path, [200.0, 0.0, 0.0])
     r, g, b = dataset.HDRTV4KDataset(str(root), patch_size=32)[0]["hdr"][:, 0, 0].tolist()
     assert r == pytest.approx(200.0 * 1.660491, rel=0.01)
-    assert g == 0.0 and b == 0.0      # negative components are clipped, as the JXR loader does
+    assert (g, b) == pytest.approx((-24.910, -3.6302), rel=0.01)
 
 
 def test_synthetic_hdr_is_in_nits(dataset, tmp_path):

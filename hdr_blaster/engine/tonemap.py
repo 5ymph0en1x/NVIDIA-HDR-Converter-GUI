@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from . import renderings as R
-from .colour import _srgb_decode
+from .colour import _srgb_decode, nonnegative_rgb
 from .constants import ENGINE_UNIT_NITS, REFERENCE_WHITE_NITS
 from .metadata import HDRMetadata
 from .neural import _get_neural_tonemap
@@ -36,6 +36,7 @@ class AdvancedToneMapper:
 
     def analyze_image_statistics(self, image: torch.Tensor) -> Dict:
         """Comprehensive HDR image analysis for optimal tone mapping selection."""
+        image = nonnegative_rgb(image.float())
         luminance = 0.2126 * image[:, 0] + 0.7152 * image[:, 1] + 0.0722 * image[:, 2]
 
         # Basic statistics
@@ -43,7 +44,7 @@ class AdvancedToneMapper:
             'min_luminance': luminance.min().item(),
             'max_luminance': luminance.max().item(),
             'mean_luminance': luminance.mean().item(),
-            'std_luminance': luminance.std().item(),
+            'std_luminance': luminance.std(correction=0).item(),
             'median_luminance': luminance.median().item(),
             'dynamic_range': (luminance.max() / (luminance.min() + 1e-8)).item(),
             'key': torch.exp(torch.log(luminance + 1e-8).mean()).item(),
@@ -62,18 +63,21 @@ class AdvancedToneMapper:
         stats['highlight_detail'] = zone_weights[6:].sum().item()  # Zones VI-VII
 
         # Local contrast analysis
-        kernel = torch.tensor([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]],
-                              dtype=torch.float32, device=image.device).view(1, 1, 3, 3)
-        contrast = F.conv2d(luminance.unsqueeze(1), kernel, padding=1)
+        # Subtract neighbouring pairs before summing. A constant patch has exactly
+        # zero response, including its borders, even in single precision.
+        h, w = luminance.shape[-2:]
+        padded = F.pad(luminance, (1, 1, 1, 1), mode="replicate")
+        contrast = sum(luminance - padded[..., dy:dy+h, dx:dx+w]
+                       for dy in range(3) for dx in range(3) if (dy, dx) != (1, 1))
         stats['local_contrast'] = contrast.abs().mean().item()
-        stats['contrast_variance'] = contrast.std().item()
+        stats['contrast_variance'] = contrast.std(correction=0).item()
 
         # Color saturation analysis
         rgb_max = image.max(dim=1)[0]
         rgb_min = image.min(dim=1)[0]
         saturation = (rgb_max - rgb_min) / (rgb_max + 1e-8)
         stats['mean_saturation'] = saturation.mean().item()
-        stats['saturation_variance'] = saturation.std().item()
+        stats['saturation_variance'] = saturation.std(correction=0).item()
 
         # Specular highlight detection
         highlight_threshold = stats['mean_luminance'] + 2 * stats['std_luminance']
@@ -182,8 +186,8 @@ class AdvancedToneMapper:
     # ------------------------------------------------------------ renderings
     @staticmethod
     def _relative(image: torch.Tensor, white_nits: float) -> torch.Tensor:
-        """Engine units -> linear RGB relative to SDR white, negatives dropped."""
-        return image.float().clamp(min=0.0) * (ENGINE_UNIT_NITS / float(white_nits))
+        """Working light for channel-based renderings, relative to SDR white."""
+        return nonnegative_rgb(image.float()) * (ENGINE_UNIT_NITS / float(white_nits))
 
     @staticmethod
     def _peak(x: torch.Tensor, params) -> torch.Tensor:
@@ -196,32 +200,28 @@ class AdvancedToneMapper:
         """The scene at its own luminance, SDR white standing for ``white_nits``.
 
         A tone of 20 nits comes out as 20 / white of the SDR range, whatever surrounds
-        it. Only what is brighter than white is compressed (:func:`faithful_curve`). The
-        curve is driven by the brightest channel and applied as one gain to the three,
-        so a highlight keeps its hue and saturation and no channel clips.
+        it. In a scene exceeding white, the upper tones roll off from half a stop below white.
+        The remaining display range carries the brightness and colour differences
+        between a light source and its surroundings.
 
         Returns LINEAR [0, 1] like every rendering.
         """
-        return self._roll_off(self._relative(image, white_nits), white_nits, params)
-
-    def _roll_off(self, x: torch.Tensor, white_nits: float, params) -> torch.Tensor:
-        top = R.brightest(x)
-        peak = self._peak(x, params)
-        white = float(white_nits)
-        mapped = faithful_curve(top * white, white, peak * white) / white
-        gain = torch.where(top > 1e-9, mapped / top.clamp(min=1e-9), torch.ones_like(top))
-        return (x * gain).clamp(0.0, 1.0)
+        x = self._relative(image, white_nits)
+        return R.faithful_highlights(x, self._peak(x, params))
 
     def tone_map_look(self, image: torch.Tensor, look: str, white_nits: float = REFERENCE_WHITE_NITS,
                       params=None) -> torch.Tensor:
-        """Natural, Punchy, Golden: the faithful picture, graded above its shadows."""
+        """Grade above the shadows, then reserve highlight contrast for the graded scene."""
         p = R.LOOKS[look]
         x = R.grade(self._relative(image, white_nits), p["contrast"], p["saturation"], p["warm"])
-        return R.fade_highlights(self._roll_off(x, white_nits, params), p["fade"])
+        return R.fade_highlights(R.faithful_highlights(x, self._peak(x, params)), p["fade"])
 
     def tone_map_operator(self, image: torch.Tensor, method: str, white_nits: float = REFERENCE_WHITE_NITS,
                           params=None) -> torch.Tensor:
         """The classical operators, each with the trait it is known for (see renderings.py)."""
+        if method == "perceptual":
+            x = image.float() * (ENGINE_UNIT_NITS / float(white_nits))
+            return R.perceptual(x, self._peak(x, params), white_nits)
         x = self._relative(image, white_nits)
         peak = self._peak(x, params)
         if method == "reinhard":
@@ -232,8 +232,6 @@ class AdvancedToneMapper:
             return R.per_channel(R._aces, x, peak)
         if method == "drago03":
             return R.hue_kept(R._drago, x, peak)
-        if method == "perceptual":
-            return R.perceptual(x, peak, white_nits)
         if method == "mantiuk06":
             return R.local_contrast(x, peak)
         if method == "adaptive":
@@ -269,12 +267,21 @@ class AdvancedToneMapper:
         if method in R.LOOKS:
             p = R.LOOKS[method]
             scene = R.grade(self._relative(image, white_nits), p["contrast"], p["saturation"], p["warm"])
+        elif method == "perceptual":
+            scene = image.float() * (ENGINE_UNIT_NITS / float(white_nits))
         elif method in _PEAK_ONLY:
             scene = self._relative(image, white_nits)
         else:
             return False
         self._peak(scene, params)
         return True
+
+    def available_method(self, method: str) -> str:
+        method = R.canonical(method)
+        if method == "neural" and self.neural_model is None:
+            logging.warning("Neural tone mapper unavailable; using Perceptual.")
+            return "perceptual"
+        return method
 
     def keeps_scene_levels(self, method: str) -> bool:
         """Kept for callers: every rendering now keeps the scene's levels, so sharpening
@@ -291,12 +298,9 @@ class AdvancedToneMapper:
         if method is None:
             method = self.select_optimal_tonemap(self.analyze_image_statistics(image))
             logging.info(f"Auto-selected tone mapping method: {method}")
-        method = R.canonical(method)
+        method = self.available_method(method)
         if method == "neural":
-            if self.neural_model is not None:
-                return self._tone_map_neural(image, params, white_nits)
-            logging.warning("Neural tone mapper requested but unavailable; falling back to perceptual.")
-            method = "perceptual"
+            return self._tone_map_neural(nonnegative_rgb(image), params, white_nits)
         if method == "faithful":
             return self.tone_map_faithful(image, white_nits, params)
         if method in R.LOOKS:
@@ -314,9 +318,8 @@ class AdvancedToneMapper:
                  the sRGB EOTF here — the downstream `linear_to_srgb`
                  step re-encodes it back without double-encoding.
         """
-        # The model's only whole-image decision is its bilateral grid of affine
-        # coefficients; everything after it is per-pixel. Recording the grid makes
-        # the operator replayable like the others.
+        # Freeze the learned grid for video. Anchored models also record their teacher's
+        # peak so the analytic highlights can be replayed with the same shot parameters.
         scale = getattr(self.neural_model, "engine_input_scale", 1.0)
         anchor = getattr(self.neural_model, "anchor_white_nits", None)
         if anchor is not None:
@@ -327,7 +330,20 @@ class AdvancedToneMapper:
         with torch.inference_mode():
             grid = _measure(params, "neural.grid", lambda: self.neural_model.predict_grid(x))
             srgb_out = self.neural_model.apply_grid(x, grid)
-        return _srgb_decode(srgb_out)
+        learned = _srgb_decode(srgb_out)
+        teacher = getattr(self.neural_model, "teacher_look", None)
+        if teacher not in R.LOOKS or anchor is None:
+            return learned
+
+        # The network owns the mid-tones. A trained bilateral grid can lift a
+        # black or flatten an overexposed sky; bind those extremes to its teacher.
+        scene = self._relative(image, white_nits)
+        top = R.brightest(scene)
+        t = ((top - 0.5) * 2.0).clamp(0.0, 1.0)
+        highlight = t * t * (3.0 - 2.0 * t)
+        taught = self.tone_map_look(image, teacher, white_nits, params)
+        weight = R.shadow_weight(top) * (1.0 - highlight)
+        return torch.lerp(taught, learned, weight)
 
     def apply_dithering(self, image: torch.Tensor, strength: float = 1.0 / 255.0) -> torch.Tensor:
         """

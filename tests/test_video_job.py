@@ -56,7 +56,7 @@ def test_conversion_keeps_frames_timestamps_and_audio_and_is_not_heavier(clip, d
     assert report.frames == 40 and len(out["pts_s"]) == 40
     assert out["pts_s"] == pytest.approx(source["pts_s"], abs=1e-4)
     assert out["audio_bytes"] == source["audio_bytes"]
-    assert (out["codec"], out["pix_fmt"], out["trc"], out["range"]) == ("h264", "yuv420p", 1, 1)
+    assert (out["codec"], out["pix_fmt"], out["trc"], out["range"]) == ("h264", "yuv420p", 13, 1)
     assert report.dst_bytes == os.path.getsize(dst) <= report.src_bytes == os.path.getsize(clip)
     assert report.method == "punchy" and report.encoder in ("h264_nvenc", "libx264")
     assert report.cuts == [0] and (report.width, report.height) == (256, 144)
@@ -96,6 +96,12 @@ def test_every_frame_is_measured_once_then_replayed_frozen(clip, device, video_e
 def test_other_operators_convert_too(clip, device, video_engine, tmp_path, operator):
     report = convert_video(clip, tmp_path / "out.mp4", settings(method=operator), device, engine=video_engine)
     assert report.frames == 40 and report.method == operator
+
+
+def test_missing_neural_model_reports_perceptual_in_the_encoded_video(clip, device, video_engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(video_engine.tone_mapper, "neural_model", None)
+    report = convert_video(clip, tmp_path / "fallback.mp4", settings(method="neural"), device, engine=video_engine)
+    assert report.method == "perceptual" and report.frames == 40
 
 
 def test_downscaling_gives_even_dimensions(clip, device, video_engine, tmp_path):

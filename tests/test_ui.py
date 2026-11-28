@@ -55,6 +55,19 @@ def after_bytes(window) -> bytes:
     return bytes(image.constBits())[: image.sizeInBytes()]
 
 
+def assert_displayed_pixels(window, rgb):
+    import numpy as np
+    import torch
+    from hdr_blaster import preview
+
+    image = window.viewer._after
+    shown = np.frombuffer(after_bytes(window), np.uint8).reshape(image.height(), image.bytesPerLine())
+    shown = shown[:, :image.width() * 3].reshape(image.height(), image.width(), 3)
+    tensor = torch.from_numpy(rgb.astype(np.float32) / np.iinfo(rgb.dtype).max).permute(2, 0, 1)[None]
+    reference = preview.for_display(tensor.to(window.backend.engines.device_for(window.options)), shown.shape[:2])
+    np.testing.assert_array_equal(shown, preview.to_rgb8(reference))
+
+
 def idle(window) -> bool:
     return not window._converting
 
@@ -126,6 +139,77 @@ def test_converting_a_capture_writes_it_next_to_the_source(window, capture):
 
 # ----------------------------------------------------------------------- videos
 
+def test_window_matches_decoded_still_for_each_export_format(window, tmp_path):
+    from dataclasses import replace
+    import imagecodecs
+    import numpy as np
+    from PIL import Image
+    import tifffile
+
+    path = tmp_path / "gradient.jxr"
+    ramp = np.linspace(0, 3, 128 * 80, dtype=np.float32).reshape(80, 128)
+    path.write_bytes(imagecodecs.jpegxr_encode(np.stack((ramp, ramp**2, ramp[::-1], np.ones_like(ramp)), -1)))
+    window.add_paths([str(path)])
+    for fmt in ("JPEG", "TIFF", "Both"):
+        window._apply(replace(window.options, image_format=fmt, exposure=0.82, pre_gamma=1.35))
+        tag = "TIFF 16-bit SDR" if fmt == "TIFF" else "JPEG SDR"
+        assert wait(lambda: window.viewer._result_tag == tag and window.viewer._note == "")
+        window.convert()
+        assert wait(lambda: idle(window) and window.queue.current.state == "done")
+        output = window.queue.current.outputs[0]
+        if fmt == "TIFF":
+            assert output.endswith("_tonemapped.tiff")
+            with tifffile.TiffFile(output) as tiff:
+                assert tiff.pages[0].tags[34675].value[36:40] == b"acsp"
+                rgb = tiff.asarray()
+            assert rgb.dtype == np.uint16
+        else:
+            with Image.open(output) as image:
+                assert image.info["icc_profile"][36:40] == b"acsp"
+                rgb = np.array(image)
+        assert_displayed_pixels(window, rgb)
+
+
+@needs_capture
+def test_first_picture_refits_if_the_window_resized_during_loading(window, capture):
+    window.resize(900, 620)
+    window.add_paths([str(capture)])
+    first_box = window._asked_box
+    window.resize(1380, 930)
+    window._refit.stop()
+    window._fit_picture()  # the resize was delivered before the worker's first answer
+    assert not window.viewer.has_picture() and window.viewer.picture_box() != first_box
+    assert wait(lambda: window.viewer.has_picture()
+                and window.viewer._made_for(window.viewer._after, window.viewer.picture_rect()))
+    assert window._asked_box == window.viewer.picture_box()
+
+
+def test_inspecting_the_encoded_video_then_saving_the_same_bytes(window, video):
+    import av
+    from dataclasses import replace
+
+    window._apply(replace(window.options, video_fps=30, video_quality="compact"))
+    window.add_paths([str(video)])
+    assert wait(lambda: window._facts and window._facts["final"])
+    window.encoded_button.click()
+    assert wait(lambda: window.viewer._result_tag == "Encoded MP4 SDR", 120)
+    proof = Path(window.backend._preview_dir.name) / "preview.mp4"
+    encoded = proof.read_bytes()
+    window.timeline.setValue(630)
+    assert wait(lambda: window._facts["time_s"] > 0.1)
+    with av.open(str(proof)) as container:
+        frames = list(container.decode(video=0))
+        held = max((f for f in frames if f.time <= window._facts["time_s"] + 1e-6), key=lambda f: f.pts)
+        from hdr_blaster.video.encoded_preview import rgb_of
+
+        assert_displayed_pixels(window, rgb_of(held))
+    window.convert()
+    assert wait(lambda: idle(window) and window.queue.current.state == "done")
+    assert Path(window.queue.current.outputs[0]).read_bytes() == encoded
+    assert not proof.exists()
+    window._apply(replace(window.options, video_quality="high"))
+    assert wait(lambda: window.viewer._result_tag == "SDR before H.264")
+
 def test_a_video_gets_a_provisional_preview_then_the_exact_one(window, video):
     window.add_paths([str(video)])
     assert wait(lambda: window.viewer.has_picture())
@@ -195,8 +279,8 @@ def test_motion_blur_is_offered_at_a_lower_frame_rate_and_shown_by_the_preview(w
     cuts = set(analysis.cuts)
     first = next(i for i in range(3, len(keep)) if keep[i] and exposure_of(keep, cuts, i)[1] > 1)
     # put the timeline on that picture: a frame it is made of
-    window.timeline.setValue(int(1000 * analysis.times[first] / window._facts["duration_s"]) + 1)
-    assert wait(lambda: analysis.index_of(window.backend._source.pts) in (first, first + 1), 60)
+    window.timeline.setValue(int(1000 * analysis.times[first] / window._facts["duration_s"]))
+    assert wait(lambda: analysis.index_of(window.backend._source.pts) == first, 60)
     settle(0.6)
     assert wait(lambda: window._facts["final"], 120)
     sharp = after_bytes(window)
@@ -600,7 +684,20 @@ def test_by_default_the_result_is_the_source_where_the_scene_fits(window, captur
     before, after = pixels(window.viewer._before), pixels(window.viewer._after)
     dark = before < 128                                       # well under white on any screen
     assert float(np.abs(after - before)[dark].mean()) < 1.5, "the result's shadows are the source's"
-    assert float(np.median(np.abs(after - before)[dark])) == 0.0
+    # The real JPEG includes dither and compression. Neither may systematically lift the shadows.
+    delta = (after - before)[dark]
+    assert np.median(delta) == 0 and np.median(np.abs(delta)) <= 1
+
+
+@needs_capture
+def test_window_names_neural_fallback(window, capture, monkeypatch):
+    from hdr_blaster.engine import tonemap
+
+    monkeypatch.setattr(tonemap, "_get_neural_tonemap", lambda device: None)
+    window.panel.operator.setCurrentText("Neural (AI)")
+    window.add_paths([str(capture)])
+    assert wait(lambda: "Neural unavailable, using Perceptual" in window.detail_label.text())
+    assert window._facts["method"] == "perceptual"
 
 
 @needs_capture

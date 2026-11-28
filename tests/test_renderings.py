@@ -192,6 +192,23 @@ def test_the_renderings_are_all_different_pictures(engine, get_linear):
 
 # ------------------------------------------------------------------ the looks
 
+@pytest.mark.parametrize("strength,colour", [(25., 0.), (100., 50.)])
+def test_shadow_texture_survives_sharpening_and_colour(engine, device, strength, colour):
+    gen = torch.Generator(device=device).manual_seed(4402)
+    scene = torch.rand((1, 3, 128, 192), generator=gen, device=device) * (0.044 * WHITE / ENGINE_UNIT_NITS)
+    scene[..., 96:] += WHITE / ENGINE_UNIT_NITS
+    settings = RenderSettings(method="perceptual", edge_strength=strength, color_strength=colour, white_nits=WHITE)
+    out, _ = render(engine.tone_mapper, engine.loader, engine.processor, scene, settings)
+    assert torch.allclose(_srgb_decode(out)[..., :96], (scene * (ENGINE_UNIT_NITS / WHITE))[..., :96],
+                          rtol=1e-5, atol=2e-7)
+
+
+def test_guided_local_contrast_maps_a_flat_peak_to_white(engine, device):
+    scene = patches(device, [1200.0], size=96)
+    out, _ = show(engine, scene, "mantiuk06")
+    assert float(out.min()) >= 0.9999
+
+
 def test_each_look_has_its_character(engine, device):
     """Above the shadows: Natural is softer than the scene, Punchy has more contrast and
     colour, Golden is warm."""

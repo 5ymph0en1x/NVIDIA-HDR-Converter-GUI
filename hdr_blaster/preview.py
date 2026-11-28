@@ -5,9 +5,8 @@ Nothing here knows about windows. A source is loaded once (a capture, or one fra
 video) and kept at its real size. It is rendered at that size, as the conversion renders
 it, as often as the settings change; the two pictures shown are then brought to the size
 of the window in ONE resampling (see ``for_display``). Shown at the size of the file,
-they are the file's pixels and the converted picture's pixels, untouched. For a video,
-rendering with the parameters of a finished analysis gives exactly the frame the
-converted file will contain.
+the GUI uses the decoded JPEG, the quantized TIFF or the inspected MP4 frame. A live
+video adjustment shows the render before H.264 compression.
 
 The first version reduced the HDR picture before rendering it, by averaging groups of
 pixels, and let the window stretch the result to its place: thin lines came out as
@@ -50,6 +49,7 @@ class PreviewSource:
     # source view and `linear` always hold the picture as recorded.
     pre_gamma: float = 1.0
     exposure: float = 1.0
+    capture_loader: object = field(default=None, repr=False, compare=False)
     _view: dict = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self):
@@ -113,7 +113,7 @@ def for_display_hdr(scrgb: torch.Tensor, size) -> torch.Tensor:
 
     Nothing is cut on such a surface, so a reduced picture is light simply averaged
     (linear light). Enlarged, it is resampled on its PQ codes, the scale on which a
-    kernel's overshoot is least visible; what lies outside BT.709 is then brought to its edge."""
+    kernel's overshoot is least visible. A signed extension preserves wide-gamut components."""
     from .engine.renderings import pq_decode, pq_encode
 
     size = (int(size[0]), int(size[1]))
@@ -122,7 +122,9 @@ def for_display_hdr(scrgb: torch.Tensor, size) -> torch.Tensor:
     scrgb = scrgb.float()
     if size[0] <= scrgb.shape[-2] and size[1] <= scrgb.shape[-1]:
         return resize(scrgb, *size)
-    return pq_decode(resize(pq_encode(scrgb.clamp(min=0.0) * SCRGB_WHITE_NITS), *size)) / SCRGB_WHITE_NITS
+    code = scrgb.sign() * pq_encode(scrgb.abs() * SCRGB_WHITE_NITS)
+    code = resize(code, *size)
+    return code.sign() * pq_decode(code.abs()) / SCRGB_WHITE_NITS
 
 
 def to_rgba16f(image: torch.Tensor) -> np.ndarray:
@@ -165,9 +167,10 @@ def reference_view(linear: torch.Tensor, white_nits: float) -> torch.Tensor:
     the window's white standing for ``white_nits``. Tones up to that level come out at
     their real luminance; brighter ones are clipped. ``linear`` is in the engine's
     working space."""
+    from .engine.colour import nonnegative_rgb
     from .engine.constants import ENGINE_UNIT_NITS
 
-    return _srgb(linear.float() * (ENGINE_UNIT_NITS / float(white_nits)))
+    return _srgb(nonnegative_rgb(linear.float()) * (ENGINE_UNIT_NITS / float(white_nits)))
 
 
 def _peak_nits(linear: torch.Tensor) -> float:
@@ -182,16 +185,11 @@ def load_image(path, device, max_side: int = 1600, pre_gamma: float = 1.0,
                box: Optional[Tuple[int, int]] = None) -> PreviewSource:
     """A JXR capture, read as its pixel format says (see ``io.jxr_info``). ``pre_gamma``
     and ``exposure`` are only remembered for the result: the source is never adjusted."""
-    from .io.jxr import OptimizedJXRLoader
-    from .io.jxr_info import check_hdr_capture, read_jxr_info
+    from .io.jxr import read_capture
 
-    check_hdr_capture(read_jxr_info(path))
-    loader = OptimizedJXRLoader(device)
-    linear, error, _ = loader.load_jxr(str(path))
-    if linear is None:
-        raise ValueError(f"Could not read this capture: {error}")
+    linear, loader = read_capture(path, device)
     height, width = linear.shape[-2:]
-    return PreviewSource(kind="image", path=str(path), linear=linear, white_nits=white_nits,
+    return PreviewSource(kind="image", path=str(path), linear=linear, white_nits=white_nits, capture_loader=loader,
                          peak_nits=_peak_nits(linear), width=width, height=height,
                          size=shown_size(width, height, max_side, box),
                          pre_gamma=pre_gamma, exposure=exposure)
@@ -234,16 +232,16 @@ def blended_light(path, time_s: float, count: int, device, info=None) -> torch.T
 
 
 def render_preview(engine, source: PreviewSource, settings: RenderSettings,
-                   params: Optional[RenderParams] = None, light: Optional[torch.Tensor] = None) -> torch.Tensor:
+                   params: Optional[RenderParams] = None, light: Optional[torch.Tensor] = None,
+                   output_size: Optional[Tuple[int, int]] = None) -> torch.Tensor:
     """The 'after' picture, sRGB, at the size shown: (1, 3, *source.size).
 
     The picture is rendered at its REAL size, exactly as the conversion renders it (the
     operator Auto-select picks, the scene's peak, the sharpening), and only then brought
     to the size of the window.
 
-    * A capture: the picture the conversion writes.
-    * A video frame with the frozen ``params`` of a finished analysis: the frame of the
-      converted file.
+    * A capture: the render before still-image encoding.
+    * Analysed video: the render with the stabilized parameters, before encoding.
     * A video frame without them is measured by itself: provisional.
 
     ``light`` replaces the frame's own light in the result (motion blur: see
@@ -252,7 +250,9 @@ def render_preview(engine, source: PreviewSource, settings: RenderSettings,
     # One white for both halves of the comparison: the one the source view is made with.
     settings = replace(settings, white_nits=source.white_nits)
     with torch.inference_mode():
-        tm, loader, processor = engine.tone_mapper, engine.loader, engine.processor
+        loader = source.capture_loader or engine.loader
+        tm = loader.tone_mapper if source.capture_loader else engine.tone_mapper
+        processor = engine.processor
         # Gamma and Exposure shape the result, as the conversion applies them while reading.
         linear = adjust_scene(source.linear if light is None else light, source.pre_gamma, source.exposure)
         if params is not None:
@@ -262,6 +262,9 @@ def render_preview(engine, source: PreviewSource, settings: RenderSettings,
             settings = replace(settings, method=params.method)
         out, used = render(tm, loader, processor, linear, settings, params=params)
         source.method = used.method
+        if output_size is not None:
+            from .video.job import resize_for_output
+            out = resize_for_output(out, output_size)
         return for_display(out, source.size)
 
 

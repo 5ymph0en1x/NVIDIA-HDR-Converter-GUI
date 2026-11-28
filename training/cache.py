@@ -52,7 +52,7 @@ class CacheWriter:
         """``nits``: (3, HEIGHT, WIDTH) linear BT.709, any device."""
         if tuple(nits.shape) != (3, HEIGHT, WIDTH):
             raise ValueError(f"expected (3, {HEIGHT}, {WIDTH}), got {tuple(nits.shape)}")
-        frame = torch.nan_to_num(nits.float(), nan=0.0, posinf=MAX_NITS).clamp(0.0, MAX_NITS)
+        frame = torch.nan_to_num(nits.float(), nan=0.0, posinf=MAX_NITS, neginf=-MAX_NITS).clamp(-MAX_NITS, MAX_NITS)
         self._file.write(frame.to(torch.float16).cpu().numpy().tobytes())
         self.items.append({"origin": origin, "detail": detail, "val": is_held_out(origin)})
 

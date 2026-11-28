@@ -99,6 +99,7 @@ def _get_neural_tonemap(device):
         model.load_state_dict(ckpt["model"])
         model.engine_input_scale = engine_input_scale(ckpt)
         model.anchor_white_nits = anchor_white_nits(ckpt)
+        model.teacher_look = ckpt.get("teacher")
         logging.info(
             f"Loaded neural tone mapper from "
             f"{NEURAL_TONEMAP_CHECKPOINT_PATH} "

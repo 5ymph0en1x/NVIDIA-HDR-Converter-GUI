@@ -25,6 +25,7 @@ for entry in (str(HERE), str(HERE.parent)):
 
 from dataset import SCRGB_WHITE_NITS, load_jxr_nits  # noqa: E402
 from model import NeuralToneMapper  # noqa: E402
+from hdr_blaster.engine.colour import nonnegative_rgb  # noqa: E402
 from teacher import TEACHERS, Teacher  # noqa: E402
 
 
@@ -76,7 +77,7 @@ def main() -> int:
         line += f"{float(luma(reference).flatten()[::17].quantile(0.01)):6.3f}   "
         for (model, scale), total in zip(models, totals):
             with torch.inference_mode():
-                out = model(nits * scale)
+                out = model(nonnegative_rgb(nits) * scale)
             stats = describe(out, reference)
             for key in total:
                 total[key] += stats[key] / len(captures)

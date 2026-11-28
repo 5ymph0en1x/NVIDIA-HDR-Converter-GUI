@@ -5,11 +5,11 @@ import numpy as np
 import tifffile
 import torch
 import torch.nn.functional as F
-from PIL import Image
 
 from .enhance import EdgeEnhancementBlock
 from .lut3d import ImageAdaptive3DLUT
 from .params import MissingRenderParam
+from .renderings import srgb_shadow_weight
 from .tonemap import AdvancedToneMapper
 
 
@@ -68,7 +68,8 @@ class HDRColorProcessor:
             tensor = original_tensor.to(self.device, dtype=torch.float16 if self.use_fp16 else torch.float32)
 
             pad_size = 32
-            padded_tensor = F.pad(tensor, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
+            padding_mode = 'reflect' if min(tensor.shape[-2:]) > pad_size else 'replicate'
+            padded_tensor = F.pad(tensor, (pad_size,) * 4, mode=padding_mode)
 
             with torch.inference_mode():
                 if use_enhancement and color_strength > 0 and self.color_net.enabled:
@@ -87,6 +88,8 @@ class HDRColorProcessor:
                     highlight_ramp = (1.0 - (lum - 0.85) / 0.13).clamp(0.0, 1.0)
                     highlight_ramp = highlight_ramp * highlight_ramp * (3.0 - 2.0 * highlight_ramp)
                     tone_mask = shadow_ramp * highlight_ramp
+                    if keep_levels:
+                        tone_mask = tone_mask * srgb_shadow_weight(padded_tensor)
                     effective_alpha = alpha * tone_mask
                     enhanced = padded_tensor * (1.0 - effective_alpha) + lut_output * effective_alpha
                 else:
@@ -119,70 +122,19 @@ class HDRColorProcessor:
             return original_tensor
 
     def save_tensor_as_image(self, tensor_to_save, output_path, output_format, is_hdr_data=False, quality=95):
-        """
-        Saves a tensor as an image file (JPEG or TIFF).
-        Applies adaptive ordered dithering before quantization for LDR formats
-        to prevent banding.
-        """
-        try:
-            if tensor_to_save.is_cuda:
-                tensor_to_save = tensor_to_save.cpu()
+        """Write an SDR still or a scene-linear float TIFF."""
+        from ..io.still import SdrStill
 
-            tensor_to_save = tensor_to_save.detach()
-
-            # --- Start of dithering logic ---
-            # Apply dithering only to LDR (non-HDR) images that will be quantized.
-            if not is_hdr_data:
-                dither_strength = 0.0
-                if output_format == 'JPEG':
-                    # Dithering intensity is adjusted for 8-bit target.
-                    dither_strength = 1.0 / 255.0
-                elif output_format == 'TIFF':
-                    # Dithering intensity is adjusted for 16-bit target.
-                    dither_strength = 1.0 / 65535.0
-
-                # If an intensity has been defined, apply dithering.
-                if dither_strength > 0 and self.jxr_loader.tone_mapper is not None:
-                    logging.info(
-                        f"Applying dithering for {output_format} format with intensity {dither_strength:.6f}")
-                    tensor_to_save = self.jxr_loader.tone_mapper.apply_dithering(tensor_to_save,
-                                                                                 strength=dither_strength)
-            # --- End of dithering logic ---
-
-            if output_format == 'JPEG':
-                # Convert tensor (potentially dithered) to NumPy array.
-                array = tensor_to_save.squeeze(0).permute(1, 2, 0).contiguous().numpy()
-                array = np.clip(array, 0.0, 1.0)
-                # Round (not truncate) to 8-bit; the TPDF dither above already
-                # broke the banding. Save 4:4:4 (subsampling=0): JPEG's default
-                # 4:2:0 chroma subsampling re-bands smooth colour gradients.
-                array = np.clip(np.rint(array * 255.0), 0, 255).astype(np.uint8)
-                result_image = Image.fromarray(array)
-                result_image.save(output_path, 'JPEG', quality=max(quality, 97),
-                                  subsampling=0, optimize=True)
-
-            elif output_format == 'TIFF':
-                # Convert tensor (potentially dithered) to NumPy array.
-                array = tensor_to_save.squeeze(0).permute(1, 2, 0).contiguous().numpy()
-
-                if is_hdr_data:
-                    # Save raw HDR data as float32, without dithering or quantization.
-                    array = np.ascontiguousarray(array, dtype=np.float32)
-                    tifffile.imwrite(output_path, array, photometric='rgb', compression='lzw')
-                else:
-                    # For LDR data, 16-bit quantization (rounded).
-                    array = np.clip(array, 0.0, 1.0)
-                    array = np.clip(np.rint(array * 65535.0), 0, 65535).astype(np.uint16)
-                    tifffile.imwrite(output_path, array, photometric='rgb', compression='lzw')
-
-            else:
-                raise ValueError(f"Unsupported output format: {output_format}")
-
-            logging.info(f"Image saved successfully: {output_path}")
-
-        except Exception as e:
-            logging.error(f"Failed to save image to {output_path}: {e}", exc_info=True)
-            raise
+        if is_hdr_data and output_format == "TIFF":
+            rgb = tensor_to_save.detach()[0].permute(1, 2, 0).cpu().numpy()
+            tifffile.imwrite(output_path, np.ascontiguousarray(rgb, dtype=np.float32),
+                             photometric="rgb", compression="lzw")
+        elif output_format == "JPEG":
+            SdrStill.prepare(tensor_to_save, "JPEG", quality).write_jpeg(output_path)
+        elif output_format == "TIFF":
+            SdrStill.prepare(tensor_to_save, "TIFF").write_tiff(output_path)
+        else:
+            raise ValueError(f"Unsupported output format: {output_format}")
 
     def switch_device(self, use_gpu, use_fp16=False):
         """

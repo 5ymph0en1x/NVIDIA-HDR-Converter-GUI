@@ -107,10 +107,27 @@ def _srgb_decode(x: torch.Tensor) -> torch.Tensor:
     )
 
 
+def nonnegative_rgb(rgb: torch.Tensor) -> torch.Tensor:
+    """Map signed scRGB into the positive BT.709 cone at constant linear luminance.
+
+    Pull only colours with negative channels towards neutral until the lowest
+    channel reaches zero. Highlights can still exceed white at this stage.
+    """
+    low = rgb.amin(dim=1, keepdim=True)
+    y = (0.2126 * rgb[:, 0:1] + 0.7152 * rgb[:, 1:2] + 0.0722 * rgb[:, 2:3]).clamp_min(0.0)
+    scale = y / (y - low).clamp_min(1e-20)
+    return torch.where(low < 0, ((rgb - low) * scale).clamp_min(0.0), rgb)
+
+
+def signed_power(x: torch.Tensor, exponent: float) -> torch.Tensor:
+    """Apply an exposure-control power curve on both sides of scRGB zero."""
+    return x.sign() * x.abs().pow(exponent)
+
+
 def adjust_scene(linear: torch.Tensor, pre_gamma: float = 1.0, exposure: float = 1.0) -> torch.Tensor:
     """The user's Gamma and Exposure on a picture already in the engine's working space:
-    the same arithmetic the loaders apply while reading (in scRGB units, positive values
-    raised to 1 / gamma, then multiplied by the exposure). The preview uses it to shape
+    the same arithmetic the loaders apply while reading (in scRGB units, signed values
+    raised in magnitude to 1 / gamma, then multiplied by the exposure). The preview uses it to shape
     the result while the source view keeps showing the picture as recorded."""
     if pre_gamma == 1.0 and exposure == 1.0:
         return linear
@@ -119,7 +136,7 @@ def adjust_scene(linear: torch.Tensor, pre_gamma: float = 1.0, exposure: float =
     scale = 80.0 / ENGINE_UNIT_NITS                      # engine units per scRGB unit
     scrgb = linear / scale
     if pre_gamma != 1.0:
-        scrgb = torch.where(scrgb > 0, scrgb.clamp(min=1e-30) ** (1.0 / pre_gamma), torch.zeros_like(scrgb))
+        scrgb = signed_power(scrgb, 1.0 / pre_gamma)
     if exposure != 1.0:
         scrgb = scrgb * exposure
     return scrgb * scale

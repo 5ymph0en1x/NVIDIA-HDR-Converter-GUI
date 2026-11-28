@@ -4,12 +4,12 @@ import subprocess
 import sys
 from dataclasses import replace
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRect, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices, QImage
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QMainWindow, QPushButton, QSlider, QVBoxLayout, QWidget
 
-from ..display import display_of_window
+from ..display import display_of_window, sdr_white_nits
 from ..session import Options, Queue, collect, describe_output, display_name
 from .advanced import PANEL_WIDTH, AdvancedPanel
 from .controls import ActionBar, ElidedLabel
@@ -35,8 +35,9 @@ def clock(seconds: float) -> str:
 
 class MainWindow(QMainWindow):
     _show = Signal(int, str, str, float, object, object, bool, str)
-    _analyse = Signal(int, str, object)
-    _convert = Signal(object, object)
+    _analyse = Signal(int, str, object, str)
+    _encode = Signal(int, str, object, str)
+    _convert = Signal(object, object, str)
     _thumbnail = Signal(str, str, object, str)
 
     def __init__(self, settings_path: str = ""):
@@ -56,11 +57,18 @@ class MainWindow(QMainWindow):
         self._facts = None                         # what the backend last told us about the shown file
         self._analysed_for = None                  # (path, picture key) of the finished analysis
         self._converting = False
-        self._last_outputs = []
-        self._saved = None                     # (text, file, settings) of the last success
-        self._job_index = self._job_total = self._run_saved = 0
+        self._encoding_preview = False
+        self._saved_paths = set()
+        self._run_options = {}
+        self._job_index = self._job_total = 0
         self._panel_open = False
         self._first_pass = None                    # the pass the file being converted began with
+        # The window moved, or came back to the front: once it has settled, see whether SDR
+        # white still stands for what the picture on screen was made for.
+        self._screen_check = QTimer(self)
+        self._screen_check.setSingleShot(True)
+        self._screen_check.setInterval(200)
+        self._screen_check.timeout.connect(self._follow_screen)
         self._left_out = []                        # files just taken out because they cannot be converted
         self._queue_open = False
         self._queue_dismissed = False              # closed by hand: it does not open by itself again
@@ -136,6 +144,11 @@ class MainWindow(QMainWindow):
         self.time_label.setProperty("role", "muted")
         self.time_label.setMinimumWidth(self.time_label.fontMetrics().horizontalAdvance("00:00 / 00:00") + 8)
         self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.encoded_button = QPushButton("Preview encoded MP4")
+        self.encoded_button.setFocusPolicy(Qt.TabFocus)
+        self.encoded_button.setToolTip("Encode the complete recording for inspection. Convert saves that same MP4.")
+        self.encoded_button.clicked.connect(self._toggle_encoded)
+        line.addWidget(self.encoded_button)
         line.addWidget(self.timeline, 1)
         line.addWidget(self.time_label)
         self.timeline_row.hide()
@@ -192,6 +205,9 @@ class MainWindow(QMainWindow):
         self.backend.moveToThread(self.thread)
         self._show.connect(self.backend.show)
         self._analyse.connect(self.backend.analyse)
+        self._encode.connect(self.backend.encode_preview)
+        self.backend.encoded_ready.connect(self._encoded_ready)
+        self.backend.encoded_progress.connect(self._encoded_progress)
         self._convert.connect(self.backend.convert)
         self._thumbnail.connect(self.backend.thumbnail)
         self.backend.thumbnail_ready.connect(self._on_thumbnail)
@@ -275,6 +291,7 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def _emptied(self) -> None:
+        self._cancel_encoded()
         self.backend.latest_show += 1
         self.backend.analysis_token += 1
         self.backend.forget_thumbnails()
@@ -315,29 +332,88 @@ class MainWindow(QMainWindow):
         self.backend.latest_show += 1
         self._asked_box = self.viewer.picture_box()
         self._show.emit(self.backend.latest_show, item.path, item.kind, self._time(),
-                        self.options.to_dict(), self._asked_box, self.viewer.hdr_ready(),
-                        display_of_window(int(self.winId())))
+                        self.options.to_dict(), self._asked_box, self.viewer.hdr_ready(), self._screen())
+
+    def _screen(self) -> str:
+        """The screen this window is on. The preview, the analysis of a video and the
+        conversion all ask it what SDR white stands for: the file is the picture previewed
+        only if it is made for the same white."""
+        return display_of_window(int(self.winId()))
+
+    def _follow_screen(self) -> None:
+        """The window is on another screen, or 'SDR content brightness' was changed in
+        Windows while the program was open: the picture on screen was made for a white
+        that is no longer this screen's. It is made again, so that what is converted next
+        is what is seen."""
+        if self._facts is None or self.queue.current is None:
+            return
+        white, _ = sdr_white_nits(self._screen())
+        if white != self._facts["white_nits"]:
+            if self._converting:
+                self._request_show()               # (the run in progress keeps the white it started with)
+            else:
+                self._restart_preview()
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        self._screen_check.start()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange:
+            self._screen_check.start()              # back from Windows' settings, perhaps
+
+    def _cancel_encoded(self):
+        self.backend.encode_token += 1
+        self._encoding_preview = False
+        self.encoded_button.setText("Preview encoded MP4")
+
+    def _toggle_encoded(self):
+        item = self.queue.current
+        if item is None or item.kind != "video":
+            return
+        if self._encoding_preview:
+            self._cancel_encoded()
+            self._request_show()
+            return
+        self.backend.encode_token += 1
+        self._encoding_preview = True
+        self.encoded_button.setText("Cancel MP4 preview")
+        self._encode.emit(self.backend.encode_token, item.path, self.options.to_dict(), self._screen())
+
+    def _encoded_progress(self, token, percent):
+        if self._encoding_preview and token == self.backend.encode_token:
+            self.encoded_button.setText(f"Cancel MP4 preview ({percent}%)")
+
+    def _encoded_ready(self, token, error):
+        if token != self.backend.encode_token:
+            return
+        self._cancel_encoded()
+        if error:
+            self.notify(error)
+        self._request_show()
 
     def _restart_preview(self) -> None:
         """The file or the picture settings changed: show it again, and analyse it if it is a video."""
         item = self.queue.current
         if item is None:
             return
+        self._cancel_encoded()
         self.backend.analysis_token += 1
         self._analysed_for = None
-        self.viewer.set_note("loading" if not self.viewer.has_picture() else self.viewer._note)
+        self.viewer.set_note("updating" if self.viewer.has_picture() else "loading")
         self._request_show()
         if item.kind == "video" and not self._converting:
-            self._analyse.emit(self.backend.analysis_token, item.path, self.options.to_dict())
+            self._analyse.emit(self.backend.analysis_token, item.path, self.options.to_dict(), self._screen())
 
     def _on_preview(self, request: int, before, after, facts) -> None:
         item = self.queue.current
         if request != self.backend.latest_show or item is None or facts["path"] != item.path:
             return                                         # an answer to a question we no longer ask
-        first = self._facts is None or self._facts.get("path") != facts["path"]
         self._facts = facts
-        self.viewer.set_pictures(before, after, fade=not first, hdr=facts.get("hdr"),
+        self.viewer.set_pictures(before, after, fade=False, hdr=facts.get("hdr"),
                                  white_nits=facts["white_nits"])
+        self.viewer.set_result_tag(facts["result_tag"])
         self.viewer.set_note("" if facts["final"] else "preview")
         # In HDR the source is shown whole. In an SDR window it is cut at the window's white:
         # the label says at how many nits.
@@ -347,9 +423,12 @@ class MainWindow(QMainWindow):
         if self.queue_panel.wants_thumbnail(item.path):
             self._on_thumbnail(item.path, before)   # its row gets the picture just made, for nothing more
         self._refresh()
+        # The window may have reached its maximized size while the first render was
+        # still running. The resize notification then saw an empty viewer.
+        self._fit_picture()
 
     def _ask_thumbnail(self, item) -> None:
-        self._thumbnail.emit(item.path, item.kind, self.options.to_dict(), display_of_window(int(self.winId())))
+        self._thumbnail.emit(item.path, item.kind, self.options.to_dict(), self._screen())
 
     def _on_thumbnail_refused(self, path: str, message: str) -> None:
         """A file read for its row turned out not to be one this program converts (a video
@@ -410,8 +489,8 @@ class MainWindow(QMainWindow):
         item = self.queue.current
         if token != self.backend.analysis_token or item is None:
             return
-        self._analysed_for = (item.path, self.options.picture_key())
-        self._request_show()                               # the same frame, now exact
+        self._analysed_for = (item.path, self.options.picture_key(self._screen()))
+        self._request_show()                               # the same frame with stabilized parameters
 
     def _on_timeline(self, value: int) -> None:
         if self._facts:
@@ -428,6 +507,12 @@ class MainWindow(QMainWindow):
 
     def _apply(self, options: Options) -> None:
         picture_changed = options.picture_key() != self.options.picture_key()
+        item = self.queue.current
+        if item is not None and item.kind == "image":
+            picture_changed |= options.image_format != self.options.image_format
+        elif item is not None and item.kind == "video":
+            picture_changed |= (options.video_height, options.video_fps, options.video_quality) != (
+                self.options.video_height, self.options.video_fps, self.options.video_quality)
         histogram_changed = options.show_histogram != self.options.show_histogram
         self.options = options
         for name, value in options.to_dict().items():
@@ -450,19 +535,23 @@ class MainWindow(QMainWindow):
                 return
             jobs = [(self.queue.selected, current.path, current.kind)]     # convert it again, on request
         self._converting = True
-        self._job_index, self._job_total, self._run_saved = 0, len(jobs), 0
-        self._last_outputs = []
-        self._saved = None
+        self._job_index, self._job_total = 0, len(jobs)
+        self._saved_paths.clear()
         self.backend.stop_convert = False
         self.banner.hide()
         self.bar.convert.set_working("Starting…", 0.0)
         self.queue_panel.set_overall(0.0)
         self._refresh()
-        self._convert.emit(jobs, self.options.to_dict())
+        # the screen is named once, here: the whole run is made for the white of the
+        # screen the window is on as the conversion is asked for
+        screen = self._screen()
+        self._run_options = dict(self.options.to_dict(), white_nits=sdr_white_nits(screen)[0])
+        self._convert.emit(jobs, self._run_options, screen)
 
     def cancel(self) -> None:
         if self._converting:
             self.backend.stop_convert = True
+            self._cancel_encoded()
             self.bar.convert.set_working("Stopping…", 0.0)
 
     def _on_item_started(self, index: int) -> None:
@@ -496,8 +585,8 @@ class MainWindow(QMainWindow):
         item = self.queue.items[index]
         item.state, item.message, item.outputs = state, message, list(outputs)
         if state == "done":
-            self._last_outputs = list(outputs)
-            self._run_saved += 1
+            item.output_settings = self._run_options
+            self._saved_paths.add(item.path)
         elif state == "failed":
             self.notify(message if item.name in message else f"{item.name}: {message}")
         self._refresh()
@@ -506,23 +595,16 @@ class MainWindow(QMainWindow):
         self._converting = False
         self.bar.convert.set_idle()
         self.queue_panel.set_overall(None)
-        if self._last_outputs:
-            # The news of a success takes no line of its own (a line above the picture pushed
-            # it down at every conversion): it is given where the output is described, next to
-            # 'Show in folder', for as long as the same file and settings are on screen.
-            name = os.path.basename(self._last_outputs[0])
-            current = self.queue.current
-            self._saved = (f"Saved {name}" if self._run_saved == 1 else f"Saved {self._run_saved} files",
-                           current.path if current else None, self.options.to_dict())
         self._refresh()
         item = self.queue.current
         if item is not None and item.kind == "video":
-            self._restart_preview()                        # exact at once if this video was just analysed
+            self._restart_preview()                        # display the exported bitstream
 
     def reveal(self) -> None:
-        if not self._last_outputs:
+        current = self.queue.current
+        if current is None or not current.outputs:
             return
-        target = self._last_outputs[0]
+        target = current.outputs[0]
         if sys.platform == "win32":
             subprocess.Popen(["explorer", "/select,", os.path.normpath(target)])
         else:
@@ -552,11 +634,15 @@ class MainWindow(QMainWindow):
                 detail = f"{facts['width']} × {facts['height']}, {kind}, peak {round(facts['peak_nits'])} nits"
                 if facts.get("method") and self.options.method() is None:
                     detail += f", Auto chose {display_name(facts['method'])}"
+                elif self.options.method() == "neural" and facts.get("neural_fallback"):
+                    detail += ", Neural unavailable, using Perceptual"
                 self.detail_label.setText(detail)
             else:
                 self.detail_label.setText("")
         is_video = item is not None and item.kind == "video" and bool(self._facts)
         self.timeline_row.setVisible(is_video)
+        self.encoded_button.setEnabled(not self._converting)
+        self.encoded_button.setVisible(is_video and (self._facts or {}).get("result_tag") != "Encoded MP4 SDR")
         if is_video:
             self.time_label.setText(f"{clock(self._time())} / {clock(self._facts.get('duration_s', 0.0))}")
 
@@ -565,14 +651,18 @@ class MainWindow(QMainWindow):
         self.bar.looks.set_look(None if self.options.operator else self.options.look)
         self.bar.looks.setEnabled(not self._converting)
         self.panel.setEnabled(not self._converting)
-        saved = self._saved
-        if saved and not self._converting and item is not None and saved[1] == item.path \
-                and saved[2] == self.options.to_dict():
-            self.bar.set_summary(saved[0], done=True, tooltip=os.linesep.join(self._last_outputs))
+        saved = False
+        if item and item.outputs and self._facts and self._facts.get("path") == item.path:
+            settings = dict(self.options.to_dict(), white_nits=self._facts["white_nits"])
+            saved = item.output_settings == settings and not self._converting
+        if saved:
+            count = len(self._saved_paths) if item.path in self._saved_paths else 1
+            text = f"Saved {count} files" if count > 1 else f"Saved {os.path.basename(item.outputs[0])}"
+            self.bar.set_summary(text, done=True, tooltip=os.linesep.join(item.outputs))
         else:
             self.bar.set_summary(describe_output(item.kind, self.options) if item else "")
         self.bar.cancel.setVisible(self._converting)
-        self.bar.reveal.setVisible(bool(self._last_outputs) and not self._converting)
+        self.bar.reveal.setVisible(saved)
         if not self._converting:
             waiting = [i for i in self.queue.items if i.state in ("waiting", "cancelled", "failed")]
             if len(waiting) > 1:
@@ -685,5 +775,6 @@ class MainWindow(QMainWindow):
         self.backend.stop_convert = True
         self.backend.analysis_token += 1
         self.thread.quit()
-        self.thread.wait(30000)
+        if self.thread.wait(30000):
+            self.backend.release_encoded_preview()
         super().closeEvent(event)
